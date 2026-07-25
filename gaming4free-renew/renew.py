@@ -328,6 +328,7 @@ def run():
         sys.exit(1)
 
     # UC mode 启动
+    log.info("正在启动浏览器 (uc=True, headless=True)...")
     with SB(
         browser="chrome",
         uc=True,
@@ -339,6 +340,7 @@ def run():
         proxy=PROXY_URL,
         ad_block=False,
     ) as sb:
+        log.info("✅ 浏览器启动成功")
 
         sb.set_window_size(1280, 800)
         sb.driver.set_page_load_timeout(PAGE_TIMEOUT)
