@@ -444,9 +444,39 @@ def process_account(drv, name: str, url: str, cookie: str) -> bool:
             time.sleep(5)
             continue
 
-        # 5.5 处理确认弹窗
-        time.sleep(CLICK_DELAY)
-        handle_confirm_dialog(drv)
+        # 5.5 处理 Turnstile / Cloudflare 验证
+        # Turnstile 可能以 iframe 形式出现，需要等待通过
+        log("检测 Turnstile/Cloudflare...", "TURNSTILE")
+        ts_start = time.time()
+        while time.time() - ts_start < 180:  # 最多等 3 分钟
+            # 先检查时间是否已增加（提前跳出）
+            _, cur_sec = get_remaining_seconds(drv)
+            if cur_sec > pre_sec + 300:
+                log("检测到时间增加 (Turnstile 前)", "OK")
+                break
+            
+            # 检查 Turnstile iframe 是否存在
+            has_turnstile = drv.execute_script("""
+                var frames = document.querySelectorAll('iframe');
+                for (var i = 0; i < frames.length; i++) {
+                    var src = frames[i].src || '';
+                    if (src.indexOf('turnstile') !== -1 || 
+                        src.indexOf('challenges.cloudflare.com') !== -1) {
+                        return true;
+                    }
+                }
+                return false;
+            """)
+            
+            if not has_turnstile:
+                log("Turnstile 已通过/未出现", "OK")
+                break
+            
+            log(f"Turnstile 验证中... ({int(time.time()-ts_start)}s)", "WAIT")
+            time.sleep(5)
+        
+        else:
+            log("Turnstile 等待超时，但仍检查时间", "WARN")
 
         # 5.6 等待续期生效（最多 30s）
         log("等待续期生效...", "WAIT")
