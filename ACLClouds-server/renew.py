@@ -97,6 +97,11 @@ def build_session(cookie_str):
         "Referer": f"{BASE_URL}/projects",
     })
     # 解析 cookie 字符串 - 处理 __Host- 和 __Secure- 前缀
+    # 关键: 同时设置到 dash.aclclouds.com / aclclouds.com / .aclclouds.com
+    # 因为 dash.aclclouds.com/api/client 会 302 重定向到 aclclouds.com/api/client
+    # Cookie 必须在两个域上都存在, 否则重定向后丢失 → 401
+    cookie_domains = ["dash.aclclouds.com", "aclclouds.com", ".aclclouds.com"]
+    n_set = 0
     for kv in cookie_str.split(";"):
         kv = kv.strip()
         if not kv or "=" not in kv:
@@ -110,28 +115,39 @@ def build_session(cookie_str):
             clean_k = k[7:]  # 移除 "__Host-" (7个字符)
         elif k.startswith("__Secure-"):
             clean_k = k[9:]  # 移除 "__Secure-" (9个字符)
-        
-        # 设置 domain 为 dash.aclclouds.com
-        s.cookies.set(clean_k, v, domain="dash.aclclouds.com", path="/")
-    
-    # 调试: 打印设置的 Cookie
-    log(f"🔍 Session 中设置了 {len(s.cookies)} 个 Cookie:")
+
+        # 关键修复: 在多个域上设置 cookie, 保证重定向后仍能携带
+        for d in cookie_domains:
+            s.cookies.set(clean_k, v, domain=d, path="/")
+        n_set += 1
+
+    # 调试: 打印设置的 Cookie (去重显示)
+    log(f"🔍 共解析 {n_set} 个 Cookie, 设置到 {len(cookie_domains)} 个域:")
+    seen = set()
     for cookie in s.cookies:
+        if cookie.name in seen:
+            continue
+        seen.add(cookie.name)
         log(f"   - {cookie.name} = {cookie.value[:30]}...")
-    
+
     return s
 
 
 def get_xsrf(session):
-    """从 cookie 中提取并解码 XSRF-TOKEN"""
-    token = session.cookies.get("XSRF-TOKEN", domain="dash.aclclouds.com")
-    if not token:
-        return None
-    return urllib.parse.unquote(token)
+    """从 cookie 中提取并解码 XSRF-TOKEN (跨域查找)"""
+    # 依次尝试几个可能的域
+    for domain in ("dash.aclclouds.com", "aclclouds.com", ".aclclouds.com"):
+        token = session.cookies.get("XSRF-TOKEN", domain=domain)
+        if token:
+            return urllib.parse.unquote(token)
+    # 兜底: 不指定 domain
+    token = session.cookies.get("XSRF-TOKEN")
+    return urllib.parse.unquote(token) if token else None
 
 
 def api_get(session, path):
-    return session.get(f"{BASE_URL}{path}", timeout=30)
+    r = session.get(f"{BASE_URL}{path}", timeout=30, allow_redirects=True)
+    return r
 
 
 def api_post(session, path, payload=None):
@@ -139,14 +155,24 @@ def api_post(session, path, payload=None):
     token = get_xsrf(session)
     if token:
         headers["X-XSRF-TOKEN"] = token
-    return session.post(f"{BASE_URL}{path}", headers=headers, json=payload or {}, timeout=30)
+    return session.post(f"{BASE_URL}{path}", headers=headers, json=payload or {}, timeout=30, allow_redirects=True)
 
 
 def list_servers(session):
-    # ACLClouds 用 GET /api/client (不是 /api/client/servers) 列服务器
-    # 响应: { data: [ { object: "server", attributes: {...} } ], meta: {...} }
+    # ACLClouds: GET /api/client 列服务器
+    # 注意: dash.aclclouds.com/api/client 会 302 → aclclouds.com/api/client
+    # Cookie 必须跨域, 已在 build_session 中设置
     r = api_get(session, "/api/client")
-    r.raise_for_status()
+    if r.status_code != 200:
+        # 打印重定向链路 + 最终 URL 方便排查
+        log(f"🐛 GET /api/client HTTP {r.status_code}")
+        log(f"   最终 URL: {r.url}")
+        if r.history:
+            log(f"   重定向链路:")
+            for h in r.history:
+                log(f"     {h.status_code} {h.url}")
+        log(f"   响应: {r.text[:500]}")
+        r.raise_for_status()
     j = r.json()
     if isinstance(j, dict):
         return j.get("data", [])

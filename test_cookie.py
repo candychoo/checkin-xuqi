@@ -24,7 +24,7 @@ if not has_xsrf or not has_session:
     print(f"完整 Cookie: {COOKIE}")
     exit(1)
 
-# 用和 renew.py 完全相同的方式构建 session
+# 用和 renew.py 完全相同的方式构建 session (含跨域 Cookie 设置)
 BASE_URL = "https://dash.aclclouds.com"
 UA = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
 
@@ -37,21 +37,41 @@ s.headers.update({
     "Referer": f"{BASE_URL}/projects",
 })
 
+# 关键: dash.aclclouds.com → aclclouds.com 会 302 重定向
+# Cookie 必须同时设置在两个域, 否则重定向后丢失 → 401
+cookie_domains = ["dash.aclclouds.com", "aclclouds.com", ".aclclouds.com"]
 for kv in COOKIE.split(";"):
     kv = kv.strip()
     if "=" in kv:
         k, v = kv.split("=", 1)
-        s.cookies.set(k.strip(), v.strip(), domain="dash.aclclouds.com", path="/")
+        k = k.strip()
+        v = v.strip()
+        # 移除 __Host- / __Secure- 前缀
+        if k.startswith("__Host-"):
+            k = k[7:]
+        elif k.startswith("__Secure-"):
+            k = k[9:]
+        for d in cookie_domains:
+            s.cookies.set(k, v, domain=d, path="/")
 
-# 打印实际设置的 Cookie
-print(f"\nSession 中的 Cookie:")
+# 打印实际设置的 Cookie (去重)
+print(f"\nSession 中的 Cookie (去重):")
+seen = set()
 for cookie in s.cookies:
-    print(f"  {cookie.name} = {cookie.value[:20]}...")
+    if cookie.name in seen:
+        continue
+    seen.add(cookie.name)
+    print(f"  {cookie.name} = {cookie.value[:30]}...")
 
 # 测试 /api/client
-r = s.get(f"{BASE_URL}/api/client", timeout=15)
-print(f"\n=== GET /api/client ===")
+r = s.get(f"{BASE_URL}/api/client", timeout=15, allow_redirects=True)
+print(f"\n=== GET {BASE_URL}/api/client ===")
 print(f"HTTP 状态码: {r.status_code}")
+print(f"最终 URL: {r.url}")
+if r.history:
+    print(f"重定向链路:")
+    for h in r.history:
+        print(f"  {h.status_code} → {h.url}")
 
 if r.status_code == 200:
     import json
