@@ -162,8 +162,44 @@ def get_remaining_seconds(sb) -> int:
         return -1
 
 
+def livewire_extend(sb) -> dict:
+    """使用 Livewire JavaScript 直接调用 extend 方法，返回结果"""
+    from util import _LW_EXTEND_V3_JS, _LW_V2_JS, _LW_CLICK_JS
+    
+    results = []
+    
+    # 策略1: Livewire v3 - $wire.call('extend')
+    try:
+        result = sb.execute_script(_LW_EXTEND_V3_JS)
+        if result:
+            log.info(f"Livewire v3 结果: {result}")
+            results.append(result)
+    except Exception as e:
+        log.warning(f"Livewire v3 调用失败: {e}")
+    
+    # 策略2: Livewire v2 - livewire.emit('extend')
+    try:
+        result = sb.execute_script(_LW_V2_JS)
+        if result:
+            log.info(f"Livewire v2 结果: {result}")
+            results.append(result)
+    except Exception as e:
+        log.warning(f"Livewire v2 调用失败: {e}")
+    
+    # 策略3: 直接点击 90 min 按钮
+    try:
+        result = sb.execute_script(_LW_CLICK_JS)
+        if result:
+            log.info(f"按钮点击结果: {result}")
+            results.append(result)
+    except Exception as e:
+        log.warning(f"按钮点击失败: {e}")
+    
+    return {"results": results, "success": any("success" in r.lower() or "clicked" in r.lower() or "call_extend" in r.lower() for r in results)}
+
+
 def click_renew_button(sb) -> bool:
-    """找到并点击续期按钮，返回是否点到了"""
+    """找到并点击续期按钮（备用方案）"""
     candidates = [
         'button:contains("+90")',
         'button:contains("90 min")',
@@ -385,14 +421,20 @@ def run():
                 log.info(f"已接近 {MAX_HOURS}h 上限，停止续期")
                 break
 
-            # Step 4.1: 点击续期按钮
-            if not click_renew_button(sb):
-                screenshot(sb, f"no_btn_{click_count}")
-                log.warning("本次未找到按钮，可能需要刷新页面")
-                sb.refresh()
-                sb.sleep(3)
-                last_sec = get_remaining_seconds(sb)
-                continue
+            # Step 4.1: 先尝试 Livewire 方法，失败再试按钮点击
+            log.info("尝试 Livewire extend...")
+            lw_result = livewire_extend(sb)
+            if lw_result["success"]:
+                log.info("✅ Livewire extend 成功")
+            else:
+                log.warning("Livewire extend 失败，尝试按钮点击...")
+                if not click_renew_button(sb):
+                    screenshot(sb, f"no_btn_{click_count}")
+                    log.warning("本次未找到按钮，可能需要刷新页面")
+                    sb.refresh()
+                    sb.sleep(3)
+                    last_sec = get_remaining_seconds(sb)
+                    continue
 
             # Step 4.2: 处理可能出现的 Turnstile
             human_sleep(1.0, 2.0)
