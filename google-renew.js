@@ -18,7 +18,7 @@ const TG_CHAT_ID = process.env.TG_CHAT_ID || '';
 
 // ==================== 工具函数 ====================
 function log(msg) {
-    console.log(msg, flush: true);
+    console.log(msg);
 }
 
 async function sendTelegram(text) {
@@ -55,7 +55,6 @@ async function loginWithGoogle(page) {
     
     // 点击 Google 登录按钮
     await page.click('button:has-text("Google")', { timeout: 10000 }).catch(() => {
-        // 如果没找到 Google 按钮，尝试其他方式
         log('⚠️ 未找到 Google 登录按钮，尝试查找 OAuth 链接...');
     });
     
