@@ -329,7 +329,7 @@ def run():
 
     # UC mode 启动
     with SB(
-        browser="chromium",
+        browser="chrome",
         uc=True,
         headless=False,
         xvfb=True,
