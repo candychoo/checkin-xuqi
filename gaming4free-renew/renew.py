@@ -729,122 +729,138 @@ def run_single_server(sb, site_url: str, server_num: str, region: str,
     human_wait(2, 4)
     bypass_turnstile(sb)
 
-    # 等待可能的 modal 出现 (点击 +90 min 后可能弹出确认对话框)
-    log.info("⏳ 等待可能的确认对话框出现...")
+    # 关键: 点击 +90 min 后, 续期应该直接生效, 不需要提交按钮
+    # 之前误判: 把左侧菜单 'Public Renewing' 链接当成提交按钮点了
+    # 现在改为: 点击 +90 min 后直接等待时间变化, 不再找提交按钮
+
+    log.info("⏳ 等待续期生效 (点击 +90 min 后直接生效, 无需提交)...")
+    # 多等一会, 让续期请求完成 + 时间刷新
+    human_wait(8, 12)
+
+    # 再次检测 Turnstile (如果点击后弹出了 Turnstile)
+    bypass_turnstile(sb)
     human_wait(3, 5)
 
-    # 再次检测 Turnstile (modal 内可能有)
-    bypass_turnstile(sb)
-
-    # 检测是否有 modal 出现
-    # 线索: 'Cancel' 按钮存在 / modal class 存在 / body 有 modal-open
-    modal_detected = False
+    # 检查是否跳转到了其他页面 (说明点错了按钮)
     try:
-        modal_check = sb.execute_script("""
+        current_url_after = sb.get_current_url().lower()
+        log.info(f"📍 点击后 URL: {sb.get_current_url()}")
+        # 如果跳转到了 settings/public-renewing 等页面, 说明点错了
+        if "public-renewing" in current_url_after or "settings" in current_url_after:
+            log.warning("⚠️ 页面跳转到了设置页, 说明点击的不是续期按钮而是菜单链接!")
+            log.warning("⚠️ 尝试返回原页面并重新点击真正的 rt-btn-free...")
+            # 返回原页面
+            sb.go_back()
+            human_wait(3, 5)
+            # 重新点击 rt-btn-free (这次只点 button.rt-btn-free, 不点其他)
+            try:
+                sb.execute_script("""
+                    try {
+                        var btn = document.querySelector('button.rt-btn-free');
+                        if (btn) {
+                            btn.scrollIntoView({block: 'center', behavior: 'instant'});
+                            btn.click();
+                        }
+                    } catch(e) {}
+                """)
+                human_wait(8, 12)
+                bypass_turnstile(sb)
+                human_wait(3, 5)
+            except Exception as e:
+                log.warning(f"重新点击失败: {e}")
+    except Exception as e:
+        log.warning(f"URL 检查失败: {e}")
+
+    # 检查是否有真正的 modal (不是 fi-modal-trigger 那种触发器)
+    # 真正的 modal 会有明显的遮罩层 + 居中对话框
+    try:
+        real_modal = sb.execute_script("""
             try {
-                // 1. 检查是否有 Cancel 按钮 (说明有对话框)
-                var cancelBtn = null;
-                var btns = document.querySelectorAll('button, a, [role=button]');
-                for (var i = 0; i < btns.length; i++) {
-                    var t = (btns[i].innerText || '').trim().toLowerCase();
-                    if (t === 'cancel' || t === '取消') { cancelBtn = btns[i]; break; }
-                }
-                // 2. 检查 modal/dialog class
-                var modalEl = document.querySelector(
-                    '.fi-modal, .modal, [role=dialog], [class*=\"modal\"], [class*=\"dialog\"], [class*=\"overlay\"]'
+                // 找真正的 modal (有固定定位 + 遮罩)
+                var modals = document.querySelectorAll(
+                    '[role=\"dialog\"], .fi-modal-content, .fi-modal-body, [class*=\"modal-content\"], [class*=\"dialog-content\"]'
                 );
-                // 3. 检查 body class
-                var bodyModal = document.body.classList.contains('modal-open') ||
-                                document.body.style.overflow === 'hidden';
-                return JSON.stringify({
-                    hasCancel: !!cancelBtn,
-                    hasModal: !!modalEl,
-                    bodyModal: bodyModal,
-                    modalClass: modalEl ? (modalEl.className || '').substring(0, 100) : '',
-                });
+                for (var i = 0; i < modals.length; i++) {
+                    var rect = modals[i].getBoundingClientRect();
+                    // 真正的 modal 应该可见且有尺寸
+                    if (rect.width > 100 && rect.height > 100) {
+                        var btns = modals[i].querySelectorAll('button, a, [role=button]');
+                        var btnTexts = [];
+                        for (var j = 0; j < btns.length; j++) {
+                            var t = (btns[j].innerText || '').trim();
+                            if (t) btnTexts.push(t);
+                        }
+                        return JSON.stringify({
+                            found: true,
+                            class: (modals[i].className || '').substring(0, 100),
+                            buttons: btnTexts
+                        });
+                    }
+                }
+                return JSON.stringify({found: false});
             } catch(e) { return JSON.stringify({error: e.message}); }
         """)
         import json as _json
-        info = _json.loads(modal_check) if modal_check else {}
-        log.info(f"🔍 Modal 检测: {info}")
-        modal_detected = info.get("hasCancel") or info.get("hasModal") or info.get("bodyModal")
-    except Exception as e:
-        log.warning(f"Modal 检测失败: {e}")
-
-    if modal_detected:
-        log.info("🪟 检测到确认对话框, 在对话框内找提交按钮...")
-
-        # 在 modal 内找 confirm 按钮 (排除 Cancel/Restart/Kill/Start 等已知按钮)
-        # 优先用 JS 精准定位
-        try:
+        modal_info = _json.loads(real_modal) if real_modal else {}
+        log.info(f"🔍 真 Modal 检测: {modal_info}")
+        if modal_info.get("found"):
+            # 真的有 modal, 找里面的提交按钮
+            log.info("🪟 检测到真正的确认对话框, 按钮列表:")
+            for btn_text in (modal_info.get("buttons") or []):
+                log.info(f"     - {btn_text!r}")
+            # 用 JS 在 modal 内找提交按钮 (排除 Cancel/Close)
             js_result = sb.execute_script("""
                 try {
-                    // 已知要排除的按钮文字 (这些不是提交按钮)
-                    var exclude = ['cancel', '取消', 'restart', 'kill', 'delete', 'start', 'stop', 'close', 'x', ''];
-                    // 优先关键词 (按顺序匹配)
-                    var preferKeywords = ['confirm', 'vote', 'add 90', 'add 90 min', 'extend', 'renew', 'submit', 'yes', 'ok', 'continue', 'proceed', 'go'];
-
-                    // 找所有可见的 button / a / [role=button]
-                    var candidates = [];
-                    var els = document.querySelectorAll('button, a, [role=button], input[type=submit], input[type=button]');
-                    for (var i = 0; i < els.length; i++) {
-                        var el = els[i];
+                    var modal = document.querySelector(
+                        '[role=\"dialog\"], .fi-modal-content, .fi-modal-body, [class*=\"modal-content\"], [class*=\"dialog-content\"]'
+                    );
+                    if (!modal) return 'no_modal';
+                    var btns = modal.querySelectorAll('button, a, [role=button]');
+                    var exclude = ['cancel', '取消', 'close', '关闭', 'x', ''];
+                    var preferKeywords = ['confirm', 'vote', 'add 90', 'extend', 'renew', 'submit', 'yes', 'ok', 'continue', 'proceed', 'go', 'add'];
+                    for (var i = 0; i < btns.length; i++) {
+                        var el = btns[i];
                         if (el.disabled) continue;
-                        var t = (el.innerText || el.textContent || el.value || '').trim();
+                        var t = (el.innerText || '').trim();
                         var tl = t.toLowerCase();
                         if (t.length === 0 || t.length > 40) continue;
-                        // 排除已知按钮
                         var isExcluded = false;
                         for (var j = 0; j < exclude.length; j++) {
                             if (tl === exclude[j]) { isExcluded = true; break; }
                         }
                         if (isExcluded) continue;
-                        candidates.push({el: el, text: t, tl: tl});
-                    }
-
-                    // 优先匹配关键词
-                    for (var k = 0; k < preferKeywords.length; k++) {
-                        for (var c = 0; c < candidates.length; c++) {
-                            if (candidates[c].tl.indexOf(preferKeywords[k]) !== -1) {
-                                var target = candidates[c].el;
-                                target.scrollIntoView({block: 'center', behavior: 'instant'});
-                                target.click();
-                                return 'clicked_prefer: ' + preferKeywords[k] + ' | ' + candidates[c].text;
+                        for (var k = 0; k < preferKeywords.length; k++) {
+                            if (tl.indexOf(preferKeywords[k]) !== -1) {
+                                el.scrollIntoView({block: 'center', behavior: 'instant'});
+                                el.click();
+                                return 'clicked: ' + t;
                             }
                         }
                     }
-
-                    // 如果没有匹配关键词, 找 class 含 primary/action/submit/confirm 的
-                    var classKeywords = ['primary', 'action', 'submit', 'confirm', 'success'];
-                    for (var ck = 0; ck < classKeywords.length; ck++) {
-                        for (var c2 = 0; c2 < candidates.length; c2++) {
-                            var cls = (candidates[c2].el.className || '').toLowerCase();
-                            if (cls.indexOf(classKeywords[ck]) !== -1) {
-                                var target2 = candidates[c2].el;
-                                target2.scrollIntoView({block: 'center', behavior: 'instant'});
-                                target2.click();
-                                return 'clicked_class: ' + classKeywords[ck] + ' | ' + candidates[c2].text;
-                            }
+                    // 如果没匹配关键词, 点 modal 里最后一个非 Cancel 按钮 (通常是确认)
+                    var candidates = [];
+                    for (var i2 = 0; i2 < btns.length; i2++) {
+                        var t2 = (btns[i2].innerText || '').trim().toLowerCase();
+                        if (t2 && t2 !== 'cancel' && t2 !== 'close' && !btns[i2].disabled) {
+                            candidates.push(btns[i2]);
                         }
                     }
-
-                    return 'not_found_in_modal (candidates=' + candidates.length + ')';
+                    if (candidates.length > 0) {
+                        var last = candidates[candidates.length - 1];
+                        last.scrollIntoView({block: 'center', behavior: 'instant'});
+                        last.click();
+                        return 'clicked_last: ' + (last.innerText || '').trim();
+                    }
+                    return 'no_btn_in_modal';
                 } catch(e) { return 'error: ' + e.message; }
             """)
-            log.info(f"JS 提交点击结果: {js_result}")
+            log.info(f"JS modal 内点击结果: {js_result}")
             if js_result and "clicked" in str(js_result).lower():
                 human_wait(8, 12)
-            else:
-                log.warning("对话框内未找到提交按钮, 可能 +90 min 已直接生效")
-        except Exception as e:
-            log.warning(f"JS 提交点击失败: {e}")
-            # 兜底: Livewire
-            livewire_extend(sb)
-            human_wait(5, 8)
-    else:
-        log.info("✅ 未检测到确认对话框, 假设 +90 min 已直接生效")
-        # 多等一会, 让续期请求完成
-        human_wait(5, 8)
+                bypass_turnstile(sb)
+                human_wait(3, 5)
+    except Exception as e:
+        log.warning(f"真 Modal 检测失败: {e}")
 
     time.sleep(5)
 
