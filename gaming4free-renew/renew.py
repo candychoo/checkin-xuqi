@@ -466,26 +466,16 @@ def run():
         tg(f"❌ gaming4free 续期失败：代理端口 {proxy_port} 未就绪")
         sys.exit(1)
 
-    # 启动浏览器
-    # 通过 ChromeOptions 设置代理——绕过 SeleniumBase proxy= 验证
-    from selenium.webdriver.chrome.options import Options as ChromeOptions
+# 代理配置
     _proxy = PROXY_URL or "socks5://127.0.0.1:1080"
-    
+
     # 如果代理 URL 含 ?（远程复杂代理），强制用本地 sing-box
     if "?" in _proxy or (not _proxy.startswith(("socks", "http")) and not _proxy.startswith("127.0.0.1")):
         _proxy = "socks5://127.0.0.1:1080"
-    
-    chrome_opts = ChromeOptions()
-    chrome_opts.add_argument(f"--proxy-server={_proxy}")
-    chrome_opts.add_argument("--no-sandbox")
-    chrome_opts.add_argument("--disable-dev-shm-usage")
-    chrome_opts.add_argument("--disable-gpu")
-    chrome_opts.add_argument("--window-size=1280,720")
-    chrome_opts.add_argument("--disable-blink-features=AutomationControlled")
-    chrome_opts.add_argument("--disable-infobars")
-    chrome_opts.add_argument("--disable-popup-blocking,--proxy-server=socks5://127.0.0.1:1080")
 
-    log.info(f"正在启动浏览器 (uc=True, headed=True, xvfb=True)...")
+    CHROMIUM_ARGS = f"--no-sandbox,--disable-dev-shm-usage,--disable-gpu,--window-size=1280,720,--disable-blink-features=AutomationControlled,--disable-infobars,--disable-popup-blocking,--proxy-server={_proxy}"
+
+    log.info(f"正在启动浏览器 (uc=True, headed=True, xvfb=True, proxy={_proxy})...")
     with SB(
         browser="chrome",
         uc=True,
@@ -493,7 +483,7 @@ def run():
         headed=True,
         headless=False,
         xvfb=True,
-        chromium_arg="--no-sandbox,--disable-dev-shm-usage,--disable-gpu,--window-size=1280,720,--disable-blink-features=AutomationControlled,--disable-infobars,--disable-popup-blocking,--proxy-server=socks5://127.0.0.1:1080",
+        chromium_arg=CHROMIUM_ARGS,
     ) as sb:
         log.info("✅ 浏览器启动成功")
         sb.set_window_size(1280, 720)
