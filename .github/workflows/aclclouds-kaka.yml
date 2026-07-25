@@ -23,15 +23,13 @@ jobs:
         with:
           python-version: "3.12"
 
-      - name: 调试 Cookie 长度
+      - name: 安装 requests
+        run: pip install requests
+
+      - name: 测试 Cookie 是否有效
         run: |
-          echo "ACL_COOKIES 长度: ${#ACL_COOKIES}"
-          if [ "${#ACL_COOKIES}" -eq 0 ]; then
-            echo "⚠️ 警告: ACL_COOKIES 为空！"
-            echo "请检查 Settings → Secrets and variables → Actions 中是否已配置 ACL_COOKIES"
-          else
-            echo "✅ Cookie 已读取，前20字符: ${ACL_COOKIES:0:20}..."
-          fi
+          echo "=== 开始测试 Cookie ==="
+          python test_cookie.py
         env:
           ACL_COOKIES: ${{ secrets.ACL_COOKIES }}
 
