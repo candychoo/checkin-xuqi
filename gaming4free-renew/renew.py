@@ -1,681 +1,458 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Gaming4Free Pro 自动续期 - SeleniumBase UC 模式 (v38)
-核心改进: 通过 Filament Actions API 触发续期（绕过 Turnstile）
-
-修改记录:
-- v38: 页面使用 Filament PHP 框架 (filament/actions.js 已加载);
-       按钮 @click="showExtendCaptcha()" 触发 Turnstile;
-       改用 Filament Actions API: Livewire.dispatch('executeAction', {action: 'extend'})
-       或直接调用 Alpine.js 组件的 showExtendCaptcha 方法;
-       修复 JS Fetch 中的 cookies 类型错误。
+gaming4free 自动续期脚本（GHA + WARP + seleniumbase UC mode）
+================================================================
+- 使用 seleniumbase UC mode 反检测
+- 走 Cloudflare WARP SOCKS5 出口（CF 自家 IP，几乎必过 Turnstile）
+- 自动识别续期按钮，循环点击至 48h 上限
+- 点击前后剩余时间对比，确保真成功
+- 失败自动截图 + Telegram 通知
 """
 import os
+import re
 import sys
 import time
-import re
-import traceback
-from datetime import datetime
-from typing import List, Tuple, Optional
+import json
+import random
+import socket
+import smtplib
+import logging
+import requests
+from datetime import datetime, timedelta
+from pathlib import Path
 
-from seleniumbase import Driver
-from selenium.webdriver.common.by import By
-from selenium.webdriver.support.ui import WebDriverWait
-from selenium.webdriver.support import expected_conditions as EC
+# ---------------------------------------------------------------------------
+# 配置区
+# ---------------------------------------------------------------------------
+SITE_URL       = os.getenv("GF_SITE_URL", "https://gaming4free.zapto.org/")
+LOGIN_URL      = os.getenv("GF_LOGIN_URL", "")          # 如有独立登录页填这里，否则留空
+USERNAME       = os.getenv("MC_USERNAME", "")           # Minecraft 用户名（用于登录）
+PASSWORD       = os.getenv("MC_PASSWORD", "")           # 密码（如需）
+COOKIE_STR     = os.getenv("GF_COOKIE", "")             # 备用：直接注入 cookie
+WARP_PROXY     = "socks5://127.0.0.1:40000"
 
-sys.path.insert(0, os.path.dirname(__file__))
-from cfg import ACCOUNTS, TG_BOT, TG_CHAT, MAX_ROUNDS
-from tg import send_tg
+MAX_HOURS      = 48            # 续期上限 48 小时
+ADD_MINUTES    = 90            # 每次点击 +90 分钟
+COOLDOWN_SEC   = 240           # 冷却 4 分钟
+MAX_CLICKS     = 30            # 单次运行最大点击次数（防死循环）
+PAGE_TIMEOUT   = 60            # 单页操作超时
+TURNSTILE_WAIT = 90            # Turnstile 等待上限
 
-try:
-    import requests
-    HAS_REQUESTS = True
-except ImportError:
-    HAS_REQUESTS = False
+TG_TOKEN       = os.getenv("TG_BOT_TOKEN", "")
+TG_CHAT_ID     = os.getenv("TG_CHAT_ID", "")
 
-# ========== 配置 ==========
-THRESHOLD = 45 * 3600
-MAX_SESSION_CAP = 45 * 3600
-MAX_ZERO_DIFF_ROUNDS = 2
-HEADLESS = True
-PAGE_LOAD_TIMEOUT = 120
-IMPLICIT_WAIT = 10
+SHOT_DIR       = Path("screenshots")
+SHOT_DIR.mkdir(exist_ok=True)
 
-DEBUG_DIR = "debug_output"
-os.makedirs(DEBUG_DIR, exist_ok=True)
+# ---------------------------------------------------------------------------
+# 日志
+# ---------------------------------------------------------------------------
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    datefmt="%H:%M:%S",
+    handlers=[
+        logging.StreamHandler(sys.stdout),
+        logging.FileHandler("renew.log", encoding="utf-8"),
+    ],
+)
+log = logging.getLogger("renew")
 
-# ========== 日志工具 ==========
-def log(msg: str, level: str = "INFO"):
-    ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    prefix = {"INFO": "[INFO]", "OK": "[OK]", "WARN": "[WARN]", "ERR": "[ERR]", "WAIT": "[WAIT]", "CLICK": "[CLICK]"}.get(level, "[INFO]")
-    print(f"[{ts}] {prefix} {msg}", flush=True)
 
-def save_screenshot(drv, name: str):
+# ---------------------------------------------------------------------------
+# 工具函数
+# ---------------------------------------------------------------------------
+def tg(msg: str):
+    """Telegram 通知（失败不影响主流程）"""
+    if not (TG_TOKEN and TG_CHAT_ID):
+        return
     try:
-        path = os.path.join(DEBUG_DIR, f"{name}_{datetime.now().strftime('%H%M%S')}.png")
-        drv.save_screenshot(path)
-        log(f"截图已保存: {path}", "INFO")
+        requests.post(
+            f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage",
+            json={"chat_id": TG_CHAT_ID, "text": msg, "parse_mode": "HTML"},
+            timeout=10,
+        )
     except Exception as e:
-        log(f"截图失败: {e}", "WARN")
+        log.warning(f"TG 通知失败: {e}")
 
-def send_tg_safe(title: str, body: str, detail: str = ""):
-    try:
-        result = send_tg(title, body, detail)
-        if result:
-            log("TG 通知发送成功", "OK")
-        else:
-            log("TG 通知返回失败", "WARN")
-    except Exception as e:
-        log(f"TG 通知异常: {e}", "WARN")
 
-def get_proxy_url() -> Optional[str]:
-    if os.environ.get("IS_PROXY") == "true":
-        log("使用 sing-box 本地代理: socks5://127.0.0.1:1080")
-        return "socks5://127.0.0.1:1080"
-    raw = os.environ.get("PROXY_URL") or os.environ.get("PROXY") or ""
-    raw = raw.strip()
-    if not raw:
-        return None
-    if raw.startswith(("http://", "https://", "socks5://", "socks5h://")):
-        return raw
-    if re.match(r'^[\d.]+:\d+$', raw):
-        return f"http://{raw}"
-    log(f"不支持的代理格式: {raw[:50]}... (跳过)", "WARN")
-    return None
+def parse_remaining_seconds(text: str) -> int:
+    """
+    从页面文本中解析剩余时间，返回秒数。
+    支持 '48h 30m', '47:30:00', '2d 5h', '90 min' 等
+    """
+    if not text:
+        return -1
+    t = text.lower().strip()
+    total = 0
 
-# ========== 时间解析 ==========
-def parse_time_str(text: str) -> Optional[int]:
-    text = text.strip()
-    m = re.search(r'(\d{1,2}):(\d{2}):(\d{2})', text)
+    # 优先匹配 HH:MM:SS 或 MM:SS
+    m = re.search(r"(\d{1,2}):(\d{2}):(\d{2})", t)
     if m:
-        h, mi, s = map(int, m.groups())
-        return h * 3600 + mi * 60 + s
-    m = re.search(r'(?:^|\s)(\d{1,2}):(\d{2})(?:\s|$)', text)
+        return int(m.group(1)) * 3600 + int(m.group(2)) * 60 + int(m.group(3))
+    m = re.search(r"(\d{1,2}):(\d{2})", t)
     if m:
-        mi, s = map(int, m.groups())
-        total = mi * 60 + s
-        if total >= 3600:
-            return total
-    return None
+        return int(m.group(1)) * 60 + int(m.group(2))
 
-def get_remaining_seconds(drv) -> Tuple[Optional[str], int]:
-    remaining_elements = drv.find_elements(By.XPATH, "//*[contains(translate(text(), 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'remaining')]")
-    
-    best_match = None
-    best_sec = 0
-    
-    for el in remaining_elements:
-        txt = (el.text or el.get_attribute("textContent") or "").strip()
-        if not txt:
-            continue
-        if any(skip in txt.lower() for skip in ["function ", "return {", "async send", "ad rewards", "balance"]):
-            continue
-        sec = parse_time_str(txt)
-        if sec is not None and sec >= 3600:
-            best_match = txt
-            best_sec = sec
-            log(f"找到剩余时间元素: {txt} => {sec}s", "INFO")
-    
-    if best_sec > 0:
-        return best_match, best_sec
-
-    try:
-        body = drv.execute_script("return document.body ? document.body.innerText : '';")
-        m = re.search(r'(\d{1,2}:\d{2}:\d{2})\s*remaining', body, re.IGNORECASE)
+    # 匹配 'Xd Xh Xm Xs' 或 'Xh Xm'
+    for unit, mult in [("d", 86400), ("day", 86400),
+                        ("h", 3600),  ("hour", 3600),
+                        ("m", 60),    ("min", 60), ("minute", 60),
+                        ("s", 1),     ("sec", 1)]:
+        m = re.search(rf"(\d+)\s*{unit}", t)
         if m:
-            sec = parse_time_str(m.group(1))
-            if sec and sec >= 3600:
-                log(f"通过正则找到剩余时间: {m.group(1)} ({sec}s)", "INFO")
-                return m.group(1), sec
-        
-        for pattern in [r'(\d{1,2}:\d{2}:\d{2})']:
-            m = re.search(pattern, body)
-            if m:
-                sec = parse_time_str(m.group(1))
-                if sec and sec >= 3600:
-                    log(f"通过兜底正则找到时间: {m.group(1)} ({sec}s)", "INFO")
-                    return m.group(1), sec
-                    
+            total += int(m.group(1)) * mult
+    return total if total > 0 else -1
+
+
+def human_sleep(a: float = 0.5, b: float = 1.5):
+    """模拟人类反应时间"""
+    time.sleep(random.uniform(a, b))
+
+
+def screenshot(sb, name: str):
+    """保存截图，返回路径"""
+    p = SHOT_DIR / f"{datetime.now():%H%M%S}_{name}.png"
+    try:
+        sb.save_screenshot(str(p))
+        log.info(f"截图: {p}")
     except Exception as e:
-        log(f"获取剩余时间失败: {e}", "WARN")
+        log.warning(f"截图失败: {e}")
+    return p
 
-    return None, 0
 
-def check_session_cap(drv) -> bool:
+# ---------------------------------------------------------------------------
+# 续期核心
+# ---------------------------------------------------------------------------
+def get_remaining_seconds(sb) -> int:
+    """从页面提取剩余时间，返回秒数（-1 表示无法识别）"""
     try:
-        body = drv.execute_script("return document.body ? document.body.innerText : '';")
-        body_lower = body.lower()
-        return any(pat in body_lower for pat in ['48h cap', 'cap 48h', '48h limit', 'maximum 48', 'max 48h'])
-    except:
-        return False
-
-def get_csrf_token(drv) -> str:
-    try:
-        token = drv.execute_script("""
-            return document.querySelector('meta[name="csrf-token"]')?.content || '';
-        """)
-        return token or ""
-    except:
-        return ""
-
-# ========== 续期核心逻辑 (v38 关键改动) ==========
-def renew_via_filament_action(drv) -> Tuple[bool, str]:
-    """
-    方法1: 通过 Filament Actions 触发续期。
-    Filament 使用 Livewire 组件来管理 actions，
-    可以通过 Livewire.dispatch 触发特定 action。
-    
-    从页面分析得知:
-    - filament/actions.js 已加载
-    - +24h 按钮使用 wire:click="extendPaid"
-    - +90min 按钮使用 @click="showExtendCaptcha()"
-    """
-    try:
-        # 尝试通过 Livewire 执行 extend 相关的 action
-        result = drv.execute_async_script("""
-            var callback = arguments[arguments.length - 1];
-            
-            // 等待 Livewire 完全加载
-            function waitForLivewire(retries) {
-                if (typeof Livewire !== 'undefined') {
-                    return true;
-                }
-                if (retries <= 0) return false;
-                setTimeout(function() { waitForLivewire(retries - 1); }, 500);
-                return false;
-            }
-            
-            if (typeof Livewire === 'undefined') {
-                setTimeout(function() {
-                    if (typeof Livewire === 'undefined') {
-                        callback({success:false, msg:'Livewire never loaded'});
-                    } else {
-                        doAction();
-                    }
-                }, 3000);
-                return;
-            }
-            
-            doAction();
-            
-            function doAction() {
-                // 方法1: 查找所有 Livewire 组件，尝试找到包含 extend 的 action
-                var components = Livewire.all();
-                var found = false;
-                
-                // 方法2: 尝试 dispatch 一个通用的 extend action
-                try {
-                    // Filament v3 使用 actions system
-                    // 尝试触发 extend 相关的 action
-                    Livewire.dispatch('extendServer');
-                    Livewire.dispatch('renewServer');
-                    Livewire.dispatch('addTime');
-                    Livewire.dispatch('extend');
-                    
-                    callback({success:true, msg:'Livewire.dispatch sent (may not have handler)'});
-                    found = true;
-                } catch(e) {
-                    callback({success:false, msg:'dispatch failed: '+e.message});
-                }
-            }
-        """)
-        
-        if isinstance(result, dict) and result.get('success'):
-            log(f"Filament Action 请求已发送: {result.get('msg', '')}", "OK")
-            return True, result.get('msg', '')
-        else:
-            msg = result.get('msg', 'Unknown') if isinstance(result, dict) else str(result)
-            log(f"Filament Action 失败: {msg}", "WARN")
-            return False, msg
-            
-    except Exception as e:
-        log(f"Filament Action 异常: {e}", "WARN")
-        return False, str(e)
-
-
-def renew_via_alpine_call(drv) -> Tuple[bool, str]:
-    """
-    方法2: 直接调用 Alpine.js 组件的方法。
-    按钮的 @click="showExtendCaptcha()" 绑定在 Alpine 组件上。
-    我们可以尝试找到对应的 Alpine 组件并调用其方法。
-    
-    但 showExtendCaptcha() 会触发 Turnstile，所以我们找的是
-    不调用 CAPTCHA 的替代方法。
-    """
-    try:
-        # 先收集 Alpine 组件信息
-        alpine_info = drv.execute_script("""
-            var info = {};
-            // 查找所有 x-data 元素
-            var allEls = document.querySelectorAll('[x-data]');
-            info.componentCount = allEls.length;
-            
-            // 尝试找到包含 showExtendCaptcha 或 watchAd 的组件
-            for (var i = 0; i < allEls.length; i++) {
-                var xdata = allEls[i].getAttribute('x-data') || '';
-                if (xdata.indexOf('showExtendCaptcha') !== -1 || 
-                    xdata.indexOf('watchAd') !== -1 ||
-                    xdata.indexOf('adRewardReady') !== -1) {
-                    info.foundComponentIndex = i;
-                    info.xdataPreview = xdata.substring(0, 500);
-                    
-                    // 尝试通过 Alpine.$data 访问组件数据
-                    try {
-                        var data = Alpine.$data(allEls[i]);
-                        info.componentDataKeys = Object.keys(data);
-                        info.adRewardReady = data.adRewardReady;
-                        info.extendDisabled = data.extendDisabled;
-                        info.cooldownSecs = data.cooldownSecs;
-                    } catch(e) {
-                        info.dataError = e.message;
-                    }
-                    break;
-                }
-            }
-            
-            return JSON.stringify(info);
-        """)
-        log(f"Alpine 组件信息: {alpine_info}", "WAIT")
-        
-        # 尝试直接调用 Alpine 组件上的方法
-        # 由于 showExtendCaptcha 会触发 CAPTCHA，我们跳过这个方法
-        # 改为尝试直接修改状态后刷新页面
-        
-        return False, "Alpine method analysis complete (no direct renew available)"
-        
-    except Exception as e:
-        log(f"Alpine 调用异常: {e}", "WARN")
-        return False, str(e)
-
-
-def renew_via_cloudflare_bypass(drv, csrf_token: str) -> Tuple[bool, str]:
-    """
-    方法3: 通过拦截 Cloudflare Turnstile token 来绕过 CAPTCHA。
-    
-    策略:
-    1. 点击按钮触发 Turnstile
-    2. 等待 Turnstile iframe 生成 token
-    3. 从 iframe 中提取 token
-    4. 将 token 提交到续期请求中
-    """
-    try:
-        # 获取 Turnstile sitekey
-        sitekey = drv.execute_script("""
-            var turnstiles = document.querySelectorAll('.cf-turnstile');
-            if (turnstiles.length > 0) {
-                return turnstiles[0].getAttribute('data-sitekey') || 
-                       turnstiles[0].querySelector('iframe')?.src?.match(/sitekey=([^&]+)/)?.[1] || '';
-            }
-            // 也检查 script src
-            var scripts = document.querySelectorAll('script[src*="turnstile"]');
-            if (scripts.length > 0) {
-                return scripts[0].src.match(/sitekey=([^&]+)/)?.[1] || '';
-            }
-            return '';
-        """)
-        
-        log(f"Turnstile sitekey: {sitekey[:20] if sitekey else 'NOT FOUND'}", "WAIT")
-        
-        if not sitekey:
-            return False, "No Turnstile sitekey found"
-        
-        # 点击按钮触发 Turnstile
-        btn = drv.find_element(By.XPATH, '//button[contains(., "90") and contains(., "min")]')
-        if btn.is_displayed() and btn.is_enabled():
-            btn.click()
-            log("按钮已点击，等待 Turnstile...", "WAIT")
-        else:
-            return False, "Button not clickable"
-        
-        # 等待 Turnstile iframe 出现并获取 token
-        max_wait = 60
-        start = time.time()
-        turnstile_token = None
-        
-        while time.time() - start < max_wait:
-            try:
-                # 尝试从 Turnstile iframe 中获取 token
-                token = drv.execute_script("""
-                    // Turnstile stores token in a hidden input or via API
-                    var turnstiles = document.querySelectorAll('.cf-turnstile');
-                    for (var i = 0; i < turnstiles.length; i++) {
-                        var t = turnstiles[i];
-                        // Check for response input
-                        var response = t.querySelector('input[name="cf-turnstile-response"]');
-                        if (response && response.value) return response.value;
-                        // Check for widget token
-                        var id = t.getAttribute('id');
-                        if (id && typeof turnstileResponse !== 'undefined') {
-                            // Try to get token via turnstile API
-                        }
-                    }
-                    return null;
-                """)
-                
-                if token:
-                    turnstile_token = token
-                    log(f"✅ 获取到 Turnstile token: {token[:20]}...", "OK")
-                    break
-                
-                # 尝试另一种方式：轮询 Turnstile response
-                response = drv.execute_script("""
-                    var frames = document.querySelectorAll('iframe[src*="turnstile"]');
-                    for (var i = 0; i < frames.length; i++) {
-                        try {
-                            var innerDoc = frames[i].contentDocument || frames[i].contentWindow.document;
-                            var inputs = innerDoc.querySelectorAll('input[type="hidden"]');
-                            for (var j = 0; j < inputs.length; j++) {
-                                if (inputs[j].name && inputs[j].value && inputs[j].value.length > 10) {
-                                    return inputs[j].value;
-                                }
-                            }
-                        } catch(e) {}
-                    }
-                    return null;
-                """)
-                
-                if response:
-                    turnstile_token = response
-                    log(f"✅ 从 iframe 获取到 Turnstile token", "OK")
-                    break
-                    
-            except:
-                pass
-            
-            elapsed = int(time.time() - start)
-            if elapsed % 10 == 0:
-                log(f"等待 Turnstile token... ({elapsed}s)", "WAIT")
-            time.sleep(5)
-        
-        if not turnstile_token:
-            log("未能在超时内获取 Turnstile token", "WARN")
-            return False, "Token not obtained within timeout"
-        
-        # 用 token 提交续期请求
-        base_url = "https://control.gaming4free.net"
-        cookies_dict = {}
-        for c in drv.get_cookies():
-            cookies_dict[c['name']] = c['value']
-        
-        headers = {
-            "X-CSRF-TOKEN": csrf_token,
-            "Accept": "application/json",
-            "X-Requested-With": "XMLHttpRequest",
-        }
-        
-        # 尝试多个端点，携带 turnstile token
-        endpoints_to_try = [
-            ("/server/extend", {"minutes": 90, "cf_turnstile_response": turnstile_token}),
-            ("/console/extend", {"minutes": 90, "cf_turnstile_response": turnstile_token}),
+        # 常见选择器，按优先级尝试
+        selectors = [
+            "#timeleft", ".timeleft", ".time-left",
+            "#remaining", ".remaining", ".countdown",
+            '[class*="time"]', '[id*="time"]',
+            '[class*="remain"]', '[id*="remain"]',
         ]
-        
-        for endpoint, payload in endpoints_to_try:
+        for sel in selectors:
             try:
-                resp = requests.post(base_url + endpoint, json=payload,
-                                    cookies=cookies_dict, headers=headers,
-                                    timeout=10, allow_redirects=False)
-                log(f"Turnstile token POST [{endpoint}]: status={resp.status_code}, body={resp.text[:200]}", "WAIT")
-                if resp.status_code in [200, 201, 302]:
-                    log(f"✅ Turnstile token 续期成功: {endpoint}", "OK")
-                    return True, f"Turnstile token: {endpoint} ({resp.status_code})"
-            except Exception as e:
-                log(f"Turnstile token POST [{endpoint}] 异常: {e}", "WARN")
-        
-        return False, "All endpoints failed with Turnstile token"
-        
+                txt = sb.get_text(sel) if sb.is_element_visible(sel) else ""
+                sec = parse_remaining_seconds(txt)
+                if sec > 0:
+                    log.info(f"剩余时间 [{sel}] = {txt} → {sec}s ({sec//3600}h {(sec%3600)//60}m)")
+                    return sec
+            except Exception:
+                continue
+
+        # 兜底：整页文本提取
+        body_text = sb.get_text("body")
+        # 找类似 '47h 30m' / '47:30:00' 的片段
+        for line in body_text.split("\n"):
+            sec = parse_remaining_seconds(line)
+            if 60 < sec < MAX_HOURS * 3600 + 3600:
+                log.info(f"剩余时间 [body line] = {line.strip()} → {sec}s")
+                return sec
+        return -1
     except Exception as e:
-        log(f"Cloudflare bypass 异常: {e}", "WARN")
-        return False, str(e)
+        log.warning(f"提取剩余时间失败: {e}")
+        return -1
 
 
-# ========== 账号处理 ==========
-def process_account(drv, name: str, url: str, cookie: str) -> bool:
-    log(f"========== 开始处理账号: {name} ==========")
-    log(f"目标 URL: {url}")
+def click_renew_button(sb) -> bool:
+    """找到并点击续期按钮，返回是否点到了"""
+    candidates = [
+        # 文字匹配优先
+        'button:contains("Renew")',
+        'button:contains("Extend")',
+        'button:contains("续期")',
+        'button:contains("增加")',
+        'a:contains("Renew")',
+        # 选择器兜底
+        "#renew", ".renew", ".btn-renew",
+        'button[class*="renew"]', 'a[class*="renew"]',
+        'button[class*="extend"]', 'a[class*="extend"]',
+    ]
+    for sel in candidates:
+        try:
+            if sb.is_element_visible(sel):
+                # 模拟人类阅读
+                human_sleep(1.0, 2.5)
+                # 滚到可视区
+                sb.scroll_to(sel)
+                human_sleep(0.3, 0.8)
+                # UC mode 推荐用 .click()，必要时用 js click
+                try:
+                    sb.click(sel, timeout=8)
+                except Exception:
+                    sb.execute_script(
+                        "document.querySelector(arguments[0]).click();", sel
+                    )
+                log.info(f"✅ 点击续期按钮 [{sel}]")
+                return True
+        except Exception:
+            continue
+    log.warning("❌ 未找到续期按钮")
+    return False
 
+
+def handle_turnstile(sb) -> bool:
+    """处理 Cloudflare Turnstile，返回是否检测到并尝试通过"""
     try:
-        drv.get("https://control.gaming4free.net/login")
-        time.sleep(2)
-    except:
-        pass
+        # Turnstile iframe 选择器
+        iframe_sel = 'iframe[src*="challenges.cloudflare.com"]'
+        if not sb.is_element_present(iframe_sel):
+            log.info("未检测到 Turnstile iframe，跳过")
+            return True
 
-    for pair in cookie.split(";"):
-        pair = pair.strip()
-        if "=" in pair:
-            k, v = pair.split("=", 1)
+        log.info("🔄 检测到 Cloudflare Turnstile，等待自动通过（UC mode + WARP 大概率自动过）...")
+        screenshot(sb, "turnstile_appear")
+
+        # 等待最多 TURNSTILE_WAIT 秒，每秒检查一次
+        for i in range(TURNSTILE_WAIT):
+            # 检测 Turnstile 是否已通过：响应 input 有值
             try:
-                drv.add_cookie({"name": k.strip(), "value": v.strip(), "domain": ".gaming4free.net", "path": "/"})
-            except:
+                val = sb.execute_script(
+                    """let el = document.querySelector('[name="cf-turnstile-response"]');
+                    if (!el) el = document.querySelector('input[name*="turnstile"]');
+                    return el ? el.value : '';"""
+                )
+                if val and len(val) > 20:
+                    log.info(f"✅ Turnstile 已通过 ({i}s)")
+                    return True
+            except Exception:
                 pass
-    log("Cookie 已注入")
 
-    try:
-        drv.get(url)
-        WebDriverWait(drv, 30).until(lambda d: d.execute_script("return document.readyState") == "complete")
+            # 尝试点击 iframe 内的复选框（UC mode 允许跨 iframe）
+            try:
+                if i == 3:  # 出现后等 3 秒再尝试点击
+                    sb.switch_to_frame(iframe_sel)
+                    try:
+                        if sb.is_element_visible('input[type="checkbox"]'):
+                            sb.click('input[type="checkbox"]', timeout=3)
+                            log.info("点击 Turnstile checkbox")
+                    except Exception:
+                        pass
+                    finally:
+                        sb.switch_to_default_content()
+            except Exception:
+                pass
+
+            time.sleep(1)
+
+        log.warning(f"⚠️ Turnstile {TURNSTILE_WAIT}s 未通过")
+        screenshot(sb, "turnstile_timeout")
+        return False
     except Exception as e:
-        log(f"页面加载异常: {e}", "WARN")
-
-    time.sleep(5)
-
-    title = drv.title
-    log(f"页面标题: {title}")
-    if "Login" in title or "Sign in" in title:
-        log("Cookie 失效，跳转到登录页", "ERR")
-        save_screenshot(drv, f"{name}_login_fail")
+        log.warning(f"Turnstile 处理异常: {e}")
         return False
 
-    csrf_token = get_csrf_token(drv)
-    if csrf_token:
-        log(f"CSRF Token 已获取: {csrf_token[:10]}...", "OK")
-    else:
-        log("未找到 CSRF Token", "WARN")
 
-    zero_diff_count = 0
-    for round_num in range(1, MAX_ROUNDS + 1):
-        log(f"\n--- 第 {round_num}/{MAX_ROUNDS} 轮 ---")
+def inject_cookies(sb):
+    """如果提供了 cookie 字符串，注入到当前域名"""
+    if not COOKIE_STR:
+        return
+    log.info("注入自定义 cookie ...")
+    for item in COOKIE_STR.split(";"):
+        if "=" in item:
+            k, v = item.strip().split("=", 1)
+            try:
+                sb.set_cookie(k, v)
+            except Exception:
+                pass
 
-        # 安全检查
+
+def do_login(sb):
+    """登录逻辑（如有）"""
+    if not USERNAME:
+        log.info("未配置 MC_USERNAME，跳过登录")
+        return
+    log.info(f"尝试登录用户: {USERNAME}")
+
+    # 通用登录表单选择器
+    user_selectors = ['input[name="username"]', 'input[name="user"]',
+                       'input[name="mc_username"]', 'input[type="text"]',
+                       'input[id*="user"]', 'input[name="email"]']
+    pass_selectors = ['input[name="password"]', 'input[type="password"]']
+    submit_selectors = ['button[type="submit"]', 'input[type="submit"]',
+                         'button:contains("Login")', 'button:contains("登录")',
+                         'button:contains("Sign in")']
+
+    # 用户名
+    for sel in user_selectors:
         try:
-            body = drv.execute_script("return document.body ? document.body.innerText : '';")
-            body_lower = body.lower()
-            if "suspended" in title.lower() or "suspended" in body_lower:
-                log(f"⚠️ 检测到账号被暂停: {title}", "ERR")
-                save_screenshot(drv, f"{name}_suspended")
-                return False
-            if "login" in title.lower() or "sign in" in title.lower():
-                log("⚠️ Cookie 失效", "ERR")
-                save_screenshot(drv, f"{name}_login_fail")
-                return False
-        except Exception as e:
-            log(f"检查页面状态失败: {e}", "WARN")
-
-        rem_text, rem_sec = get_remaining_seconds(drv)
-        if rem_sec == 0:
-            log("无法获取剩余时间，刷新页面", "WARN")
-            save_screenshot(drv, f"{name}_no_remaining_time_r{round_num}")
-            drv.refresh()
-            time.sleep(5)
+            if sb.is_element_visible(sel):
+                sb.type(sel, USERNAME, timeout=5)
+                break
+        except Exception:
             continue
-
-        log(f"当前剩余: {rem_text} ({rem_sec} 秒)")
-
-        if rem_sec > MAX_SESSION_CAP:
-            log(f"剩余 {rem_sec//3600}h > 会话上限，结束", "WARN")
-            return True
-
-        if zero_diff_count >= MAX_ZERO_DIFF_ROUNDS:
-            log(f"连续 {zero_diff_count} 轮增量<=0，结束该账号", "WARN")
-            return True
-
-        if rem_sec > THRESHOLD:
-            log(f"剩余时间 > 阈值({THRESHOLD//3600}h)，无需续期", "OK")
-            return True
-
-        pre_sec = rem_sec
-
-        # 续期优先级: Turnstile Bypass > Alpine分析 > Filament Action > UI 按钮
-        renew_success = False
-        renew_method = ""
-        
-        # 方法1: Cloudflare Turnstile token 提取 + HTTP POST
-        if csrf_token:
-            log("尝试方法1: Turnstile token 提取 + HTTP POST...", "WAIT")
-            success, msg = renew_via_cloudflare_bypass(drv, csrf_token)
-            if success:
-                renew_success = True
-                renew_method = "Turnstile_Bypass"
-                log(f"Turnstile Bypass 续期成功: {msg}", "OK")
-            else:
-                log(f"Turnstile Bypass 续期失败: {msg}", "WARN")
-        
-        # 方法2: Alpine.js 组件分析
-        if not renew_success:
-            log("尝试方法2: Alpine.js 组件分析...", "WAIT")
-            success, msg = renew_via_alpine_call(drv)
-            if success:
-                renew_success = True
-                renew_method = "Alpine_Call"
-                log(f"Alpine 续期成功: {msg}", "OK")
-            else:
-                log(f"Alpine 续期失败: {msg}", "WARN")
-        
-        # 方法3: Filament Action dispatch
-        if not renew_success:
-            log("尝试方法3: Filament Action dispatch...", "WAIT")
-            success, msg = renew_via_filament_action(drv)
-            if success:
-                renew_success = True
-                renew_method = "Filament_Action"
-                log(f"Filament Action 续期成功: {msg}", "OK")
-            else:
-                log(f"Filament Action 续期失败: {msg}", "WARN")
-        
-        # 方法4: UI 按钮（最后手段）
-        if not renew_success:
-            log("尝试方法4: UI 按钮...", "WARN")
+    # 密码
+    if PASSWORD:
+        for sel in pass_selectors:
             try:
-                btn = drv.find_element(By.XPATH, '//button[contains(., "90") and contains(., "min")]')
-                if btn.is_displayed() and btn.is_enabled():
-                    btn.click()
-                    renew_success = True
-                    renew_method = "Button"
-                    log("UI 按钮已点击", "WARN")
-                else:
-                    log("按钮不可点击", "WARN")
-            except Exception as e:
-                log(f"UI 按钮点击失败: {e}", "WARN")
-
-        # 等待续期生效
-        log(f"等待续期生效 ({renew_method})...", "WAIT")
-        time.sleep(15)
-
-        final_text, final_sec = get_remaining_seconds(drv)
-        diff = final_sec - pre_sec
-        log(f"本轮结果: {final_text} ({final_sec}s), 增量: {diff}s (方法: {renew_method})", "INFO")
-
-        if diff > 300:
-            log(f"✅ 续期成功! +{diff//60} 分钟 (方法: {renew_method})", "OK")
-            zero_diff_count = 0
-            send_tg_safe("✅ 续期成功", f"[{name}] {final_text}", f"+{diff//60} 分钟 ({renew_method})")
-            time.sleep(30)
-            try:
-                drv.refresh()
+                if sb.is_element_visible(sel):
+                    sb.type(sel, PASSWORD, timeout=5)
+                    break
+            except Exception:
+                continue
+    # 提交
+    for sel in submit_selectors:
+        try:
+            if sb.is_element_visible(sel):
+                human_sleep(0.5, 1.2)
+                sb.click(sel, timeout=5)
+                log.info("登录表单已提交")
                 time.sleep(3)
-            except:
-                pass
-            continue
-        else:
-            log(f"❌ 续期失败，增量不足: {diff}s (方法: {renew_method})", "ERR")
-            zero_diff_count += 1
-            save_screenshot(drv, f"{name}_fail_r{round_num}")
-            send_tg_safe("❌ 续期失败", f"[{name}] {rem_text}", f"增量: {diff}s ({renew_method})")
-
-            time.sleep(5)
-            try:
-                drv.refresh()
-                time.sleep(5)
-            except:
-                pass
+                return
+        except Exception:
             continue
 
-    log(f"达到最大轮次 ({MAX_ROUNDS})，结束该账号")
-    return True
 
-def build_driver() -> Driver:
-    proxy = get_proxy_url()
-    log(f"代理: {proxy or '直连'}")
-    
-    drv = Driver(
-        uc=True,
-        headless=HEADLESS,
-        incognito=True,
-        proxy=proxy,
-        chromium_arg="--disable-blink-features=AutomationControlled",
-        page_load_strategy="eager",
-        window_size="1920,1080",
-        agent="Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-        undetectable=True,
-        headless2=HEADLESS,
-    )
-    drv.set_page_load_timeout(PAGE_LOAD_TIMEOUT)
-    drv.implicitly_wait(IMPLICIT_WAIT)
-    return drv
+# ---------------------------------------------------------------------------
+# 主流程
+# ---------------------------------------------------------------------------
+def run():
+    from seleniumbase import SB
 
-def main():
-    log("========== Gaming4Free Pro 自动续期启动 (SeleniumBase UC v38) ==========")
+    log.info("=" * 60)
+    log.info("gaming4free 续期启动")
+    log.info(f"WARP 代理: {WARP_PROXY}")
+    log.info(f"目标站点: {SITE_URL}")
+    log.info(f"MC 用户:  {USERNAME or '(未配置)'}")
+    log.info("=" * 60)
 
-    log("🔍 检查 Telegram 通知配置...")
-    from tg import check_tg_config, send_tg
-    tg_config_ok = check_tg_config()
-
-    if tg_config_ok:
-        log("📤 发送 TG 测试通知...", "INFO")
-        try:
-            test_result = send_tg("🧪 TG 通知测试", "Gaming4Free Pro", "配置正常")
-            if test_result:
-                log("✅ TG 测试通知发送成功", "OK")
-            else:
-                log("⚠️ TG 测试通知发送失败", "WARN")
-        except Exception as e:
-            log(f"⚠️ TG 测试通知异常: {e}", "WARN")
-
-    if not ACCOUNTS:
-        log("❌ 未配置任何账号", "ERR")
+    # 预检 WARP
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        s.settimeout(3)
+        s.connect(("127.0.0.1", 40000))
+        s.close()
+        log.info("✅ WARP SOCKS5 端口 40000 可用")
+    except Exception:
+        log.error("❌ WARP 端口 40000 不可达，请检查 WARP 启动状态")
+        tg("❌ gaming4free 续期失败：WARP 代理未就绪")
         sys.exit(1)
 
-    log(f"共 {len(ACCOUNTS)} 个账号待处理")
+    # UC mode 启动
+    with SB(
+        browser="chromium",
+        uc=True,                                # undetected chromedriver
+        headless=False,                          # Xvfb 下跑非 headless，反检测更强
+        xvfb=True,                               # 自动用 Xvfb 虚拟显示
+        incognito=False,
+        agent="Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+              "(KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
+        disable_cookies=False,
+        ignore_certificate_errors=True,
+        proxy=WARP_PROXY,
+        ad_block=False,                          # 别开 ad block，可能误杀 Turnstile
+        localized=False,
+    ) as sb:
 
-    for idx, (name, url, cookie) in enumerate(ACCOUNTS, 1):
-        log(f"\n{'='*60}")
-        log(f"账号 {idx}/{len(ACCOUNTS)}: {name}")
-        log(f"{'='*60}")
+        sb.set_window_size(1280, 800)
+        sb.driver.set_page_load_timeout(PAGE_TIMEOUT)
 
-        drv = None
-        for attempt in range(3):
-            try:
-                drv = build_driver()
-                ok = process_account(drv, name, url, cookie)
-                if ok:
-                    break
-            except Exception as e:
-                log(f"第 {attempt+1} 次运行异常: {e}", "ERR")
-                log(traceback.format_exc(), "ERR")
-                if drv:
-                    save_screenshot(drv, f"{name}_exc_attempt{attempt+1}")
-            finally:
-                if drv:
-                    try:
-                        drv.quit()
-                    except:
-                        pass
-            if attempt < 2:
-                log("10 秒后重试...", "WAIT")
+        # Step 1: 打开站点
+        try:
+            sb.open(SITE_URL)
+            sb.sleep(2)
+        except Exception as e:
+            log.error(f"打开站点失败: {e}")
+            screenshot(sb, "open_fail")
+            tg(f"❌ gaming4free 续期失败：站点打不开\n{e}")
+            return
+
+        # Step 2: 处理 CF 5 秒盾（如有）
+        log.info("等待 CF 5 秒盾（如有）...")
+        for _ in range(15):
+            if "just a moment" in sb.get_text("body").lower():
+                time.sleep(1)
+            else:
+                break
+
+        # Step 3: 注入 cookie / 登录
+        inject_cookies(sb)
+        if LOGIN_URL:
+            sb.open(LOGIN_URL)
+            sb.sleep(2)
+            do_login(sb)
+            sb.open(SITE_URL)
+            sb.sleep(2)
+
+        screenshot(sb, "dashboard")
+
+        # Step 4: 主循环 - 反复点击续期直到接近 48h
+        click_count = 0
+        last_sec = get_remaining_seconds(sb)
+        log.info(f"初始剩余: {last_sec}s ({last_sec//3600}h {(last_sec%3600)//60}m)")
+
+        while click_count < MAX_CLICKS:
+            # 接近上限就停
+            if last_sec >= (MAX_HOURS - 1) * 3600:
+                log.info(f"🎉 已接近 {MAX_HOURS}h 上限，停止续期")
+                break
+
+            # Step 4.1: 点击续期按钮
+            if not click_renew_button(sb):
+                screenshot(sb, f"no_btn_{click_count}")
+                log.warning("本次未找到按钮，可能需要刷新页面")
+                sb.refresh()
+                sb.sleep(3)
+                last_sec = get_remaining_seconds(sb)
+                continue
+
+            # Step 4.2: 处理可能出现的 Turnstile
+            human_sleep(1.0, 2.0)
+            handle_turnstile(sb)
+
+            # Step 4.3: 等待响应
+            human_sleep(3.0, 5.0)
+            sb.sleep(2)
+
+            # Step 4.4: 对比时间
+            new_sec = get_remaining_seconds(sb)
+            delta = new_sec - last_sec
+            log.info(f"点击 #{click_count+1}: {last_sec}s → {new_sec}s (Δ={delta}s)")
+
+            if new_sec > last_sec:
+                click_count += 1
+                log.info(f"✅ 续期成功 (累计 {click_count} 次)")
+                screenshot(sb, f"success_{click_count}")
+                last_sec = new_sec
+            else:
+                log.warning(f"⚠️ 续期可能失败，时间未增加")
+                screenshot(sb, f"fail_{click_count}")
+                # 失败一次重试刷新
+                sb.refresh()
+                sb.sleep(3)
+                last_sec = get_remaining_seconds(sb)
+                click_count += 1   # 计入尝试次数
+
+            # Step 4.5: 冷却
+            if last_sec >= (MAX_HOURS - 1) * 3600:
+                break
+            log.info(f"⏳ 冷却 {COOLDOWN_SEC}s ...")
+            for i in range(COOLDOWN_SEC, 0, -10):
+                log.info(f"  剩 {i}s")
                 time.sleep(10)
-        else:
-            log(f"账号 {name} 3 次尝试均失败", "ERR")
 
-    log("\n========== 所有账号处理完成 ==========")
+        # 收尾
+        final_sec = get_remaining_seconds(sb)
+        h, m = final_sec // 3600, (final_sec % 3600) // 60
+        msg = (f"✅ gaming4free 续期完成\n"
+               f"成功点击: {click_count} 次\n"
+               f"最终剩余: {h}h {m}m")
+        log.info(msg)
+        tg(msg)
+        screenshot(sb, "final")
+
 
 if __name__ == "__main__":
-    main()
+    try:
+        run()
+    except KeyboardInterrupt:
+        log.info("用户中断")
+    except Exception as e:
+        log.exception(f"❌ 未捕获异常: {e}")
+        tg(f"❌ gaming4free 续期崩溃\n{e}")
+        sys.exit(1)
