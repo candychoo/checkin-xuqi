@@ -483,7 +483,7 @@ def run():
     chrome_opts.add_argument("--window-size=1280,720")
     chrome_opts.add_argument("--disable-blink-features=AutomationControlled")
     chrome_opts.add_argument("--disable-infobars")
-    chrome_opts.add_argument("--disable-popup-blocking")
+    chrome_opts.add_argument("--disable-popup-blocking,--proxy-server=socks5://127.0.0.1:1080")
 
     log.info(f"正在启动浏览器 (uc=True, headed=True, xvfb=True)...")
     with SB(
@@ -493,7 +493,7 @@ def run():
         headed=True,
         headless=False,
         xvfb=True,
-        chrome_options=chrome_opts,
+        chromium_arg="--no-sandbox,--disable-dev-shm-usage,--disable-gpu,--window-size=1280,720,--disable-blink-features=AutomationControlled,--disable-infobars,--disable-popup-blocking,--proxy-server=socks5://127.0.0.1:1080",
     ) as sb:
         log.info("✅ 浏览器启动成功")
         sb.set_window_size(1280, 720)

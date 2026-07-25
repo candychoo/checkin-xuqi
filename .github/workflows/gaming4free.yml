@@ -41,9 +41,13 @@ jobs:
           if [ -n "$NODE_LINK" ]; then
             bash <(wget -qO- https://main.ssss.nyc.mn/setup_proxy.sh)
             sleep 5
+            # 测试 SOCKS5 和 HTTP 代理
             if curl -x "socks5://127.0.0.1:1080" --max-time 5 -s https://api.ipify.org > /dev/null 2>&1; then
               echo "IS_PROXY=true" >> $GITHUB_ENV
-              echo "代理连通性测试通过"
+              echo "代理连通性测试通过 (SOCKS5)"
+            elif curl -x "http://127.0.0.1:20170" --max-time 5 -s https://api.ipify.org > /dev/null 2>&1; then
+              echo "IS_PROXY=true" >> $GITHUB_ENV
+              echo "代理连通性测试通过 (HTTP)"
             else
               echo "代理连通性测试失败，将直连"
             fi
