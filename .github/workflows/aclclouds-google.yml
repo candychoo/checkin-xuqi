@@ -1,0 +1,38 @@
+name: ACLClouds-Google自动续期
+
+on:
+  schedule:
+    # UTC 01:00（北京时间 09:00）
+    - cron: "0 1 * * *"
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+jobs:
+  renew:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      - name: 设置 Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: 安装 Playwright
+        run: |
+          npm init -y
+          npm install playwright
+          npx playwright install chromium
+
+      - name: 运行 Google 登录续期
+        env:
+          ACL_EMAIL: ${{ secrets.ACL_GOOGLE_EMAIL }}
+          ACL_PASSWORD: ${{ secrets.ACL_GOOGLE_PASSWORD }}
+          TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
+          TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
+        run: node google-renew.js
