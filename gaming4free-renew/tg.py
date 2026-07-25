@@ -69,12 +69,12 @@ def check_tg_config():
 
     # 检查格式
     if not TG_BOT.startswith(""):
-        log("⚠️  TG 配置: TG_BOT_TOKEN 格式错误", "WARN")
+        log("⚠️  TG 配置: TG_BOT_TOKEN 格式错误（应以数字开头）")
         return False
 
     if not TG_CHAT.startswith(""):
-        log("⚠️  TG 配置: TG_CHAT_ID 格式错误", "WARN")
+        log("⚠️  TG 配置: TG_CHAT_ID 格式错误（应以数字开头）")
         return False
 
-    log(f"✅ TG 配置: {TG_BOT[:10]}... / {TG_CHAT[:10]}...", "OK")
+    log(f"✅ TG 配置: {TG_BOT[:10]}... / {TG_CHAT[:10]}...")
     return True
