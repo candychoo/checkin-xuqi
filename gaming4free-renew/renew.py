@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Gaming4Free Pro 自动续期 - SeleniumBase UC 模式 (v34)
-核心改进: 绕过 UI 按钮触发 Turnstile，改用 Livewire API 直接续期
+Gaming4Free Pro 自动续期 - SeleniumBase UC 模式 (v35)
+核心改进: 修复 Livewire + Fetch API 调用，增加调试信息
 
 修改记录:
-- v34: 使用 Livewire @extends 事件直接续期（不触发 Turnstile CAPTCHA）;
-       如果 Livewire 不可用，回退到 fetch API 直接调用后端接口;
-       修复时间解析避免匹配 JS 代码;
+- v35: 修复 Livewire 调用方式（使用 new Livewire.Component() 或 window.livewire.find）;
+       修复 Fetch JS 中 {{}} 转义问题（execute_async_script 会将 {{}} 转为 {}）;
+       增加页面 HTML 片段调试输出，帮助诊断 Livewire 组件结构;
        TG 通知安全封装。
 """
 import os
@@ -28,9 +28,9 @@ from cfg import ACCOUNTS, TG_BOT, TG_CHAT, MAX_ROUNDS
 from tg import send_tg
 
 # ========== 配置 ==========
-THRESHOLD = 45 * 3600          # 剩余时间阈值 45h
-MAX_SESSION_CAP = 45 * 3600     # 会话最大限制
-MAX_ZERO_DIFF_ROUNDS = 2       # 连续增量<=0 判定次数
+THRESHOLD = 45 * 3600
+MAX_SESSION_CAP = 45 * 3600
+MAX_ZERO_DIFF_ROUNDS = 2
 HEADLESS = True
 PAGE_LOAD_TIMEOUT = 120
 IMPLICIT_WAIT = 10
@@ -53,7 +53,6 @@ def save_screenshot(drv, name: str):
         log(f"截图失败: {e}", "WARN")
 
 def send_tg_safe(title: str, body: str, detail: str = ""):
-    """安全发送 TG 通知"""
     try:
         result = send_tg(title, body, detail)
         if result:
@@ -80,7 +79,6 @@ def get_proxy_url() -> Optional[str]:
 
 # ========== 时间解析 ==========
 def parse_time_str(text: str) -> Optional[int]:
-    """从文本中解析 HH:MM:SS / H:MM:SS / MM:SS 为秒数"""
     text = text.strip()
     m = re.search(r'(\d{1,2}):(\d{2}):(\d{2})', text)
     if m:
@@ -95,8 +93,6 @@ def parse_time_str(text: str) -> Optional[int]:
     return None
 
 def get_remaining_seconds(drv) -> Tuple[Optional[str], int]:
-    """获取当前剩余时间"""
-    # 策略1: 查找包含 "remaining" 关键字的元素
     remaining_elements = drv.find_elements(By.XPATH, "//*[contains(translate(text(), 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'remaining')]")
     
     best_match = None
@@ -106,7 +102,6 @@ def get_remaining_seconds(drv) -> Tuple[Optional[str], int]:
         txt = (el.text or el.get_attribute("textContent") or "").strip()
         if not txt:
             continue
-        # 跳过 JS 代码块、广告相关
         if any(skip in txt.lower() for skip in ["function ", "return {", "async send", "ad rewards", "balance"]):
             continue
         sec = parse_time_str(txt)
@@ -118,11 +113,8 @@ def get_remaining_seconds(drv) -> Tuple[Optional[str], int]:
     if best_sec > 0:
         return best_match, best_sec
 
-    # 策略2: 从 body 全文正则提取
     try:
         body = drv.execute_script("return document.body ? document.body.innerText : '';")
-        
-        # 优先匹配 "XX:XX:XXremaining" 模式
         m = re.search(r'(\d{1,2}:\d{2}:\d{2})\s*remaining', body, re.IGNORECASE)
         if m:
             sec = parse_time_str(m.group(1))
@@ -130,7 +122,6 @@ def get_remaining_seconds(drv) -> Tuple[Optional[str], int]:
                 log(f"通过正则找到剩余时间: {m.group(1)} ({sec}s)", "INFO")
                 return m.group(1), sec
         
-        # 兜底: 找所有 HH:MM:SS
         for pattern in [r'(\d{1,2}:\d{2}:\d{2})']:
             m = re.search(pattern, body)
             if m:
@@ -152,125 +143,197 @@ def check_session_cap(drv) -> bool:
     except:
         return False
 
-# ========== Turnstile 检测 ==========
-def is_turnstile_active(drv) -> bool:
-    """检测 Turnstile CAPTCHA 是否正在显示"""
+def get_csrf_token(drv) -> str:
     try:
-        # 检查 cf-turnstile div
-        turnstile_divs = drv.find_elements(By.CSS_SELECTOR, "div.cf-turnstile")
-        for div in turnstile_divs:
-            if div.is_displayed():
-                return True
-        # 检查 iframe
-        iframes = drv.find_elements(By.TAG_NAME, "iframe")
-        for iframe in iframes:
-            src = iframe.get_attribute("src") or ""
-            if "turnstile" in src.lower() or "challenges.cloudflare" in src.lower():
-                return True
-        # 检查文字
-        body = drv.execute_script("return document.body ? document.body.innerText : '';")
-        if "verify you're human" in body.lower():
-            return True
-        return False
+        token = drv.execute_script("""
+            return document.querySelector('meta[name="csrf-token"]')?.content ||
+                   document.querySelector('input[name="_token"]')?.value ||
+                   document.querySelector('[name="_token"]')?.value || '';
+        """)
+        return token or ""
     except:
-        return False
+        return ""
 
-# ========== 续期核心逻辑 (v34 关键改动) ==========
+# ========== 续期核心逻辑 (v35 关键改动) ==========
 def renew_via_livewire(drv) -> Tuple[bool, str]:
     """
-    通过 Livewire API 直接续期，绕过 UI 按钮触发 Turnstile。
-    返回 (success, message)
+    通过 Livewire API 直接续期。
+    v35 修复: 使用多种 Livewire 访问方式，增加调试输出。
     """
     try:
-        # 方法1: 使用 Livewire call('extend')
-        result = drv.execute_async_script("""
-            // 等待 Livewire 加载
-            const callback = arguments[arguments.length - 1];
+        # 先收集调试信息
+        debug_info = drv.execute_script("""
+            var info = {};
+            // Livewire 全局对象
+            info.hasLivewireGlobal = (typeof Livewire !== 'undefined');
+            info.hasWindowLivewire = (typeof window.livewire !== 'undefined');
             
-            if (typeof Livewire === 'undefined' && typeof window.livewire === 'undefined') {
-                // 尝试等待 Livewire 加载
-                setTimeout(() => {
-                    if (typeof Livewire === 'undefined' && typeof window.livewire === 'undefined') {
-                        callback({ success: false, message: 'Livewire not loaded' });
-                    } else {
-                        doExtend();
+            if (info.hasLivewireGlobal) {
+                info.Livewire_keys = Object.keys(Livewire);
+                try { info.Livewire_all_count = Livewire.all ? Livewire.all.length : 'N/A'; } catch(e) { info.Livewire_all_count = 'error: '+e.message; }
+                try { info.Livewire_find = typeof Livewire.find; } catch(e) { info.Livewire_find = 'error'; }
+                try { info.Livewire_dispatch = typeof Livewire.dispatch; } catch(e) { info.Livewire_dispatch = 'error'; }
+                
+                // 尝试列出第一个组件的属性
+                if (Livewire.all && Livewire.all.length > 0) {
+                    try {
+                        var firstComp = Livewire.all[0];
+                        info.firstComp_keys = Object.keys(firstComp);
+                        info.firstComp_call = typeof firstComp.call;
+                        info.firstComp___livewire = typeof firstComp.__livewire;
+                        // 检查是否有 extend 方法
+                        info.firstComp_extend = typeof firstComp.extend;
+                        // 检查所有包含 'extend' 的方法名
+                        info.firstComp_methods_with_extend = Object.keys(firstComp).filter(function(k){ return k.toLowerCase().indexOf('extend') !== -1; });
+                    } catch(e) {
+                        info.firstComp_error = e.message;
                     }
-                }, 2000);
-            } else {
-                doExtend();
+                }
             }
             
-            function doExtend() {
-                const lw = typeof Livewire !== 'undefined' ? Livewire : window.livewire;
-                if (!lw) {
-                    callback({ success: false, message: 'Livewire object not found' });
+            // 检查 Alpine.js / $wire
+            info.hasAlpine = (typeof Alpine !== 'undefined');
+            info.hasWire = (typeof $wire !== 'undefined');
+            if (typeof $wire !== 'undefined') {
+                try { info.wire_methods = Object.getOwnPropertyNames(Object.getPrototypeOf($wire)); } catch(e) { info.wire_methods = 'error'; }
+            }
+            
+            // 查找包含 extend 的 @click 或 x-on 绑定
+            var allEls = document.querySelectorAll('[x-data]');
+            info.xDataCount = allEls.length;
+            if (allEls.length > 0) {
+                try {
+                    info.firstXData = allEls[0].getAttribute('x-data') || '';
+                    info.firstXData = info.firstXData.substring(0, 500);
+                } catch(e) {}
+            }
+            
+            // 查找包含 "extend" 的 onclick/onclick 属性
+            var elsWithExtend = [];
+            var allElements = document.querySelectorAll('*');
+            for (var i = 0; i < Math.min(allElements.length, 200); i++) {
+                var el = allElements[i];
+                var attrs = el.attributes;
+                for (var j = 0; j < attrs.length; j++) {
+                    if (attrs[j].name.indexOf('on') === 0 && attrs[j].value.indexOf('extend') !== -1) {
+                        elsWithExtend.push(attrs[j].name + '=' + attrs[j].value.substring(0, 100));
+                        break;
+                    }
+                }
+            }
+            info.clickHandlersWithExtend = elsWithExtend.slice(0, 5);
+            
+            return JSON.stringify(info);
+        """)
+        
+        log(f"Livewire 调试信息: {debug_info}", "WAIT")
+        
+        # 方法1: 尝试 Livewire 旧版 API
+        try:
+            result = drv.execute_async_script("""
+                var callback = arguments[arguments.length - 1];
+                if (typeof Livewire === 'undefined') {
+                    callback({success:false, msg:'No Livewire'});
                     return;
                 }
                 
-                try {
-                    // 尝试调用 extend 方法
-                    lw.all()[0].call('extend').then(() => {
-                        callback({ success: true, message: 'Livewire extend called' });
-                    }).catch((err) => {
-                        // 尝试其他组件索引
-                        for (let i = 1; i < lw.all().length; i++) {
-                            try {
-                                lw.all()[i].call('extend');
-                                callback({ success: true, message: `Livewire extend on component ${i}` });
-                                return;
-                            } catch(e) {}
-                        }
-                        callback({ success: false, message: err.message || 'Livewire extend failed' });
-                    });
-                } catch (e) {
-                    callback({ success: false, message: e.message || 'Livewire call error' });
+                // 尝试多种方式
+                var components = Livewire.all();
+                if (!components || components.length === 0) {
+                    callback({success:false, msg:'No components found'});
+                    return;
                 }
-            }
-        """)
-        
-        if isinstance(result, dict) and result.get('success'):
-            log(f"Livewire 续期请求已发送: {result.get('message', '')}", "OK")
-            return True, result.get('message', '')
-        else:
-            msg = result.get('message', 'Unknown error') if isinstance(result, dict) else str(result)
-            log(f"Livewire 续期失败: {msg}", "WARN")
-            return False, msg
+                
+                // 方式A: 直接 call('extend')
+                try {
+                    var comp = components[0];
+                    // 在 Livewire v3 中，组件实例可能没有 .call() 方法
+                    // 尝试通过 __livewire 内部对象
+                    if (comp.__livewire && comp.__livewire.component) {
+                        // Livewire v3 新 API
+                        comp.__livewire.component.call('extend').then(function() {
+                            callback({success:true, msg:'v3 component.call'});
+                        }).catch(function(err) {
+                            callback({success:false, msg:'v3 component.call failed: '+err.message});
+                        });
+                        return;
+                    }
+                    
+                    // Livewire v2 API
+                    if (typeof comp.call === 'function') {
+                        comp.call('extend').then(function() {
+                            callback({success:true, msg:'v2 comp.call'});
+                        }).catch(function(err) {
+                            callback({success:false, msg:'v2 comp.call failed: '+err.message});
+                        });
+                        return;
+                    }
+                    
+                    // 尝试 dispatch 方式
+                    try {
+                        Livewire.dispatch('extend');
+                        callback({success:true, msg:'Livewire.dispatch'});
+                    } catch(e) {
+                        callback({success:false, msg:'dispatch failed: '+e.message});
+                    }
+                } catch(e) {
+                    callback({success:false, msg:'general error: '+e.message});
+                }
+            """)
+            
+            if isinstance(result, dict) and result.get('success'):
+                log(f"Livewire 续期成功: {result.get('msg', '')}", "OK")
+                return True, result.get('msg', '')
+            else:
+                msg = result.get('msg', 'Unknown') if isinstance(result, dict) else str(result)
+                log(f"Livewire 续期失败: {msg}", "WARN")
+                return False, msg
+                
+        except Exception as e:
+            log(f"Livewire 续期异常: {e}", "WARN")
+            return False, str(e)
             
     except Exception as e:
-        log(f"Livewire 续期异常: {e}", "WARN")
+        log(f"Livewire 调试异常: {e}", "WARN")
         return False, str(e)
 
 
 def renew_via_fetch(drv, csrf_token: str) -> Tuple[bool, str]:
     """
-    方法2: 通过 fetch API 直接调用后端续期接口（绕过 Livewire）
+    通过 fetch API 直接调用后端续期接口。
+    v35 修复: 解决 JS 模板字符串中的 {{}} 转义问题。
     """
     try:
-        # 尝试常见的续期接口路径
         endpoints = [
             "/api/server/renew",
             "/api/extend",
             "/renew",
             "/server/extend",
+            "/console/extend",
         ]
         
         for endpoint in endpoints:
-            result = drv.execute_async_script(f"""
-                const callback = arguments[arguments.length - 1];
-                fetch('{endpoint}', {{
-                    method: 'POST',
-                    headers: {{
-                        'Content-Type': 'application/json',
-                        'X-CSRF-TOKEN': '{csrf_token}',
-                        'Accept': 'application/json',
-                        'X-Requested-With': 'XMLHttpRequest'
-                    }},
-                    body: JSON.stringify({{ minutes: 90 }})
-                }})
-                .then(r => r.json().then(d => ({ status: r.status, data: d })))
-                .then(r => callback(r))
-                .catch(e => callback({{ success: false, message: e.message }}));
-            """)
+            # 注意：execute_async_script 会将 {{}} 解释为模板占位符，所以用单个 {}
+            js_code = f"""
+                (function() {{
+                    var callback = arguments[arguments.length - 1];
+                    fetch('{endpoint}', {{
+                        method: 'POST',
+                        headers: {{
+                            'Content-Type': 'application/json',
+                            'X-CSRF-TOKEN': '{csrf_token}',
+                            'Accept': 'application/json',
+                            'X-Requested-With': 'XMLHttpRequest'
+                        }},
+                        body: JSON.stringify({{'minutes': 90}})
+                    }})
+                    .then(function(r) {{ return r.json().then(function(d) {{ return {{status: r.status, data: d}}; }}); }})
+                    .then(function(r) {{ callback(r); }})
+                    .catch(function(e) {{ callback({{'success': false, 'message': e.message}}); }});
+                }})();
+            """
+            
+            result = drv.execute_async_script(js_code)
             
             if isinstance(result, dict) and result.get('status', 0) in [200, 201]:
                 log(f"Fetch 续期成功 ({endpoint}): {result}", "OK")
@@ -284,42 +347,7 @@ def renew_via_fetch(drv, csrf_token: str) -> Tuple[bool, str]:
         return False, str(e)
 
 
-def renew_via_button_fallback(drv) -> Tuple[bool, str]:
-    """
-    方法3: 最后的回退方案 - 点击 UI 按钮（会触发 Turnstile）
-    仅在前两种方法都失败时使用
-    """
-    try:
-        # 找 +90min 按钮
-        btn = drv.find_element(By.XPATH, '//button[contains(., "90") and contains(., "min")]')
-        if btn.is_displayed() and btn.is_enabled():
-            btn.click()
-            log("UI 按钮点击成功（可能触发 Turnstile）", "WARN")
-            return True, "Button clicked (Turnstile may appear)"
-        else:
-            log("按钮不可点击", "WARN")
-            return False, "Button not clickable"
-    except Exception as e:
-        log(f"UI 按钮点击失败: {e}", "WARN")
-        return False, str(e)
-
-
-def get_csrf_token(drv) -> str:
-    """获取 CSRF Token"""
-    try:
-        token = drv.execute_script("""
-            return document.querySelector('meta[name="csrf-token"]')?.content ||
-                   document.querySelector('input[name="_token"]')?.value ||
-                   document.querySelector('[name="_token"]')?.value ||
-                   '';
-        """)
-        return token or ""
-    except:
-        return ""
-
-# ========== 按钮操作 ==========
 def find_clickable_button(drv) -> Optional[Tuple]:
-    """查找可点击按钮"""
     selectors = [
         (By.XPATH, '//button[contains(translate(., "WATCH AD", "watch ad"), "watch ad")]'),
         (By.XPATH, '//button[contains(translate(., "WATCH AD", "watch ad"), "watch ad") or contains(., "90") and contains(., "min") or contains(., "renew") or contains(., "extend")]'),
@@ -331,7 +359,6 @@ def find_clickable_button(drv) -> Optional[Tuple]:
                 if el.is_displayed() and el.is_enabled():
                     txt = (el.text or el.get_attribute("textContent") or "").strip()[:80]
                     if "+ 90 min" in txt or "watch ad" in txt.lower() or "renew" in txt.lower() or "extend" in txt.lower():
-                        # 排除冷却中的按钮
                         if re.search(r'\b\d{1,2}:\d{2}\b', txt):
                             continue
                         return (by, sel, el, txt)
@@ -344,7 +371,6 @@ def process_account(drv, name: str, url: str, cookie: str) -> bool:
     log(f"========== 开始处理账号: {name} ==========")
     log(f"目标 URL: {url}")
 
-    # 1. 登录并注入 Cookie
     try:
         drv.get("https://control.gaming4free.net/login")
         time.sleep(2)
@@ -361,7 +387,6 @@ def process_account(drv, name: str, url: str, cookie: str) -> bool:
                 pass
     log("Cookie 已注入")
 
-    # 2. 刷新到控制台页面
     try:
         drv.get(url)
         WebDriverWait(drv, 30).until(lambda d: d.execute_script("return document.readyState") == "complete")
@@ -370,7 +395,6 @@ def process_account(drv, name: str, url: str, cookie: str) -> bool:
 
     time.sleep(5)
 
-    # 3. 验证登录状态
     title = drv.title
     log(f"页面标题: {title}")
     if "Login" in title or "Sign in" in title:
@@ -378,19 +402,16 @@ def process_account(drv, name: str, url: str, cookie: str) -> bool:
         save_screenshot(drv, f"{name}_login_fail")
         return False
 
-    # 获取 CSRF Token
     csrf_token = get_csrf_token(drv)
     if csrf_token:
         log(f"CSRF Token 已获取: {csrf_token[:10]}...", "OK")
     else:
         log("未找到 CSRF Token", "WARN")
 
-    # 4. 主循环
     zero_diff_count = 0
     for round_num in range(1, MAX_ROUNDS + 1):
         log(f"\n--- 第 {round_num}/{MAX_ROUNDS} 轮 ---")
 
-        # 4.0 安全检查
         try:
             body = drv.execute_script("return document.body ? document.body.innerText : '';")
             body_lower = body.lower()
@@ -405,7 +426,6 @@ def process_account(drv, name: str, url: str, cookie: str) -> bool:
         except Exception as e:
             log(f"检查页面状态失败: {e}", "WARN")
 
-        # 4.1 获取剩余时间
         rem_text, rem_sec = get_remaining_seconds(drv)
         if rem_sec == 0:
             log("无法获取剩余时间，刷新页面", "WARN")
@@ -416,9 +436,8 @@ def process_account(drv, name: str, url: str, cookie: str) -> bool:
 
         log(f"当前剩余: {rem_text} ({rem_sec} 秒)")
 
-        # --- 会话上限检查 ---
         if rem_sec > MAX_SESSION_CAP:
-            log(f"剩余 {rem_sec//3600}h > 会话上限 {MAX_SESSION_CAP//3600}h，结束", "WARN")
+            log(f"剩余 {rem_sec//3600}h > 会话上限，结束", "WARN")
             return True
 
         if zero_diff_count >= MAX_ZERO_DIFF_ROUNDS:
@@ -431,7 +450,7 @@ def process_account(drv, name: str, url: str, cookie: str) -> bool:
 
         pre_sec = rem_sec
 
-        # 4.2 尝试续期 - 优先级: Livewire > Fetch > Button
+        # 续期优先级: Livewire > Fetch > Button
         renew_success = False
         renew_method = ""
         
@@ -456,22 +475,26 @@ def process_account(drv, name: str, url: str, cookie: str) -> bool:
                 else:
                     log(f"Fetch 续期失败: {msg}", "WARN")
             
-            # 方法3: UI 按钮（最后手段，会触发 Turnstile）
+            # 方法3: UI 按钮（最后手段）
             if not renew_success:
-                log("尝试方法3: UI 按钮续期（会触发 Turnstile）...", "WARN")
-                success, msg = renew_via_button_fallback(drv)
-                if success:
-                    renew_success = True
-                    renew_method = "Button"
-                    log(f"UI 按钮已点击: {msg}", "WARN")
+                log("尝试方法3: UI 按钮续期...", "WARN")
+                btn_info = find_clickable_button(drv)
+                if btn_info:
+                    _, _, btn_el, btn_txt = btn_info
+                    try:
+                        btn_el.click()
+                        renew_success = True
+                        renew_method = "Button"
+                        log(f"UI 按钮已点击: {btn_txt}", "WARN")
+                    except Exception as e:
+                        log(f"UI 按钮点击失败: {e}", "WARN")
                 else:
-                    log(f"所有续期方法均失败", "ERR")
+                    log("未找到可点击按钮", "ERR")
 
-        # 4.3 等待续期生效
+        # 等待续期生效
         log(f"等待续期生效 ({renew_method})...", "WAIT")
-        time.sleep(15)  # 给服务器足够时间响应
+        time.sleep(15)
 
-        # 4.4 验证结果
         final_text, final_sec = get_remaining_seconds(drv)
         diff = final_sec - pre_sec
         log(f"本轮结果: {final_text} ({final_sec}s), 增量: {diff}s (方法: {renew_method})", "INFO")
@@ -504,7 +527,6 @@ def process_account(drv, name: str, url: str, cookie: str) -> bool:
     log(f"达到最大轮次 ({MAX_ROUNDS})，结束该账号")
     return True
 
-# ========== 驱动构建 ==========
 def build_driver() -> Driver:
     proxy = get_proxy_url()
     log(f"代理: {proxy or '直连'}")
@@ -526,7 +548,7 @@ def build_driver() -> Driver:
     return drv
 
 def main():
-    log("========== Gaming4Free Pro 自动续期启动 (SeleniumBase UC v34) ==========")
+    log("========== Gaming4Free Pro 自动续期启动 (SeleniumBase UC v35) ==========")
 
     log("🔍 检查 Telegram 通知配置...")
     from tg import check_tg_config, send_tg
