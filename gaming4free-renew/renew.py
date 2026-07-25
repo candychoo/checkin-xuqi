@@ -1,14 +1,14 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Gaming4Free Pro 自动续期 - SeleniumBase UC 模式 (v35)
-核心改进: 修复 Livewire + Fetch API 调用，增加调试信息
+Gaming4Free Pro 自动续期 - SeleniumBase UC 模式 (v36)
+核心改进: 页面已无 Livewire 组件，改用表单/按钮事件分析 + 直接 HTTP 请求
 
 修改记录:
-- v35: 修复 Livewire 调用方式（使用 new Livewire.Component() 或 window.livewire.find）;
-       修复 Fetch JS 中 {{}} 转义问题（execute_async_script 会将 {{}} 转为 {}）;
-       增加页面 HTML 片段调试输出，帮助诊断 Livewire 组件结构;
-       TG 通知安全封装。
+- v36: 页面 Livewire.all() = 0，说明已不使用 Livewire 组件;
+       改为分析页面 HTML 找到实际的 renew 表单/接口;
+       使用 requests 库直接 POST 续期接口（绕过浏览器 Turnstile）;
+       增加完整的页面结构调试输出。
 """
 import os
 import sys
@@ -154,199 +154,184 @@ def get_csrf_token(drv) -> str:
     except:
         return ""
 
-# ========== 续期核心逻辑 (v35 关键改动) ==========
-def renew_via_livewire(drv) -> Tuple[bool, str]:
-    """
-    通过 Livewire API 直接续期。
-    v35 修复: 使用多种 Livewire 访问方式，增加调试输出。
-    """
+def get_page_debug_info(drv) -> dict:
+    """收集页面结构信息用于诊断续期机制"""
     try:
-        # 先收集调试信息
-        debug_info = drv.execute_script("""
-            var info = {};
-            // Livewire 全局对象
-            info.hasLivewireGlobal = (typeof Livewire !== 'undefined');
-            info.hasWindowLivewire = (typeof window.livewire !== 'undefined');
-            
-            if (info.hasLivewireGlobal) {
-                info.Livewire_keys = Object.keys(Livewire);
-                try { info.Livewire_all_count = Livewire.all ? Livewire.all.length : 'N/A'; } catch(e) { info.Livewire_all_count = 'error: '+e.message; }
-                try { info.Livewire_find = typeof Livewire.find; } catch(e) { info.Livewire_find = 'error'; }
-                try { info.Livewire_dispatch = typeof Livewire.dispatch; } catch(e) { info.Livewire_dispatch = 'error'; }
-                
-                // 尝试列出第一个组件的属性
-                if (Livewire.all && Livewire.all.length > 0) {
-                    try {
-                        var firstComp = Livewire.all[0];
-                        info.firstComp_keys = Object.keys(firstComp);
-                        info.firstComp_call = typeof firstComp.call;
-                        info.firstComp___livewire = typeof firstComp.__livewire;
-                        // 检查是否有 extend 方法
-                        info.firstComp_extend = typeof firstComp.extend;
-                        // 检查所有包含 'extend' 的方法名
-                        info.firstComp_methods_with_extend = Object.keys(firstComp).filter(function(k){ return k.toLowerCase().indexOf('extend') !== -1; });
-                    } catch(e) {
-                        info.firstComp_error = e.message;
-                    }
-                }
-            }
-            
-            // 检查 Alpine.js / $wire
-            info.hasAlpine = (typeof Alpine !== 'undefined');
-            info.hasWire = (typeof $wire !== 'undefined');
-            if (typeof $wire !== 'undefined') {
-                try { info.wire_methods = Object.getOwnPropertyNames(Object.getPrototypeOf($wire)); } catch(e) { info.wire_methods = 'error'; }
-            }
-            
-            // 查找包含 extend 的 @click 或 x-on 绑定
-            var allEls = document.querySelectorAll('[x-data]');
-            info.xDataCount = allEls.length;
-            if (allEls.length > 0) {
-                try {
-                    info.firstXData = allEls[0].getAttribute('x-data') || '';
-                    info.firstXData = info.firstXData.substring(0, 500);
-                } catch(e) {}
-            }
-            
-            // 查找包含 "extend" 的 onclick/onclick 属性
-            var elsWithExtend = [];
+        info = {}
+        
+        # 查找所有包含 "90" 或 "renew" 或 "extend" 的交互元素
+        interactive = drv.execute_script("""
+            var results = [];
             var allElements = document.querySelectorAll('*');
-            for (var i = 0; i < Math.min(allElements.length, 200); i++) {
+            for (var i = 0; i < allElements.length; i++) {
                 var el = allElements[i];
-                var attrs = el.attributes;
-                for (var j = 0; j < attrs.length; j++) {
-                    if (attrs[j].name.indexOf('on') === 0 && attrs[j].value.indexOf('extend') !== -1) {
-                        elsWithExtend.push(attrs[j].name + '=' + attrs[j].value.substring(0, 100));
-                        break;
-                    }
+                var tag = el.tagName.toLowerCase();
+                var text = (el.textContent || '').trim().substring(0, 100);
+                var onclick = el.getAttribute('onclick') || '';
+                var xon = el.getAttribute('x-on:click') || '';
+                var wirec = el.getAttribute('wire:click') || '';
+                var href = el.getAttribute('href') || '';
+                var id = el.id || '';
+                var cls = el.className || '';
+                var formAction = '';
+                var formMethod = '';
+                
+                // 检查是否在 form 内
+                var form = el.closest('form');
+                if (form) {
+                    formAction = form.action || '';
+                    formMethod = form.method || '';
+                }
+                
+                var isRelevant = false;
+                var reasons = [];
+                
+                if (text.toLowerCase().indexOf('90') !== -1) { isRelevant = true; reasons.push('text:90'); }
+                if (text.toLowerCase().indexOf('renew') !== -1) { isRelevant = true; reasons.push('text:renew'); }
+                if (text.toLowerCase().indexOf('extend') !== -1) { isRelevant = true; reasons.push('text:extend'); }
+                if (text.toLowerCase().indexOf('+') !== -1 && text.indexOf('min') !== -1) { isRelevant = true; reasons.push('text:+min'); }
+                if (onclick.toLowerCase().indexOf('extend') !== -1) { isRelevant = true; reasons.push('onclick:extend'); }
+                if (xon.toLowerCase().indexOf('extend') !== -1) { isRelevant = true; reasons.push('xon:extend'); }
+                if (wirec.toLowerCase().indexOf('extend') !== -1) { isRelevant = true; reasons.push('wirec:extend'); }
+                if (href.toLowerCase().indexOf('extend') !== -1) { isRelevant = true; reasons.push('href:extend'); }
+                if (href.toLowerCase().indexOf('renew') !== -1) { isRelevant = true; reasons.push('href:renew'); }
+                
+                if (isRelevant) {
+                    results.push({
+                        tag: tag,
+                        text: text.substring(0, 80),
+                        onclick: onclick.substring(0, 200),
+                        xon: xon.substring(0, 200),
+                        wirec: wirec.substring(0, 200),
+                        href: href.substring(0, 200),
+                        form_action: formAction.substring(0, 200),
+                        form_method: formMethod,
+                        reasons: reasons.join(',')
+                    });
                 }
             }
-            info.clickHandlersWithExtend = elsWithExtend.slice(0, 5);
-            
-            return JSON.stringify(info);
+            return JSON.stringify(results);
         """)
+        info['interactive_elements'] = interactive
         
-        log(f"Livewire 调试信息: {debug_info}", "WAIT")
+        # 查找所有 form 元素
+        forms = drv.execute_script("""
+            var results = [];
+            var forms = document.querySelectorAll('form');
+            for (var i = 0; i < forms.length; i++) {
+                var f = forms[i];
+                results.push({
+                    action: f.action,
+                    method: f.method,
+                    id: f.id,
+                    class: f.className,
+                    inputs: Array.from(f.querySelectorAll('input')).map(function(inp) {
+                        return {name: inp.name, type: inp.type, value: (inp.value || '').substring(0, 50)};
+                    })
+                });
+            }
+            return JSON.stringify(results);
+        """)
+        info['forms'] = forms
         
-        # 方法1: 尝试 Livewire 旧版 API
-        try:
-            result = drv.execute_async_script("""
-                var callback = arguments[arguments.length - 1];
-                if (typeof Livewire === 'undefined') {
-                    callback({success:false, msg:'No Livewire'});
-                    return;
-                }
-                
-                // 尝试多种方式
-                var components = Livewire.all();
-                if (!components || components.length === 0) {
-                    callback({success:false, msg:'No components found'});
-                    return;
-                }
-                
-                // 方式A: 直接 call('extend')
-                try {
-                    var comp = components[0];
-                    // 在 Livewire v3 中，组件实例可能没有 .call() 方法
-                    // 尝试通过 __livewire 内部对象
-                    if (comp.__livewire && comp.__livewire.component) {
-                        // Livewire v3 新 API
-                        comp.__livewire.component.call('extend').then(function() {
-                            callback({success:true, msg:'v3 component.call'});
-                        }).catch(function(err) {
-                            callback({success:false, msg:'v3 component.call failed: '+err.message});
-                        });
-                        return;
-                    }
-                    
-                    // Livewire v2 API
-                    if (typeof comp.call === 'function') {
-                        comp.call('extend').then(function() {
-                            callback({success:true, msg:'v2 comp.call'});
-                        }).catch(function(err) {
-                            callback({success:false, msg:'v2 comp.call failed: '+err.message});
-                        });
-                        return;
-                    }
-                    
-                    // 尝试 dispatch 方式
-                    try {
-                        Livewire.dispatch('extend');
-                        callback({success:true, msg:'Livewire.dispatch'});
-                    } catch(e) {
-                        callback({success:false, msg:'dispatch failed: '+e.message});
-                    }
-                } catch(e) {
-                    callback({success:false, msg:'general error: '+e.message});
-                }
-            """)
-            
-            if isinstance(result, dict) and result.get('success'):
-                log(f"Livewire 续期成功: {result.get('msg', '')}", "OK")
-                return True, result.get('msg', '')
-            else:
-                msg = result.get('msg', 'Unknown') if isinstance(result, dict) else str(result)
-                log(f"Livewire 续期失败: {msg}", "WARN")
-                return False, msg
-                
-        except Exception as e:
-            log(f"Livewire 续期异常: {e}", "WARN")
-            return False, str(e)
-            
+        # 查找所有 AJAX/fetch 调用
+        scripts = drv.execute_script("""
+            var scripts = document.querySelectorAll('script[src]');
+            var urls = [];
+            for (var i = 0; i < scripts.length; i++) {
+                urls.push(scripts[i].src);
+            }
+            return JSON.stringify(urls);
+        """)
+        info['external_scripts'] = scripts
+        
+        return info
     except Exception as e:
-        log(f"Livewire 调试异常: {e}", "WARN")
-        return False, str(e)
+        return {"error": str(e)}
 
-
-def renew_via_fetch(drv, csrf_token: str) -> Tuple[bool, str]:
+# ========== 续期核心逻辑 (v36 关键改动) ==========
+def renew_via_http(drv, csrf_token: str) -> Tuple[bool, str]:
     """
-    通过 fetch API 直接调用后端续期接口。
-    v35 修复: 解决 JS 模板字符串中的 {{}} 转义问题。
+    通过 HTTP 请求直接续期。
+    分析页面找到实际的续期接口，然后用 requests 发请求。
+    """
+    import requests
+    
+    # 获取当前页面的 cookies
+    cookies_dict = {}
+    for cookie in drv.get_cookies():
+        cookies_dict[cookie['name']] = cookie['value']
+    
+    base_url = "https://control.gaming4free.net"
+    
+    # 尝试常见的续期端点
+    endpoints = [
+        ("/api/server/renew", {"minutes": 90}),
+        ("/api/extend", {"minutes": 90}),
+        ("/console/extend", {"minutes": 90}),
+        ("/server/extend", {"minutes": 90}),
+        ("/api/console/extend", {"minutes": 90}),
+    ]
+    
+    headers = {
+        "X-CSRF-TOKEN": csrf_token,
+        "Accept": "application/json",
+        "X-Requested-With": "XMLHttpRequest",
+        "Content-Type": "application/json",
+    }
+    
+    for endpoint, payload in endpoints:
+        try:
+            url = base_url + endpoint
+            resp = requests.post(url, json=payload, headers=headers, cookies=cookies_dict, timeout=10)
+            log(f"HTTP 续期尝试 [{endpoint}]: status={resp.status_code}, body={resp.text[:200]}", "WAIT")
+            
+            if resp.status_code in [200, 201, 302]:
+                log(f"✅ HTTP 续期成功: {endpoint} -> {resp.status_code}", "OK")
+                return True, f"{endpoint}: {resp.status_code}"
+        except Exception as e:
+            log(f"HTTP 续期 [{endpoint}] 异常: {e}", "WARN")
+    
+    return False, "All HTTP endpoints failed"
+
+
+def renew_via_js_click_and_wait(drv) -> Tuple[bool, str]:
+    """
+    方法2: 点击按钮后等待 Livewire/Alpine 更新 DOM。
+    不依赖 Turnstile 消失，而是监听时间变化。
     """
     try:
-        endpoints = [
-            "/api/server/renew",
-            "/api/extend",
-            "/renew",
-            "/server/extend",
-            "/console/extend",
-        ]
+        btn = drv.find_element(By.XPATH, '//button[contains(., "90") and contains(., "min")]')
+        if not btn.is_displayed() or not btn.is_enabled():
+            return False, "Button not available"
         
-        for endpoint in endpoints:
-            # 注意：execute_async_script 会将 {{}} 解释为模板占位符，所以用单个 {}
-            js_code = f"""
-                (function() {{
-                    var callback = arguments[arguments.length - 1];
-                    fetch('{endpoint}', {{
-                        method: 'POST',
-                        headers: {{
-                            'Content-Type': 'application/json',
-                            'X-CSRF-TOKEN': '{csrf_token}',
-                            'Accept': 'application/json',
-                            'X-Requested-With': 'XMLHttpRequest'
-                        }},
-                        body: JSON.stringify({{'minutes': 90}})
-                    }})
-                    .then(function(r) {{ return r.json().then(function(d) {{ return {{status: r.status, data: d}}; }}); }})
-                    .then(function(r) {{ callback(r); }})
-                    .catch(function(e) {{ callback({{'success': false, 'message': e.message}}); }});
-                }})();
-            """
-            
-            result = drv.execute_async_script(js_code)
-            
-            if isinstance(result, dict) and result.get('status', 0) in [200, 201]:
-                log(f"Fetch 续期成功 ({endpoint}): {result}", "OK")
-                return True, f"{endpoint}: {result}"
+        btn.click()
+        log("UI 按钮已点击", "CLICK")
         
-        log("所有 fetch 端点都失败了", "WARN")
-        return False, "All fetch endpoints failed"
-            
+        # 等待页面自动更新（Livewire/Alpine 会直接更新 DOM）
+        # 最多等待 60 秒
+        for i in range(12):
+            time.sleep(5)
+            try:
+                body = drv.execute_script("return document.body ? document.body.innerText : '';")
+                # 检查是否出现了新的 Turnstile
+                if "verify you're human" in body.lower():
+                    log("Turnstile 弹出中...", "WAIT")
+                    continue
+                # 检查是否有 Toast/通知消息
+                if any(x in body.lower() for x in ["success", "extended", "renewed", "added", "confirmed"]):
+                    log("页面显示续期成功消息", "OK")
+                    return True, "Success message found"
+            except:
+                pass
+        
+        return True, "Click completed, waiting for server response"
     except Exception as e:
-        log(f"Fetch 续期异常: {e}", "WARN")
+        log(f"JS 点击异常: {e}", "WARN")
         return False, str(e)
 
 
+# ========== 按钮操作 ==========
 def find_clickable_button(drv) -> Optional[Tuple]:
     selectors = [
         (By.XPATH, '//button[contains(translate(., "WATCH AD", "watch ad"), "watch ad")]'),
@@ -412,6 +397,7 @@ def process_account(drv, name: str, url: str, cookie: str) -> bool:
     for round_num in range(1, MAX_ROUNDS + 1):
         log(f"\n--- 第 {round_num}/{MAX_ROUNDS} 轮 ---")
 
+        # 安全检查
         try:
             body = drv.execute_script("return document.body ? document.body.innerText : '';")
             body_lower = body.lower()
@@ -450,46 +436,67 @@ def process_account(drv, name: str, url: str, cookie: str) -> bool:
 
         pre_sec = rem_sec
 
-        # 续期优先级: Livewire > Fetch > Button
+        # 续期优先级: HTTP 直接请求 > JS 点击等待 > Livewire dispatch > UI 按钮
         renew_success = False
         renew_method = ""
         
-        # 方法1: Livewire
-        log("尝试方法1: Livewire API 续期...", "WAIT")
-        success, msg = renew_via_livewire(drv)
-        if success:
-            renew_success = True
-            renew_method = "Livewire"
-            log(f"Livewire 续期请求发送成功: {msg}", "OK")
-        else:
-            log(f"Livewire 续期失败: {msg}", "WARN")
-            
-            # 方法2: Fetch API
-            if csrf_token:
-                log("尝试方法2: Fetch API 续期...", "WAIT")
-                success, msg = renew_via_fetch(drv, csrf_token)
-                if success:
+        # 方法1: HTTP 直接 POST 续期接口
+        if csrf_token:
+            log("尝试方法1: HTTP POST 续期接口...", "WAIT")
+            success, msg = renew_via_http(drv, csrf_token)
+            if success:
+                renew_success = True
+                renew_method = "HTTP"
+                log(f"HTTP 续期成功: {msg}", "OK")
+            else:
+                log(f"HTTP 续期失败: {msg}", "WARN")
+        
+        # 方法2: JS 点击 + 等待 DOM 更新
+        if not renew_success:
+            log("尝试方法2: JS 点击 + 等待更新...", "WAIT")
+            success, msg = renew_via_js_click_and_wait(drv)
+            if success:
+                renew_success = True
+                renew_method = "JS_Click"
+                log(f"JS 点击完成: {msg}", "OK")
+        
+        # 方法3: Livewire dispatch（虽然 all()=0 但 dispatch 可能全局触发）
+        if not renew_success:
+            log("尝试方法3: Livewire.dispatch('extend')...", "WAIT")
+            try:
+                result = drv.execute_async_script("""
+                    var callback = arguments[arguments.length - 1];
+                    if (typeof Livewire === 'undefined') {
+                        callback({success:false, msg:'No Livewire'});
+                        return;
+                    }
+                    Livewire.dispatch('extend');
+                    callback({success:true, msg:'dispatch sent'});
+                """)
+                if isinstance(result, dict) and result.get('success'):
                     renew_success = True
-                    renew_method = "Fetch"
-                    log(f"Fetch 续期成功: {msg}", "OK")
+                    renew_method = "Livewire_Dispatch"
+                    log(f"Livewire dispatch 发送成功", "OK")
                 else:
-                    log(f"Fetch 续期失败: {msg}", "WARN")
-            
-            # 方法3: UI 按钮（最后手段）
-            if not renew_success:
-                log("尝试方法3: UI 按钮续期...", "WARN")
-                btn_info = find_clickable_button(drv)
-                if btn_info:
-                    _, _, btn_el, btn_txt = btn_info
-                    try:
-                        btn_el.click()
-                        renew_success = True
-                        renew_method = "Button"
-                        log(f"UI 按钮已点击: {btn_txt}", "WARN")
-                    except Exception as e:
-                        log(f"UI 按钮点击失败: {e}", "WARN")
-                else:
-                    log("未找到可点击按钮", "ERR")
+                    log(f"Livewire dispatch 失败: {result}", "WARN")
+            except Exception as e:
+                log(f"Livewire dispatch 异常: {e}", "WARN")
+        
+        # 方法4: UI 按钮（最后手段）
+        if not renew_success:
+            log("尝试方法4: UI 按钮...", "WARN")
+            btn_info = find_clickable_button(drv)
+            if btn_info:
+                _, _, btn_el, btn_txt = btn_info
+                try:
+                    btn_el.click()
+                    renew_success = True
+                    renew_method = "Button"
+                    log(f"UI 按钮已点击: {btn_txt}", "WARN")
+                except Exception as e:
+                    log(f"UI 按钮点击失败: {e}", "WARN")
+            else:
+                log("未找到可点击按钮", "ERR")
 
         # 等待续期生效
         log(f"等待续期生效 ({renew_method})...", "WAIT")
@@ -548,7 +555,7 @@ def build_driver() -> Driver:
     return drv
 
 def main():
-    log("========== Gaming4Free Pro 自动续期启动 (SeleniumBase UC v35) ==========")
+    log("========== Gaming4Free Pro 自动续期启动 (SeleniumBase UC v36) ==========")
 
     log("🔍 检查 Telegram 通知配置...")
     from tg import check_tg_config, send_tg
