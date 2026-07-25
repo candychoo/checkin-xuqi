@@ -160,15 +160,17 @@ def is_watch_ad_state(btn_txt: str) -> bool:
     """判断按钮是否处于可点击的续期状态（Watch Ad / + 90 min 等）"""
     import re
     t = btn_txt.lower()
-    
+
     # 特殊处理："+ 90 min" 是可点击状态（无倒计时）
     # 但 "+ 90 min 05:00" 是冷却状态（有倒计时）
     if re.search(r'\+\s*90\s*min', t):
         # 检查是否有倒计时
         if re.search(r'\b\d{1,2}:\d{2}\b', t) or re.search(r'\b\d{1,2}:\d{2}:\d{2}\b', t):
+            log(f"❌ 检测到冷却按钮: {btn_txt} (包含倒计时)", "WARN")
             return False  # 冷却状态
+        log(f"✅ 可点击按钮: {btn_txt}", "OK")
         return True  # 可点击状态
-    
+
     # 可点击的续期按钮特征
     clickable_patterns = [
         r'watch\s*ad',           # Watch Ad
@@ -176,31 +178,43 @@ def is_watch_ad_state(btn_txt: str) -> bool:
         r'renew',               # Renew
         r'extend',              # Extend
     ]
-    
+
     has_clickable = any(re.search(p, t) for p in clickable_patterns)
     if not has_clickable:
+        log(f"⚠️ 无效按钮文本: {btn_txt}", "WARN")
         return False
-    
+
     # 冷却特征：含倒计时时间格式 (MM:SS / H:MM:SS / 5m / 5min / 5 min)
     cooldown_patterns = [
         r'\b\d{1,2}:\d{2}\b',           # 05:00, 5:00, 12:34 (MM:SS 或 H:MM)
         r'\b\d{1,2}:\d{2}:\d{2}\b',     # 1:05:00 (H:MM:SS)
         r'\b\d+\s*m(?:in)?\b',          # 5m, 5min, 5 min
     ]
-    
+
     is_cooldown = any(re.search(p, t) for p in cooldown_patterns)
-    return not is_cooldown
+    if is_cooldown:
+        log(f"❌ 冷却按钮: {btn_txt}", "WARN")
+        return False
+
+    log(f"✅ 可点击按钮: {btn_txt}", "OK")
+    return True
 
 
 # ========== 核心：按钮检测与点击 ==========
 BUTTON_SELECTORS = [
-    # 优先：文本匹配
+    # 优先：精确文本匹配（Watch Ad）
     (By.XPATH, '//button[contains(translate(., "WATCH AD", "watch ad"), "watch ad")]'),
     (By.XPATH, '//a[contains(translate(., "WATCH AD", "watch ad"), "watch ad")]'),
-    (By.XPATH, '//button[contains(., "90") and contains(., "min")]'),
-    (By.XPATH, '//a[contains(., "90") and contains(., "min")]'),
-    (By.XPATH, '//*[@role="button"][contains(., "90") and contains(., "min")]'),
-    # 兜底：class/id 常见模式
+    # 精确匹配：+ 90 min（无倒计时）
+    (By.XPATH, '//button[normalize-space(text()) = "+ 90 min" or translate(text(), "+", "") = "90 min"]'),
+    (By.XPATH, '//a[normalize-space(text()) = "+ 90 min" or translate(text(), "+", "") = "90 min"]'),
+    # 精确匹配：90 min（无倒计时，无+号）
+    (By.XPATH, '//button[normalize-space(text()) = "90 min"]'),
+    (By.XPATH, '//a[normalize-space(text()) = "90 min"]'),
+    # 兜底：包含 90 和 min 的按钮
+    (By.XPATH, '//button[contains(translate(., "WATCH AD", "watch ad"), "watch ad") or contains(., "90") and contains(., "min") or contains(., "renew") or contains(., "extend")]'),
+    (By.XPATH, '//a[contains(translate(., "WATCH AD", "watch ad"), "watch ad") or contains(., "90") and contains(., "min") or contains(., "renew") or contains(., "extend")]'),
+    # CSS 选择器兜底
     (By.CSS_SELECTOR, 'button.btn-renew, button.renew-btn, button[onclick*="renew"], a[href*="renew"]'),
     (By.CSS_SELECTOR, '.renew-button, #renew-button, .btn-renew'),
 ]
@@ -222,8 +236,12 @@ def find_clickable_button(drv) -> Optional[Tuple[str, str]]:
             for el in els:
                 if el.is_displayed() and el.is_enabled():
                     txt = (el.text or el.get_attribute("textContent") or "").strip()[:80]
-                    log(f"找到按钮: {txt} ({by}={sel})", "OK")
-                    return (by, sel, el, txt)
+                    # 验证按钮状态
+                    if is_watch_ad_state(txt):
+                        log(f"找到可点击按钮: {txt} ({by}={sel})", "OK")
+                        return (by, sel, el, txt)
+                    else:
+                        log(f"找到按钮但不可点击: {txt} ({by}={sel})", "WARN")
         except:
             continue
     return None
@@ -414,6 +432,9 @@ def process_account(drv, name: str, url: str, cookie: str) -> bool:
             if not btn_info:
                 continue
             by, sel, btn_el, btn_txt = btn_info
+
+        # 5.4 点击按钮前截图
+        save_screenshot(drv, f"{name}_before_click_r{round_num}")
 
         # 5.4 点击按钮
         log(f"点击按钮: {btn_txt}", "CLICK")
