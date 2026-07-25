@@ -43,13 +43,16 @@ def init_browser(headless=True):
         pass
     return dr
 
-def inject_cookie(dr, cookie_str):
+def inject_cookie(dr, cookie_str, domain=".gaming4free.net"):
+    """注入 cookie 到指定域 (默认 .gaming4free.net)
+    注意: 调用前 dr 必须已经打开了该域下的任意页面, 否则 add_cookie 会报 invalid domain
+    """
     pairs = [p.strip() for p in cookie_str.split(";")]
     for p in pairs:
         if "=" in p:
             k, v = p.split("=", 1)
             try:
-                dr.add_cookie({"name": k.strip(), "value": v.strip(), "domain": ".gaming4free.net", "path": "/"})
+                dr.add_cookie({"name": k.strip(), "value": v.strip(), "domain": domain, "path": "/"})
             except:
                 pass
 

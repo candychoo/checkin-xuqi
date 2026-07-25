@@ -1,8 +1,8 @@
-﻿#!/usr/bin/env python3
+#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
 gaming4free 自动续期脚本（GHA + sing-box proxy + seleniumbase UC mode）
-===============================================================
+================================================================
 - 使用 seleniumbase UC mode 反检测
 - 走 sing-box SOCKS5 代理出口（CF 自家 IP，几乎必过 Turnstile）
 - 多服务器支持（通过 SERVERS 环境变量配置）
@@ -18,26 +18,71 @@ import random
 import socket
 import logging
 import requests
-from datetime import datetime, timedelta
+from datetime import datetime
 from pathlib import Path
+from urllib.parse import urlparse
 from selenium.webdriver.common.action_chains import ActionChains
 
 # ---------------------------------------------------------------------------
-# 配置区
+# 配置区 —— 与 workflow / README 对齐的环境变量名
 # ---------------------------------------------------------------------------
-SITE_URL       = os.getenv("GF_SITE_URL", "https://gaming4free.zapto.org/")
-LOGIN_URL      = os.getenv("GF_LOGIN_URL", "")
-USERNAME       = os.getenv("MC_USERNAME", "")
-PASSWORD       = os.getenv("MC_PASSWORD", "")
-COOKIE_STR     = os.getenv("GF_COOKIE", "")
+# 站点根 URL: 优先用 GAME4FREE_RENEW_URL, 兜底 control.gaming4free.net
+_raw_renew_url = os.getenv("GAME4FREE_RENEW_URL", "").strip()
+if _raw_renew_url:
+    # 用户可能填的是完整续期页 URL, 我们只取 origin
+    _parsed = urlparse(_raw_renew_url)
+    SITE_URL = f"{_parsed.scheme}://{_parsed.netloc}"
+else:
+    SITE_URL = "https://control.gaming4free.net"
 
-# 代理地址：优先用 secrets.PROXY_URL（简单格式如 http://ip:port）
-# 如果包含 ? 或不是标准协议前缀，说明是远程复杂代理，忽略它，用本地 sing-box
+COOKIE_STR = os.getenv("GAME4FREE_COOKIE", "").strip()
+
+# 多账号 (可选): 每行 "名称|||URL|||Cookie"
+_raw_accounts = os.getenv("GAME4FREE_ACCOUNTS", "").strip()
+ACCOUNTS = []
+if _raw_accounts:
+    for line in _raw_accounts.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        parts = line.split("|||")
+        if len(parts) >= 3:
+            name, url, ck = parts[0].strip(), parts[1].strip(), parts[2].strip()
+            p = urlparse(url)
+            ACCOUNTS.append({
+                "name": name,
+                "site": f"{p.scheme}://{p.netloc}" if p.scheme else SITE_URL,
+                "renew_url": url,
+                "cookie": ck,
+            })
+
+# 单账号兜底: 用 SITE_URL + COOKIE_STR
+if not ACCOUNTS and (COOKIE_STR or _raw_renew_url):
+    ACCOUNTS.append({
+        "name": "main",
+        "site": SITE_URL,
+        "renew_url": _raw_renew_url or f"{SITE_URL}/server",
+        "cookie": COOKIE_STR,
+    })
+
+# 多服务器配置 (可选): 格式 "1,US|2,CN|3,EU"
+SERVERS_ENV = os.getenv("SERVERS", "").strip()
+SERVER_LIST = []
+if SERVERS_ENV:
+    for item in SERVERS_ENV.split("|"):
+        try:
+            num, region = item.split(",", 1)
+            SERVER_LIST.append({"num": num.strip(), "region": region.strip()})
+        except ValueError:
+            pass
+
+# 代理: sing-box 本地 SOCKS5
 _raw_proxy = os.getenv("PROXY_URL", "").strip()
-if _raw_proxy and not _raw_proxy.startswith(("socks", "http")) and "?" not in _raw_proxy:
+# 优先用本地 sing-box (workflow 里 setup_proxy.sh 启动)
+# 只有当 PROXY_URL 是直接的 socks5://ip:port 格式时才直接用
+if _raw_proxy and _raw_proxy.startswith("socks5://") and "127.0.0.1" not in _raw_proxy:
     PROXY_URL = _raw_proxy
 else:
-    # 默认用本地 sing-box SOCKS5
     PROXY_URL = "socks5://127.0.0.1:1080"
 
 MAX_HOURS      = 48            # 续期上限 48 小时
@@ -47,21 +92,11 @@ MAX_CLICKS     = 30            # 单次运行最大点击次数
 PAGE_TIMEOUT   = 60            # 单页操作超时
 TURNSTILE_WAIT = 90            # Turnstile 等待上限
 
-TG_TOKEN       = os.getenv("TG_BOT_TOKEN", "")
-TG_CHAT_ID     = os.getenv("TG_CHAT_ID", "")
+TG_TOKEN   = os.getenv("TG_BOT_TOKEN", "")
+TG_CHAT_ID = os.getenv("TG_CHAT_ID", "")
 
-# 多服务器配置：格式 "1,US|2,CN|3,EU"
-SERVERS_ENV    = os.getenv("SERVERS", "").strip()
-SERVER_LIST    = []
-if SERVERS_ENV:
-    for item in SERVERS_ENV.split("|"):
-        try:
-            num, region = item.split(",", 1)
-            SERVER_LIST.append({"num": num.strip(), "region": region.strip()})
-        except ValueError:
-            pass
-
-SHOT_DIR       = Path("artifacts")
+# 截图目录: 统一用 debug_output/, 与 workflow artifact 路径对齐
+SHOT_DIR = Path("debug_output")
 SHOT_DIR.mkdir(exist_ok=True)
 
 # ---------------------------------------------------------------------------
@@ -80,27 +115,44 @@ log = logging.getLogger("renew")
 
 
 # ---------------------------------------------------------------------------
-# 工具函数
+# Telegram 通知
 # ---------------------------------------------------------------------------
-def tg(msg: str):
-    """Telegram 通知（失败不影响主流程）"""
+def tg(msg: str, photo_path: str = None):
+    """发送 Telegram 通知，支持带截图"""
     if not (TG_TOKEN and TG_CHAT_ID):
         log.warning("TG 未配置，跳过通知")
         return
     try:
-        r = requests.post(
-            f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage",
-            json={"chat_id": TG_CHAT_ID, "text": msg, "parse_mode": "HTML"},
-            timeout=10,
-        )
-        r.raise_for_status()
+        if photo_path and os.path.exists(photo_path):
+            url = f"https://api.telegram.org/bot{TG_TOKEN}/sendPhoto"
+            with open(photo_path, "rb") as f:
+                requests.post(
+                    url,
+                    data={"chat_id": TG_CHAT_ID, "caption": msg},
+                    files={"photo": f},
+                    timeout=15,
+                )
+        else:
+            url = f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage"
+            requests.post(
+                url,
+                json={
+                    "chat_id": TG_CHAT_ID,
+                    "text": msg,
+                    "parse_mode": "HTML",
+                },
+                timeout=15,
+            )
         log.info("✅ TG 通知发送成功")
     except Exception as e:
         log.warning(f"TG 通知失败: {e}")
 
 
+# ---------------------------------------------------------------------------
+# 工具函数
+# ---------------------------------------------------------------------------
 def screenshot(sb, name: str):
-    """保存截图，返回路径"""
+    """保存截图到 debug_output/, 返回路径"""
     p = SHOT_DIR / f"{datetime.now():%H%M%S}_{name}.png"
     try:
         sb.save_screenshot(str(p))
@@ -120,7 +172,7 @@ def time_to_seconds(t_str: str) -> int:
     if not t_str or "EXPIRED" in t_str.upper() or "未知" in t_str:
         return 0
     try:
-        h, m, s = map(int, t_str.strip().split(':'))
+        h, m, s = map(int, t_str.strip().split(":"))
         return h * 3600 + m * 60 + s
     except Exception:
         return 0
@@ -155,18 +207,72 @@ def parse_remaining_seconds(text: str) -> int:
     return total if total > 0 else -1
 
 
+def inject_cookies(sb, site_url: str, cookie_str: str):
+    """先打开站点(让浏览器有域上下文), 再注入 cookie, 再 reload"""
+    if not cookie_str:
+        log.warning("Cookie 为空，跳过注入")
+        return False
+    # 1. 先打开站点任意页面(必须, 否则 add_cookie 会报 invalid domain)
+    try:
+        sb.open(site_url)
+        sb.sleep(2)
+    except Exception as e:
+        log.warning(f"打开站点 {site_url} 失败: {e}")
+        return False
+
+    # 2. 解析 cookie 域名
+    parsed = urlparse(site_url)
+    domain = parsed.netloc
+    # 如果是裸域, 加前导点表示该域及其子域都生效
+    if not domain.startswith("."):
+        cookie_domain = "." + domain.split(":")[0]
+    else:
+        cookie_domain = domain
+
+    # 3. 注入 cookie
+    n_ok, n_fail = 0, 0
+    for item in cookie_str.split(";"):
+        item = item.strip()
+        if "=" not in item:
+            continue
+        k, v = item.split("=", 1)
+        k, v = k.strip(), v.strip()
+        try:
+            # SeleniumBase 的 set_cookie 接受 domain 参数
+            sb.set_cookie(k, v, domain=cookie_domain)
+            n_ok += 1
+        except Exception:
+            try:
+                # 兜底: 用 driver 直接 add_cookie
+                sb.driver.add_cookie({
+                    "name": k, "value": v,
+                    "domain": cookie_domain, "path": "/",
+                })
+                n_ok += 1
+            except Exception:
+                n_fail += 1
+    log.info(f"Cookie 注入完成: ✅ {n_ok} 个, ❌ {n_fail} 个 (域: {cookie_domain})")
+
+    # 4. reload 让 cookie 生效
+    try:
+        sb.refresh()
+        sb.sleep(2)
+    except Exception:
+        pass
+    return n_ok > 0
+
+
 # ---------------------------------------------------------------------------
 # Cloudflare Turnstile 破解
 # ---------------------------------------------------------------------------
 def bypass_turnstile(sb) -> bool:
     """手动破解 Cloudflare Turnstile，返回是否成功"""
     try:
-        # 查找 Turnstile iframe
         cf_iframe = None
         iframes = sb.driver.find_elements("tag name", "iframe")
         for f in iframes:
-            src = f.get_attribute("src")
-            if src and ("cloudflare" in src.lower() or "turnstile" in src.lower()):
+            src = f.get_attribute("src") or ""
+            if "cloudflare" in src.lower() or "turnstile" in src.lower():
                 cf_iframe = f
                 break
 
@@ -175,12 +281,11 @@ def bypass_turnstile(sb) -> bool:
             return True
 
         size = cf_iframe.size
-        width = size.get('width', 0)
+        width = size.get("width", 0)
         log.info(f"🎯 锁定 Turnstile iframe! 尺寸: {width}x{size.get('height', '?')}")
 
         if width > 0:
             center_x_offset = int(-(width / 2) + 30)
-            # 尝试点击 iframe 内 checkbox
             for offset in [center_x_offset - 15, center_x_offset, center_x_offset + 15]:
                 try:
                     ac = ActionChains(sb.driver)
@@ -190,20 +295,19 @@ def bypass_turnstile(sb) -> bool:
                     pass
 
         # 等待验证回调
-        token = ""
         for attempt in range(4):
             log.info(f"⏳ 等待验证回调 ({attempt+1}/4)...")
             time.sleep(6)
             try:
                 token = sb.execute_script(
-                    "return document.querySelector('[name=\"cf-turnstile-response\"]') ? "
-                    "document.querySelector('[name=\"cf-turnstile-response\"]').value : ''"
+                    "var el = document.querySelector('[name=\"cf-turnstile-response\"]');"
+                    "return el ? el.value : '';"
                 )
+                if token and len(token) > 20:
+                    log.info("✅ 已获取 Cloudflare 凭证")
+                    return True
             except Exception:
                 pass
-            if token and len(token) > 20:
-                log.info("✅ 成功！已获取 Cloudflare 凭证")
-                return True
 
         log.warning("⚠️ 未确认凭证")
         return False
@@ -221,32 +325,14 @@ def livewire_extend(sb) -> dict:
 
     results = []
 
-    # 策略1: Livewire v3
-    try:
-        result = sb.execute_script(_LW_EXTEND_V3_JS)
-        if result:
-            log.info(f"Livewire v3 结果: {result}")
-            results.append(result)
-    except Exception as e:
-        log.warning(f"Livewire v3 调用失败: {e}")
-
-    # 策略2: Livewire v2
-    try:
-        result = sb.execute_script(_LW_V2_JS)
-        if result:
-            log.info(f"Livewire v2 结果: {result}")
-            results.append(result)
-    except Exception as e:
-        log.warning(f"Livewire v2 调用失败: {e}")
-
-    # 策略3: 按钮点击
-    try:
-        result = sb.execute_script(_LW_CLICK_JS)
-        if result:
-            log.info(f"按钮点击结果: {result}")
-            results.append(result)
-    except Exception as e:
-        log.warning(f"按钮点击失败: {e}")
+    for label, js in [("v3", _LW_EXTEND_V3_JS), ("v2", _LW_V2_JS), ("click", _LW_CLICK_JS)]:
+        try:
+            result = sb.execute_script(js)
+            if result:
+                log.info(f"Livewire {label} 结果: {result}")
+                results.append(result)
+        except Exception as e:
+            log.warning(f"Livewire {label} 调用失败: {e}")
 
     return {
         "results": results,
@@ -263,16 +349,18 @@ def get_remaining_seconds(sb) -> int:
         selectors = [
             "#timeleft", ".timeleft", ".time-left",
             "#remaining", ".remaining", ".countdown",
+            "#sd-timer",
             '[class*="time"]', '[id*="time"]',
             '[class*="remain"]', '[id*="remain"]',
         ]
         for sel in selectors:
             try:
-                txt = sb.get_text(sel) if sb.is_element_visible(sel) else ""
-                sec = parse_remaining_seconds(txt)
-                if sec > 0:
-                    log.info(f"剩余时间 [{sel}] = {txt} -> {sec}s ({sec//3600}h {(sec%3600)//60}m)")
-                    return sec
+                if sb.is_element_visible(sel):
+                    txt = sb.get_text(sel)
+                    sec = parse_remaining_seconds(txt)
+                    if sec > 0:
+                        log.info(f"剩余时间 [{sel}] = {txt} -> {sec}s ({sec//3600}h {(sec%3600)//60}m)")
+                        return sec
             except Exception:
                 continue
 
@@ -292,23 +380,26 @@ def get_remaining_seconds(sb) -> int:
 # ---------------------------------------------------------------------------
 # 单服务器续期
 # ---------------------------------------------------------------------------
-def run_single_server(sb, server_num: str, region: str) -> bool:
+def run_single_server(sb, site_url: str, server_num: str, region: str) -> bool:
     """对一个服务器执行续期，返回是否成功"""
-    url_app = f"{SITE_URL.rstrip('/')}/servers/{server_num}"
+    url_app = f"{site_url.rstrip('/')}/servers/{server_num}"
 
     log.info("=" * 40)
     log.info(f"🚀 开始续期 [{region}] ({server_num})")
+    log.info(f"📂 续期页面: {url_app}")
 
+    # 出口 IP
     try:
         proxies = {"http": PROXY_URL, "https": PROXY_URL} if PROXY_URL else None
         ip_val = requests.get(
             "https://api.ipify.org?format=json",
-            proxies=proxies, timeout=10
+            proxies=proxies, timeout=10,
         ).json().get("ip", "Unknown")
         log.info(f"🌐 当前出口 IP: {ip_val}")
     except Exception:
         log.warning("⚠️ 无法获取出口 IP，跳过")
 
+    # 打开面板
     log.info(f"📂 正在进入续期面板 [{region}] ...")
     try:
         sb.uc_open_with_reconnect(url_app, reconnect_time=5)
@@ -318,7 +409,7 @@ def run_single_server(sb, server_num: str, region: str) -> bool:
 
     # 检查登录状态
     current_url = sb.get_current_url().lower()
-    if "login" in current_url:
+    if "login" in current_url or "auth" in current_url:
         raise Exception("登录状态失效或权限被拒绝")
 
     # 同意 Cookies
@@ -336,16 +427,18 @@ def run_single_server(sb, server_num: str, region: str) -> bool:
             except Exception:
                 pass
 
-    # 获取续期前时间
+    # 续期前时间
     timestamp_before = "未知"
     try:
-        sb.wait_for_element_visible('#sd-timer', timeout=15)
-        timestamp_before = sb.get_text('#sd-timer').strip()
+        sb.wait_for_element_visible("#sd-timer", timeout=15)
+        timestamp_before = sb.get_text("#sd-timer").strip()
     except Exception:
-        pass
+        # 兜底: 用通用选择器
+        sec_before = get_remaining_seconds(sb)
+        timestamp_before = f"{sec_before//3600:02d}:{(sec_before%3600)//60:02d}:00" if sec_before > 0 else "未知"
     log.info(f"🕒 续期前剩余运行时间: {timestamp_before}")
 
-    # 滚动到底部找到按钮
+    # 滚动到底部找按钮
     try:
         ActionChains(sb.driver).scroll_by_amount(0, 600).perform()
         human_wait(2, 4)
@@ -356,9 +449,8 @@ def run_single_server(sb, server_num: str, region: str) -> bool:
     try:
         log.info("🖱️ 正在点击 'VOTE + ADD 90 MIN'...")
         sb.wait_for_element_visible("#sd-vote-btn", timeout=10)
-        sb.click('#sd-vote-btn')
+        sb.click("#sd-vote-btn")
     except Exception as e:
-        # 备用：Livewire 直接调用
         log.warning("按钮点击失败，尝试 Livewire extend...")
         lw_result = livewire_extend(sb)
         if not lw_result["success"]:
@@ -372,22 +464,22 @@ def run_single_server(sb, server_num: str, region: str) -> bool:
     try:
         log.info("🖱️ 正在点击最终提交按钮 'VOTE + ADD 90 MINUTES'...")
         sb.wait_for_element_visible("#vm-submit", timeout=15)
-        sb.uc_click('#vm-submit')
+        sb.uc_click("#vm-submit")
         human_wait(8, 12)
     except Exception as e:
         log.warning(f"提交按钮点击失败: {e}")
-        # 再次尝试 Livewire
         livewire_extend(sb)
         human_wait(5, 8)
 
     time.sleep(5)
 
-    # 获取续期后时间
+    # 续期后时间
     timestamp_after = "未知"
     try:
-        timestamp_after = sb.get_text('#sd-timer').strip()
+        timestamp_after = sb.get_text("#sd-timer").strip()
     except Exception:
-        pass
+        sec_after = get_remaining_seconds(sb)
+        timestamp_after = f"{sec_after//3600:02d}:{(sec_after%3600)//60:02d}:00" if sec_after > 0 else "未知"
     log.info(f"🕒 续期后剩余运行时间: {timestamp_after}")
 
     sec_before = time_to_seconds(timestamp_before)
@@ -411,48 +503,35 @@ def run_single_server(sb, server_num: str, region: str) -> bool:
     return True
 
 
-def send_tg_with_photo(msg: str, photo_path: str = None):
-    """带截图的 TG 通知"""
-    if not (TG_TOKEN and TG_CHAT_ID):
-        log.warning("TG 未配置，跳过通知")
-        return
-    try:
-        url = f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage"
-        if photo_path and os.path.exists(photo_path):
-            url = f"https://api.telegram.org/bot{TG_TOKEN}/sendPhoto"
-            with open(photo_path, 'rb') as f:
-                requests.post(url, data={'chat_id': TG_CHAT_ID, 'caption': msg},
-                              files={'photo': f})
-        else:
-            requests.post(url, json={
-                "chat_id": TG_CHAT_ID,
-                "text": msg,
-                "parse_mode": "HTML",
-            })
-        log.info("✅ TG 通知发送成功")
-    except Exception as e:
-        log.warning(f"TG 通知失败: {e}")
-
-
 # ---------------------------------------------------------------------------
-# 主流程
+# 单账号主流程
 # ---------------------------------------------------------------------------
-def run():
-    from seleniumbase import SB
+def process_account(account: dict) -> dict:
+    """处理单个账号, 返回结果"""
+    name = account["name"]
+    site = account["site"]
+    cookie = account["cookie"]
+    renew_url = account["renew_url"]
 
-    # 解析代理端口用于预检
+    log.info("=" * 60)
+    log.info(f"👤 账号: {name}")
+    log.info(f"🌐 站点: {site}")
+    log.info(f"🔗 续期 URL: {renew_url}")
+    log.info("=" * 60)
+
+    # 从 renew_url 提取 server_num (如果有)
+    # 格式: https://control.gaming4free.net/server/247d3700/console
+    server_num_from_url = None
+    m = re.search(r"/server/([^/?#]+)", renew_url)
+    if m:
+        server_num_from_url = m.group(1)
+        log.info(f"📌 从 URL 提取服务器编号: {server_num_from_url}")
+
+    # 解析代理端口
     proxy_port = 1080
     if PROXY_URL:
-        port_match = re.search(r':(\d+)$', PROXY_URL.rstrip('/'))
+        port_match = re.search(r":(\d+)$", PROXY_URL.rstrip("/"))
         proxy_port = int(port_match.group(1)) if port_match else 1080
-
-    log.info("=" * 60)
-    log.info("gaming4free 续期启动")
-    log.info(f"代理地址: {PROXY_URL or '(未配置)'}")
-    log.info(f"目标站点: {SITE_URL}")
-    log.info(f"MC 用户:  {USERNAME or '(未配置)'}")
-    log.info(f"服务器列表: {len(SERVER_LIST)} 个")
-    log.info("=" * 60)
 
     # 预检代理端口
     try:
@@ -460,22 +539,19 @@ def run():
         s.settimeout(3)
         s.connect(("127.0.0.1", proxy_port))
         s.close()
-        log.info(f"代理 SOCKS5 端口 {proxy_port} 可用")
+        log.info(f"✅ 代理 SOCKS5 端口 {proxy_port} 可用")
     except Exception:
-        log.error(f"代理端口 {proxy_port} 不可达，请检查代理启动状态")
-        tg(f"❌ gaming4free 续期失败：代理端口 {proxy_port} 未就绪")
-        sys.exit(1)
+        log.warning(f"⚠️ 代理端口 {proxy_port} 不可达，将直连")
 
-# 代理配置
-    _proxy = PROXY_URL or "socks5://127.0.0.1:1080"
+    CHROMIUM_ARGS = (
+        f"--no-sandbox,--disable-dev-shm-usage,--disable-gpu,"
+        f"--window-size=1280,720,--disable-blink-features=AutomationControlled,"
+        f"--disable-infobars,--disable-popup-blocking,--proxy-server={PROXY_URL}"
+    )
 
-    # 如果代理 URL 含 ?（远程复杂代理），强制用本地 sing-box
-    if "?" in _proxy or (not _proxy.startswith(("socks", "http")) and not _proxy.startswith("127.0.0.1")):
-        _proxy = "socks5://127.0.0.1:1080"
+    log.info(f"正在启动浏览器 (uc=True, xvfb=True, proxy={PROXY_URL})...")
+    from seleniumbase import SB
 
-    CHROMIUM_ARGS = f"--no-sandbox,--disable-dev-shm-usage,--disable-gpu,--window-size=1280,720,--disable-blink-features=AutomationControlled,--disable-infobars,--disable-popup-blocking,--proxy-server={_proxy}"
-
-    log.info(f"正在启动浏览器 (uc=True, headed=True, xvfb=True, proxy={_proxy})...")
     with SB(
         browser="chrome",
         uc=True,
@@ -488,98 +564,67 @@ def run():
         log.info("✅ 浏览器启动成功")
         sb.set_window_size(1280, 720)
 
-        # 注入 cookie（如有）
-        if COOKIE_STR:
-            log.info("注入自定义 cookie...")
-            for item in COOKIE_STR.split(";"):
-                if "=" in item:
-                    k, v = item.strip().split("=", 1)
-                    try:
-                        sb.set_cookie(k, v)
-                    except Exception:
-                        pass
-
-        # 登录（如有用户名密码）
-        if USERNAME:
-            log.info(f"尝试登录用户: {USERNAME}")
-            login_url = LOGIN_URL or SITE_URL
-            sb.open(login_url)
-            sb.sleep(2)
-
-            user_selectors = [
-                'input[name="username"]', 'input[name="user"]',
-                'input[name="mc_username"]', 'input[type="text"]',
-                'input[id*="user"]', 'input[name="email"]',
-            ]
-            pass_selectors = [
-                'input[name="password"]', 'input[type="password"]',
-            ]
-            submit_selectors = [
-                'button[type="submit"]', 'input[type="submit"]',
-                'button:contains("Login")', 'button:contains("登录")',
-                'button:contains("Sign in")',
-            ]
-
-            for sel in user_selectors:
-                try:
-                    if sb.is_element_visible(sel):
-                        sb.type(sel, USERNAME, timeout=5)
-                        break
-                except Exception:
-                    continue
-            if PASSWORD:
-                for sel in pass_selectors:
-                    try:
-                        if sb.is_element_visible(sel):
-                            sb.type(sel, PASSWORD, timeout=5)
-                            break
-                    except Exception:
-                        continue
-            for sel in submit_selectors:
-                try:
-                    if sb.is_element_visible(sel):
-                        human_wait(0.5, 1.2)
-                        sb.click(sel, timeout=5)
-                        log.info("登录表单已提交")
-                        time.sleep(3)
-                        break
-                except Exception:
-                    continue
+        # 注入 Cookie (关键: 必须先 open 站点, 再 add_cookie, 再 reload)
+        if cookie:
+            log.info("🍪 开始注入 Cookie...")
+            inject_cookies(sb, site, cookie)
+        else:
+            log.warning("⚠️ 未配置 Cookie, 仅靠浏览器匿名访问")
 
         # 处理 CF 5 秒盾
         log.info("等待 CF 5 秒盾（如有）...")
         for _ in range(15):
-            if "just a moment" in sb.get_text("body").lower():
+            try:
+                if "just a moment" in sb.get_text("body").lower():
+                    time.sleep(1)
+                else:
+                    break
+            except Exception:
                 time.sleep(1)
-            else:
-                break
 
-        # 如果有 SERVERS 配置，逐个续期
+        # 决定要续期的服务器列表
+        servers_to_renew = []
         if SERVER_LIST:
+            servers_to_renew = SERVER_LIST
+            log.info(f"📋 从 SERVERS 环境变量读取到 {len(servers_to_renew)} 个服务器")
+        elif server_num_from_url:
+            servers_to_renew = [{"num": server_num_from_url, "region": name}]
+            log.info(f"📋 从 URL 提取服务器编号: {server_num_from_url}")
+        else:
+            log.warning("⚠️ 既无 SERVERS 配置, 也无法从 URL 提取服务器编号, 将走循环续期模式")
+
+        if servers_to_renew:
             success_count = 0
             fail_count = 0
-            for server in SERVER_LIST:
+            for server in servers_to_renew:
                 try:
-                    if run_single_server(sb, server["num"], server["region"]):
+                    if run_single_server(sb, site, server["num"], server["region"]):
                         success_count += 1
                     else:
                         fail_count += 1
                 except Exception as e:
                     log.error(f"❌ [{server['region']}] 续期失败: {e}")
                     error_shot = screenshot(sb, f"error_{server['num']}")
-                    tg(f"❌ [{server['region']}] 执行失败: {e}\n🖥️ 编号: {server['num']}")
+                    tg(f"❌ [{server['region']}] 执行失败: {e}\n🖥️ 编号: {server['num']}",
+                       photo_path=str(error_shot))
                     fail_count += 1
 
             msg = (
-                f"gaming4free 续期完成\n"
-                f"成功: {success_count} | 失败: {fail_count}\n"
-                f"总计: {len(SERVER_LIST)} 个服务器"
+                f"🎮 gaming4free 续期完成 [{name}]\n"
+                f"✅ 成功: {success_count} | ❌ 失败: {fail_count}\n"
+                f"📊 总计: {len(servers_to_renew)} 个服务器"
             )
             log.info(msg)
             tg(msg)
+            return {
+                "name": name, "ok": True,
+                "total": len(servers_to_renew),
+                "renewed": success_count,
+                "failed": fail_count,
+            }
         else:
-            # 无 SERVERS 配置，走旧版循环续期逻辑
-            log.info("未配置 SERVERS，使用默认循环续期模式...")
+            # 循环续期模式 (无具体服务器编号)
+            log.info("使用默认循环续期模式...")
             click_count = 0
             last_sec = get_remaining_seconds(sb)
             log.info(f"初始剩余: {last_sec}s ({last_sec//3600}h {(last_sec%3600)//60}m)")
@@ -672,18 +717,63 @@ def run():
             final_sec = get_remaining_seconds(sb)
             h, m = final_sec // 3600, (final_sec % 3600) // 60
             msg = (
-                f"gaming4free 续期完成\n"
-                f"成功点击: {click_count} 次\n"
-                f"最终剩余: {h}h {m}m"
+                f"🎮 gaming4free 续期完成 [{name}]\n"
+                f"✅ 成功点击: {click_count} 次\n"
+                f"🕒 最终剩余: {h}h {m}m"
             )
             log.info(msg)
             tg(msg)
             screenshot(sb, "final")
+            return {
+                "name": name, "ok": True,
+                "clicks": click_count,
+                "final_sec": final_sec,
+            }
+
+
+# ---------------------------------------------------------------------------
+# 主入口
+# ---------------------------------------------------------------------------
+def main():
+    log.info("=" * 60)
+    log.info("🎮 gaming4free 续期启动")
+    log.info(f"代理地址: {PROXY_URL}")
+    log.info(f"目标站点: {SITE_URL}")
+    log.info(f"账号数量: {len(ACCOUNTS)}")
+    log.info(f"服务器列表: {len(SERVER_LIST)} 个 (来自 SERVERS 环境变量)")
+    log.info("=" * 60)
+
+    if not ACCOUNTS:
+        msg = "❌ 未配置 GAME4FREE_COOKIE 或 GAME4FREE_ACCOUNTS"
+        log.error(msg)
+        tg(msg)
+        sys.exit(1)
+
+    all_results = []
+    for acc in ACCOUNTS:
+        try:
+            res = process_account(acc)
+        except Exception as e:
+            log.exception(f"账号 {acc['name']} 异常: {e}")
+            res = {"name": acc["name"], "ok": False, "msg": f"异常: {e}"}
+            tg(f"❌ 账号 {acc['name']} 崩溃\n{e}")
+        all_results.append(res)
+
+    # 汇总
+    total_renewed = sum(r.get("renewed", 0) for r in all_results if r.get("ok"))
+    total_failed = sum(r.get("failed", 0) for r in all_results if r.get("ok"))
+    summary = (
+        f"🎮 gaming4free 续期汇总\n"
+        f"📊 账号数: {len(all_results)}\n"
+        f"✅ 总成功: {total_renewed} | ❌ 总失败: {total_failed}"
+    )
+    log.info(summary)
+    tg(summary)
 
 
 if __name__ == "__main__":
     try:
-        run()
+        main()
     except KeyboardInterrupt:
         log.info("用户中断")
     except Exception as e:

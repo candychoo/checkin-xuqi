@@ -60,7 +60,7 @@ jobs:
           GAME4FREE_RENEW_URL: ${{ secrets.GAME4FREE_RENEW_URL }}
           GAME4FREE_COOKIE: ${{ secrets.GAME4FREE_COOKIE }}
           GAME4FREE_ACCOUNTS: ${{ secrets.GAME4FREE_ACCOUNTS }}
-          GAME4FREE_ACCOUNT: ${{ secrets.GAME4FREE_ACCOUNT }}
+          SERVERS: ${{ secrets.SERVERS }}
           PROXY_URL: ${{ secrets.PROXY_URL }}
           # SeleniumBase 会自动管理 Chrome/Chromedriver，无需手动指定
           SB_SKIP_DRIVER_UPDATE: "true"
