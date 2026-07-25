@@ -31,13 +31,13 @@ USERNAME       = os.getenv("MC_USERNAME", "")
 PASSWORD       = os.getenv("MC_PASSWORD", "")
 COOKIE_STR     = os.getenv("GF_COOKIE", "")
 
-# 代理地址：优先用 secrets.PROXY_URL，回退到本地 sing-box
+# 代理地址：优先用 secrets.PROXY_URL（简单格式如 http://ip:port）
+# 如果包含 ? 或不是标准协议前缀，说明是远程复杂代理，忽略它，用本地 sing-box
 _raw_proxy = os.getenv("PROXY_URL", "").strip()
-if "?" in _raw_proxy or (_raw_proxy and not _raw_proxy.startswith(("socks", "http"))):
-    PROXY_URL = _raw_proxy
-elif _raw_proxy:
+if _raw_proxy and not _raw_proxy.startswith(("socks", "http")) and "?" not in _raw_proxy:
     PROXY_URL = _raw_proxy
 else:
+    # 默认用本地 sing-box SOCKS5
     PROXY_URL = "socks5://127.0.0.1:1080"
 
 MAX_HOURS      = 48            # 续期上限 48 小时
@@ -468,12 +468,13 @@ def run():
 
     # 启动浏览器
     CHROMIUM_ARGS = (
-        "--no-sandbox,--disable-dev-shm-usage,--disable-gpu,"
-        "--window-position=0,0,--window-size=1280,720,"
-        "--disable-blink-features=AutomationControlled,"
-        "--disable-infobars,--disable-popup-blocking,"
-        "--disable-features=OptimizationGuideModelDownloading,"
-        "OptimizationHintsFetching,OptimizationTargetPrediction"
+        f"--no-sandbox,--disable-dev-shm-usage,--disable-gpu,"
+        f"--window-position=0,0,--window-size=1280,720,"
+        f"--disable-blink-features=AutomationControlled,"
+        f"--disable-infobars,--disable-popup-blocking,"
+        f"--disable-features=OptimizationGuideModelDownloading,"
+        f"OptimizationHintsFetching,OptimizationTargetPrediction,"
+        f"--proxy-server={PROXY_URL}"
     )
 
     log.info(f"正在启动浏览器 (uc=True, headed=True, xvfb=True)...")
@@ -485,7 +486,6 @@ def run():
         headless=False,
         xvfb=True,
         chromium_arg=CHROMIUM_ARGS,
-        proxy=PROXY_URL if PROXY_URL else None,
     ) as sb:
         log.info("✅ 浏览器启动成功")
         sb.set_window_size(1280, 720)
