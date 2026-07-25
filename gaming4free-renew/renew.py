@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+﻿#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
 gaming4free 自动续期脚本（GHA + sing-box proxy + seleniumbase UC mode）
@@ -467,15 +467,23 @@ def run():
         sys.exit(1)
 
     # 启动浏览器
-    CHROMIUM_ARGS = (
-        f"--no-sandbox,--disable-dev-shm-usage,--disable-gpu,"
-        f"--window-position=0,0,--window-size=1280,720,"
-        f"--disable-blink-features=AutomationControlled,"
-        f"--disable-infobars,--disable-popup-blocking,"
-        f"--disable-features=OptimizationGuideModelDownloading,"
-        f"OptimizationHintsFetching,OptimizationTargetPrediction,"
-        f"--proxy-server={PROXY_URL}"
-    )
+    # 通过 ChromeOptions 设置代理——绕过 SeleniumBase proxy= 验证
+    from selenium.webdriver.chrome.options import Options as ChromeOptions
+    _proxy = PROXY_URL or "socks5://127.0.0.1:1080"
+    
+    # 如果代理 URL 含 ?（远程复杂代理），强制用本地 sing-box
+    if "?" in _proxy or (not _proxy.startswith(("socks", "http")) and not _proxy.startswith("127.0.0.1")):
+        _proxy = "socks5://127.0.0.1:1080"
+    
+    chrome_opts = ChromeOptions()
+    chrome_opts.add_argument(f"--proxy-server={_proxy}")
+    chrome_opts.add_argument("--no-sandbox")
+    chrome_opts.add_argument("--disable-dev-shm-usage")
+    chrome_opts.add_argument("--disable-gpu")
+    chrome_opts.add_argument("--window-size=1280,720")
+    chrome_opts.add_argument("--disable-blink-features=AutomationControlled")
+    chrome_opts.add_argument("--disable-infobars")
+    chrome_opts.add_argument("--disable-popup-blocking")
 
     log.info(f"正在启动浏览器 (uc=True, headed=True, xvfb=True)...")
     with SB(
@@ -485,7 +493,7 @@ def run():
         headed=True,
         headless=False,
         xvfb=True,
-        chromium_arg=CHROMIUM_ARGS,
+        chrome_options=chrome_opts,
     ) as sb:
         log.info("✅ 浏览器启动成功")
         sb.set_window_size(1280, 720)
