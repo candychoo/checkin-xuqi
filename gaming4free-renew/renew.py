@@ -372,21 +372,20 @@ def run():
         tg(f"❌ gaming4free 续期失败：代理端口 {proxy_port} 未就绪")
         sys.exit(1)
 
-    # UC mode 启动
-    log.info("正在启动浏览器 (uc=True, headless=True)...")
-    # 设置系统级代理环境变量
-    os.environ["ALL_PROXY"] = PROXY_URL
+    # 启动浏览器，通过 ChromeOptions 设置代理
+    from selenium.webdriver.chrome.options import Options as ChromeOptions
+    chrome_opts = ChromeOptions()
+    chrome_opts.add_argument(f"--proxy-server={PROXY_URL}")
     
+    log.info("正在启动浏览器 (uc=False, headless=True)...")
     with SB(
         browser="chrome",
         uc=False,
         headless=True,
         incognito=False,
-        agent="Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
-              "(KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
+        options=chrome_opts,
         disable_cookies=False,
         ad_block=False,
-        proxy_server=PROXY_URL,
     ) as sb:
         log.info("✅ 浏览器启动成功")
 
