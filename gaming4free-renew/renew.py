@@ -149,21 +149,36 @@ def check_session_cap(drv) -> bool:
     return False
 
 def is_watch_ad_state(btn_txt: str) -> bool:
-    """判断按钮是否处于可点击的 Watch Ad 状态（排除冷却态 '+ 90 min 05:00' 等）"""
+    """判断按钮是否处于可点击的续期状态（Watch Ad / + 90 min 等）"""
     import re
     t = btn_txt.lower()
-    # 必须包含 watch ad / watch
-    has_watch = 'watch ad' in t or ('watch' in t and 'ad' in t)
-    if not has_watch:
-        return False
-    # 冷却特征：含 90min / +90 / 倒计时时间格式 (MM:SS / H:MM:SS / 5m / 5min / 5 min)
-    cooldown_patterns = [
-        r'90\s*min',           # 90min, 90 min
-        r'\+\s*90',            # +90, + 90
-        r'\b\d{1,2}:\d{2}\b',  # 05:00, 5:00, 12:34 (MM:SS 或 H:MM)
-        r'\b\d{1,2}:\d{2}:\d{2}\b',  # 1:05:00 (H:MM:SS)
-        r'\b\d+\s*m(?:in)?\b', # 5m, 5min, 5 min
+    
+    # 可点击的续期按钮特征
+    clickable_patterns = [
+        r'watch\s*ad',           # Watch Ad
+        r'watch',                # Watch
+        r'\+\s*90\s*min',       # + 90 min (新版格式)
+        r'90\s*min',            # 90 min
+        r'renew',               # Renew
+        r'extend',              # Extend
     ]
+    
+    has_clickable = any(re.search(p, t) for p in clickable_patterns)
+    if not has_clickable:
+        return False
+    
+    # 冷却特征：含倒计时时间格式 (MM:SS / H:MM:SS / 5m / 5min / 5 min)
+    # 注意："+ 90 min" 不含倒计时，是可点击状态
+    cooldown_patterns = [
+        r'\b\d{1,2}:\d{2}\b',           # 05:00, 5:00, 12:34 (MM:SS 或 H:MM)
+        r'\b\d{1,2}:\d{2}:\d{2}\b',     # 1:05:00 (H:MM:SS)
+        r'\b\d+\s*m(?:in)?\b',          # 5m, 5min, 5 min (但不含 90 min)
+    ]
+    
+    # 特殊处理："+ 90 min" 是可点击状态，不是冷却
+    if re.search(r'\+\s*90\s*min', t):
+        return True
+    
     is_cooldown = any(re.search(p, t) for p in cooldown_patterns)
     return not is_cooldown
 
