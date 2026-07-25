@@ -586,15 +586,43 @@ def run_single_server(sb, site_url: str, server_num: str, region: str,
             except Exception:
                 pass
 
-    # 续期前时间
+    # 续期前时间 - 优先用 JS 精确提取 (页面是 Filament 框架, 时间格式 "HH:MM:SSremaining")
     timestamp_before = "未知"
     try:
-        sb.wait_for_element_visible("#sd-timer", timeout=15)
-        timestamp_before = sb.get_text("#sd-timer").strip()
-    except Exception:
-        # 兜底: 用通用选择器
-        sec_before = get_remaining_seconds(sb)
-        timestamp_before = f"{sec_before//3600:02d}:{(sec_before%3600)//60:02d}:00" if sec_before > 0 else "未知"
+        # 用 JS 找含 HH:MM:SS 的元素 (更精确)
+        time_text = sb.execute_script("""
+            try {
+                // 1. 先找已知 class (rt-timer / sd-timer)
+                var known = document.querySelector('.rt-timer, #sd-timer, .sd-timer');
+                if (known) return known.innerText.trim();
+                // 2. 找所有元素, 匹配 HH:MM:SS 格式 (允许后面跟 'remaining' 等文字)
+                var els = document.querySelectorAll('div, span, p, h1, h2, h3, h4, h5, h6');
+                for (var i = 0; i < els.length; i++) {
+                    var t = (els[i].innerText || '').trim();
+                    // 精确匹配: 数字:数字:数字 开头, 长度 < 30
+                    var m = t.match(/^(\\d{1,2}:\\d{2}:\\d{2})/);
+                    if (m && t.length < 30) return m[1];
+                }
+                return '';
+            } catch(e) { return ''; }
+        """)
+        if time_text:
+            # 提取 HH:MM:SS 部分
+            m = re.search(r"(\d{1,2}:\d{2}:\d{2})", time_text)
+            if m:
+                timestamp_before = m.group(1)
+                log.info(f"🕒 续期前剩余 (JS 提取): {timestamp_before}")
+    except Exception as e:
+        log.warning(f"JS 提取时间失败: {e}")
+
+    if timestamp_before == "未知":
+        # 兜底: 通用选择器
+        try:
+            sb.wait_for_element_visible("#sd-timer", timeout=5)
+            timestamp_before = sb.get_text("#sd-timer").strip()
+        except Exception:
+            sec_before = get_remaining_seconds(sb)
+            timestamp_before = f"{sec_before//3600:02d}:{(sec_before%3600)//60:02d}:00" if sec_before > 0 else "未知"
     log.info(f"🕒 续期前剩余运行时间: {timestamp_before}")
 
     # 滚动到底部找按钮
@@ -604,19 +632,27 @@ def run_single_server(sb, site_url: str, server_num: str, region: str,
     except Exception:
         pass
 
-    # 点击续期按钮 - 尝试多种选择器
+    # 点击续期按钮 - 尝试多种选择器 (按真实页面结构优先排序)
+    # 真实页面: <BUTTON class='rt-btn-free'> '+ 90 min'
+    #          <BUTTON class='rt-btn-paid'> '+24h $0.15'
     vote_btn_selectors = [
-        "#sd-vote-btn",                            # 原始 ID
+        # 1. 真实 class (最高优先级)
+        "button.rt-btn-free",                       # 续期 +90 分钟 (免费)
+        "button.rt-btn-paid",                       # 续期 +24h (付费, 备选)
+        ".rt-btn-free",                             # class 选择器 (无标签)
+        # 2. ID (旧版兼容)
+        "#sd-vote-btn",
         'button[id="sd-vote-btn"]',
+        # 3. 文字匹配 (兜底)
+        'button:contains("+ 90 min")',
+        'button:contains("+90 min")',
+        'button:contains("90 min")',
         'button:contains("VOTE")',
-        'button:contains("90")',
-        'button:contains("+90")',
         'button:contains("ADD 90")',
-        'a:contains("VOTE")',
-        'a:contains("90 min")',
-        '//button[contains(., "VOTE")]',
+        # 4. XPath 兜底
+        '//button[contains(., "+ 90 min")]',
         '//button[contains(., "90 min")]',
-        '//a[contains(., "VOTE")]',
+        '//button[contains(., "VOTE")]',
     ]
     clicked = False
     for sel in vote_btn_selectors:
@@ -644,13 +680,27 @@ def run_single_server(sb, site_url: str, server_num: str, region: str,
     bypass_turnstile(sb)
 
     # 点击最终提交按钮 - 尝试多种选择器
+    # 点击 + 90 min 后可能弹出确认对话框, 含 "Confirm" / "Submit" 按钮
     submit_selectors = [
+        # 1. 真实页面可能的 class (基于 Filament 框架)
+        "button.fi-btn-action",
+        "button.fi-ac-btn-action",
+        ".fi-modal-confirm-btn",
+        # 2. 旧版 ID
         "#vm-submit",
         'button[id="vm-submit"]',
+        # 3. 文字匹配
+        'button:contains("Confirm")',
+        'button:contains("Submit")',
         'button:contains("VOTE + ADD")',
         'button:contains("ADD 90 MINUTES")',
-        'button:contains("Submit")',
+        'button:contains("Yes")',
+        'button:contains("OK")',
+        # 4. 通用 submit
         'button[type="submit"]',
+        # 5. XPath
+        '//button[contains(., "Confirm")]',
+        '//button[contains(., "Submit")]',
     ]
     submitted = False
     for sel in submit_selectors:
@@ -671,13 +721,36 @@ def run_single_server(sb, site_url: str, server_num: str, region: str,
 
     time.sleep(5)
 
-    # 续期后时间
+    # 续期后时间 - 同样用 JS 精确提取
     timestamp_after = "未知"
     try:
-        timestamp_after = sb.get_text("#sd-timer").strip()
-    except Exception:
-        sec_after = get_remaining_seconds(sb)
-        timestamp_after = f"{sec_after//3600:02d}:{(sec_after%3600)//60:02d}:00" if sec_after > 0 else "未知"
+        time_text = sb.execute_script("""
+            try {
+                var known = document.querySelector('.rt-timer, #sd-timer, .sd-timer');
+                if (known) return known.innerText.trim();
+                var els = document.querySelectorAll('div, span, p, h1, h2, h3, h4, h5, h6');
+                for (var i = 0; i < els.length; i++) {
+                    var t = (els[i].innerText || '').trim();
+                    var m = t.match(/^(\\d{1,2}:\\d{2}:\\d{2})/);
+                    if (m && t.length < 30) return m[1];
+                }
+                return '';
+            } catch(e) { return ''; }
+        """)
+        if time_text:
+            m = re.search(r"(\d{1,2}:\d{2}:\d{2})", time_text)
+            if m:
+                timestamp_after = m.group(1)
+                log.info(f"🕒 续期后剩余 (JS 提取): {timestamp_after}")
+    except Exception as e:
+        log.warning(f"JS 提取续期后时间失败: {e}")
+
+    if timestamp_after == "未知":
+        try:
+            timestamp_after = sb.get_text("#sd-timer").strip()
+        except Exception:
+            sec_after = get_remaining_seconds(sb)
+            timestamp_after = f"{sec_after//3600:02d}:{(sec_after%3600)//60:02d}:00" if sec_after > 0 else "未知"
     log.info(f"🕒 续期后剩余运行时间: {timestamp_after}")
 
     sec_before = time_to_seconds(timestamp_before)
