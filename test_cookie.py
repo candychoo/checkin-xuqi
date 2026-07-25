@@ -1,6 +1,10 @@
 #!/usr/bin/env python3
 """
 快速测试 ACL_COOKIES 是否有效 - 详细版
+关键修复:
+1. 直接访问 aclclouds.com (跳过 dash. 重定向)
+2. 自动把 aclclouds_session 改名为 __Host-aclclouds_session
+3. 同时用 Cookie header + cookie jar 双保险
 """
 import os
 import requests
@@ -13,19 +17,35 @@ if not COOKIE:
     print("❌ ACL_COOKIES 为空！")
     exit(1)
 
-# 检查关键 Cookie 是否存在
-has_xsrf = "XSRF-TOKEN" in COOKIE
-has_session = "aclclouds_session" in COOKIE
-print(f"包含 XSRF-TOKEN: {has_xsrf}")
-print(f"包含 aclclouds_session: {has_session}")
+# 解析 cookie 字符串成 dict
+parsed = {}
+for kv in COOKIE.split(";"):
+    kv = kv.strip()
+    if "=" in kv:
+        k, v = kv.split("=", 1)
+        parsed[k.strip()] = v.strip()
 
-if not has_xsrf or not has_session:
-    print("⚠️ 警告: Cookie 可能不完整，请重新从浏览器复制完整 Cookie")
+# 检查关键 Cookie
+has_xsrf = "XSRF-TOKEN" in parsed
+has_session_legacy = "aclclouds_session" in parsed
+has_session_host = "__Host-aclclouds_session" in parsed
+print(f"\n包含 XSRF-TOKEN: {has_xsrf}")
+print(f"包含 aclclouds_session (旧名): {has_session_legacy}")
+print(f"包含 __Host-aclclouds_session (新名): {has_session_host}")
+
+# 关键: 服务器现在用 __Host-aclclouds_session, 自动改名
+if has_session_legacy and not has_session_host:
+    parsed["__Host-aclclouds_session"] = parsed.pop("aclclouds_session")
+    print("🔄 已将 aclclouds_session 重命名为 __Host-aclclouds_session (服务器要求)")
+    has_session_host = True
+
+if not has_xsrf or not has_session_host:
+    print("⚠️ 警告: Cookie 可能不完整")
     print(f"完整 Cookie: {COOKIE}")
     exit(1)
 
-# 用和 renew.py 完全相同的方式构建 session (含跨域 Cookie 设置)
-BASE_URL = "https://dash.aclclouds.com"
+# 关键: 直接用 aclclouds.com (跳过 dash. 重定向)
+BASE_URL = "https://aclclouds.com"
 UA = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
 
 s = requests.Session()
@@ -37,22 +57,14 @@ s.headers.update({
     "Referer": f"{BASE_URL}/projects",
 })
 
-# 关键: dash.aclclouds.com → aclclouds.com 会 302 重定向
-# Cookie 必须同时设置在两个域, 否则重定向后丢失 → 401
-cookie_domains = ["dash.aclclouds.com", "aclclouds.com", ".aclclouds.com"]
-for kv in COOKIE.split(";"):
-    kv = kv.strip()
-    if "=" in kv:
-        k, v = kv.split("=", 1)
-        k = k.strip()
-        v = v.strip()
-        # 移除 __Host- / __Secure- 前缀
-        if k.startswith("__Host-"):
-            k = k[7:]
-        elif k.startswith("__Secure-"):
-            k = k[9:]
-        for d in cookie_domains:
-            s.cookies.set(k, v, domain=d, path="/")
+# 双保险 1: 设置 Cookie header
+cookie_header = "; ".join(f"{k}={v}" for k, v in parsed.items())
+s.headers["Cookie"] = cookie_header
+
+# 双保险 2: 设置到 cookie jar 的多个域
+for d in ["aclclouds.com", ".aclclouds.com", "dash.aclclouds.com"]:
+    for k, v in parsed.items():
+        s.cookies.set(k, v, domain=d, path="/")
 
 # 打印实际设置的 Cookie (去重)
 print(f"\nSession 中的 Cookie (去重):")
@@ -63,7 +75,7 @@ for cookie in s.cookies:
     seen.add(cookie.name)
     print(f"  {cookie.name} = {cookie.value[:30]}...")
 
-# 测试 /api/client
+# 测试 /api/client (直接访问 aclclouds.com, 不经过 dash. 重定向)
 r = s.get(f"{BASE_URL}/api/client", timeout=15, allow_redirects=True)
 print(f"\n=== GET {BASE_URL}/api/client ===")
 print(f"HTTP 状态码: {r.status_code}")

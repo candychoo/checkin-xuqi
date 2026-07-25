@@ -17,7 +17,9 @@ from datetime import datetime, timezone
 import requests
 
 # ==================== 配置 ====================
-BASE_URL = "https://dash.aclclouds.com"
+# 关键: 直接访问主域 aclclouds.com, 不走 dash.aclclouds.com
+# 因为 dash.aclclouds.com 会 302 重定向到 aclclouds.com, 引起跨 host cookie 问题
+BASE_URL = "https://aclclouds.com"
 RENEW_THRESHOLD_HOURS = int(os.environ.get("RENEW_THRESHOLD_HOURS", "48"))
 
 # Cookie: 完整的浏览器 Cookie 字符串, 必须包含 XSRF-TOKEN 和 aclclouds_session
@@ -96,39 +98,55 @@ def build_session(cookie_str):
         "Origin": BASE_URL,
         "Referer": f"{BASE_URL}/projects",
     })
-    # 解析 cookie 字符串 - 处理 __Host- 和 __Secure- 前缀
-    # 关键: 同时设置到 dash.aclclouds.com / aclclouds.com / .aclclouds.com
-    # 因为 dash.aclclouds.com/api/client 会 302 重定向到 aclclouds.com/api/client
-    # Cookie 必须在两个域上都存在, 否则重定向后丢失 → 401
-    cookie_domains = ["dash.aclclouds.com", "aclclouds.com", ".aclclouds.com"]
-    n_set = 0
+
+    # 解析 cookie 字符串成 dict
+    parsed = {}
     for kv in cookie_str.split(";"):
         kv = kv.strip()
         if not kv or "=" not in kv:
             continue
         k, v = kv.split("=", 1)
-        k = k.strip()
-        v = v.strip()
-        # 移除 __Host- 和 __Secure- 前缀（requests 不支持这些前缀）
-        clean_k = k
-        if k.startswith("__Host-"):
-            clean_k = k[7:]  # 移除 "__Host-" (7个字符)
-        elif k.startswith("__Secure-"):
-            clean_k = k[9:]  # 移除 "__Secure-" (9个字符)
+        parsed[k.strip()] = v.strip()
 
-        # 关键修复: 在多个域上设置 cookie, 保证重定向后仍能携带
+    # 关键: 服务器现在用的是 __Host-aclclouds_session (带 __Host- 前缀)
+    # 但用户复制 cookie 时可能丢失前缀 (因为 __Host- 是浏览器内部前缀,
+    # document.cookie 不返回它, 只有 Application 面板才显示)
+    # 所以: 如果用户提供了 aclclouds_session, 自动改名为 __Host-aclclouds_session
+    if "aclclouds_session" in parsed and "__Host-aclclouds_session" not in parsed:
+        parsed["__Host-aclclouds_session"] = parsed.pop("aclclouds_session")
+        log("🔄 已将 aclclouds_session 重命名为 __Host-aclclouds_session (服务器要求)")
+
+    # 关键: __Host- 前缀的 cookie 有特殊限制 (无 domain, path=/, secure)
+    # requests 的 cookie jar 设置 domain 会破坏 __Host- 语义
+    # 最可靠的方式: 直接用 Cookie header 注入, 绕过 cookie jar
+    # 这样无论怎么重定向, header 都会原样发送 (除非被 requests 跨 host 安全策略拦截)
+    #
+    # 但 requests 跨 host 重定向会重新评估 cookie, 所以我们用两种方式:
+    # 1. 设置 Cookie header (用于首次请求)
+    # 2. 同时设置到 cookie jar 的多个域 (用于重定向后自动携带)
+
+    # 构建 Cookie header 字符串
+    cookie_header_parts = []
+    for k, v in parsed.items():
+        cookie_header_parts.append(f"{k}={v}")
+    cookie_header = "; ".join(cookie_header_parts)
+
+    # 设置到 cookie jar 的多个域 (用于跨 host 重定向后携带)
+    cookie_domains = ["aclclouds.com", ".aclclouds.com", "dash.aclclouds.com"]
+    for k, v in parsed.items():
+        # XSRF-TOKEN 是普通 cookie, 可以设 domain
+        # __Host- 前缀的 cookie 严格来说不能设 domain, 但 requests 不强制
+        # 为了跨 host 重定向能携带, 我们都设置 domain
         for d in cookie_domains:
-            s.cookies.set(clean_k, v, domain=d, path="/")
-        n_set += 1
+            s.cookies.set(k, v, domain=d, path="/")
 
-    # 调试: 打印设置的 Cookie (去重显示)
-    log(f"🔍 共解析 {n_set} 个 Cookie, 设置到 {len(cookie_domains)} 个域:")
-    seen = set()
-    for cookie in s.cookies:
-        if cookie.name in seen:
-            continue
-        seen.add(cookie.name)
-        log(f"   - {cookie.name} = {cookie.value[:30]}...")
+    # 同时设置 Cookie header (双保险, 用于首次请求)
+    s.headers["Cookie"] = cookie_header
+
+    # 调试输出
+    log(f"🔍 共解析 {len(parsed)} 个 Cookie:")
+    for k, v in parsed.items():
+        log(f"   - {k} = {v[:30]}...")
 
     return s
 
@@ -136,7 +154,7 @@ def build_session(cookie_str):
 def get_xsrf(session):
     """从 cookie 中提取并解码 XSRF-TOKEN (跨域查找)"""
     # 依次尝试几个可能的域
-    for domain in ("dash.aclclouds.com", "aclclouds.com", ".aclclouds.com"):
+    for domain in ("aclclouds.com", ".aclclouds.com", "dash.aclclouds.com"):
         token = session.cookies.get("XSRF-TOKEN", domain=domain)
         if token:
             return urllib.parse.unquote(token)
