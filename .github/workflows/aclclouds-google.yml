@@ -23,16 +23,17 @@ jobs:
         with:
           node-version: '20'
 
-      - name: 安装 Playwright
+      - name: 安装依赖
         run: |
           npm init -y
-          npm install playwright
+          npm install axios playwright
           npx playwright install chromium
 
       - name: 运行 Google 登录续期
         env:
-          ACL_EMAIL: ${{ secrets.ACL_GOOGLE_EMAIL }}
-          ACL_PASSWORD: ${{ secrets.ACL_GOOGLE_PASSWORD }}
+          ACL_GOOGLE_EMAIL: ${{ secrets.ACL_GOOGLE_EMAIL }}
+          ACL_GOOGLE_PASSWORD: ${{ secrets.ACL_GOOGLE_PASSWORD }}
+          RENEW_THRESHOLD_HOURS: ${{ vars.RENEW_THRESHOLD_HOURS || '48' }}
           TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
           TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
         run: node google-renew.js
