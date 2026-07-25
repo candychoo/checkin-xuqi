@@ -337,7 +337,6 @@ def run():
         agent="Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
               "(KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
         disable_cookies=False,
-        ignore_certificate_errors=True,
         proxy=PROXY_URL,
         ad_block=False,
         localized=False,
