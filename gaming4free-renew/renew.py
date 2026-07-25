@@ -110,27 +110,35 @@ def get_remaining_seconds(drv) -> Tuple[Optional[str], int]:
             els = drv.find_elements(By.XPATH, xpath)
             for el in els:
                 txt = (el.text or el.get_attribute("textContent") or "").strip()
+                log(f"找到剩余时间元素: {txt}", "INFO")
                 sec = parse_remaining_time(txt)
                 if sec is not None:
                     return txt, sec
-        except:
-            pass
+        except Exception as e:
+            log(f"查找剩余时间元素失败: {e}", "WARN")
 
     # 2. 全文正则兜底
     try:
         body = drv.execute_script("return document.body ? document.body.innerText : '';")
+        log(f"页面文本长度: {len(body)}", "INFO")
+        log(f"页面文本片段: {body[:500]}...", "INFO")
+
+        # 常见的剩余时间格式
         for pattern in [
             r'(\d{1,2}:\d{2}:\d{2})\s*remaining',
             r'remaining[^\d]*(\d{1,2}:\d{2}:\d{2})',
             r'(\d{1,2}:\d{2}:\d{2})',
+            r'(\d{1,2}:\d{2})\s*(hour|hr|hours|h)',
+            r'(\d+)\s*(hour|hr|hours|h)',
         ]:
             m = re.search(pattern, body, re.IGNORECASE)
             if m:
                 sec = parse_remaining_time(m.group(1))
                 if sec is not None:
+                    log(f"通过正则找到剩余时间: {m.group(1)}", "INFO")
                     return m.group(1), sec
-    except:
-        pass
+    except Exception as e:
+        log(f"正则查找剩余时间失败: {e}", "WARN")
 
     return None, 0
 
@@ -327,10 +335,31 @@ def process_account(drv, name: str, url: str, cookie: str) -> bool:
     for round_num in range(1, MAX_ROUNDS + 1):
         log(f"\n--- 第 {round_num}/{MAX_ROUNDS} 轮 ---")
 
+        # 5.0 检查页面状态
+        try:
+            title = drv.title
+            body = drv.execute_script("return document.body ? document.body.innerText : '';")
+            body_lower = body.lower()
+
+            # 检查是否被暂停
+            if "suspended" in title.lower() or "suspended" in body_lower:
+                log(f"⚠️ 检测到账号被暂停: {title}", "ERR")
+                save_screenshot(drv, f"{name}_suspended")
+                return False
+
+            # 检查是否在登录页
+            if "login" in title.lower() or "sign in" in title.lower():
+                log("❌ Cookie 失效，仍在登录页", "ERR")
+                save_screenshot(drv, f"{name}_login_fail")
+                return False
+        except Exception as e:
+            log(f"检查页面状态失败: {e}", "WARN")
+
         # 5.1 获取当前剩余时间
         rem_text, rem_sec = get_remaining_seconds(drv)
         if rem_sec == 0:
             log("无法获取剩余时间，刷新重试", "WARN")
+            save_screenshot(drv, f"{name}_no_remaining_time_r{round_num}")
             drv.refresh()
             time.sleep(5)
             continue
