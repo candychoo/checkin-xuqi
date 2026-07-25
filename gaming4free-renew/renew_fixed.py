@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Gaming4Free Pro 服务器自动续期 - SeleniumBase UC 模式
+Gaming4Free Pro 服务器自动续期 - SeleniumBase UC 模式（修复版）
 兼容 Turnstile/Cloudflare 验证，支持代理，多账号轮询
 
 修复记录:
-- v32: 增加会话上限检测 (48h cap)，剩余>6h 跳过续期；连续失败自动停止；按钮未找到时刷新重试
+- v33: 修复时间检测问题（验证弹窗导致时间倒退）；增加验证弹窗等待逻辑；增加重试次数
 """
 import os
 import sys
@@ -35,6 +35,8 @@ PAGE_LOAD_TIMEOUT = 120
 IMPLICIT_WAIT = 10
 CLICK_DELAY = 1.5              # 点击后等待
 BUTTON_RETRY_REFRESH = True    # 按钮未找到时是否刷新重试一次
+VERIFY_WAIT = 30               # 验证弹窗等待时间（秒）
+VERIFY_RETRY = 3               # 验证弹窗等待重试次数
 
 # 调试截图目录
 DEBUG_DIR = "debug_output"
@@ -151,6 +153,28 @@ def check_session_cap(drv) -> bool:
         cap_patterns = ['48h cap', 'cap 48h', '48h limit', 'maximum 48', 'max 48h', 'session cap']
         for pat in cap_patterns:
             if pat in body_lower:
+                return True
+    except:
+        pass
+    return False
+
+def is_verify_human_state(drv) -> bool:
+    """检测是否出现 'Verify you're human' 验证弹窗"""
+    try:
+        body = drv.execute_script("return document.body ? document.body.innerText : '';")
+        body_lower = body.lower()
+        # 常见验证弹窗文本
+        verify_patterns = [
+            'verify you are human',
+            'verify you\'re human',
+            'check you are human',
+            'i am not a robot',
+            'human verification',
+            'please wait',
+        ]
+        for pat in verify_patterns:
+            if pat in body_lower:
+                log(f"检测到验证弹窗: '{pat}'", "WARN")
                 return True
     except:
         pass
@@ -286,6 +310,40 @@ def handle_confirm_dialog(drv) -> bool:
         pass
     return False
 
+# ========== 核心：等待验证弹窗消失 ==========
+def wait_for_verify_dialog(drv, max_wait: int = VERIFY_WAIT, retry: int = VERIFY_RETRY) -> bool:
+    """等待验证弹窗消失（Google reCAPTCHA / Cloudflare Turnstile 等）"""
+    start = time.time()
+    attempt = 0
+
+    while attempt < retry:
+        attempt += 1
+        time_left = max(0, max_wait - int(time.time() - start))
+
+        if is_verify_human_state(drv):
+            log(f"验证弹窗仍存在，等待中... ({attempt}/{retry}, 剩余 {time_left}s)", "WAIT")
+
+            # 如果等待时间足够长，尝试刷新页面（重新触发验证）
+            if attempt >= 2 and time_left > 15:
+                log("等待超时，尝试刷新页面...", "WARN")
+                try:
+                    drv.refresh()
+                    time.sleep(5)
+                except:
+                    pass
+
+            if time_left > 0:
+                time.sleep(3)
+            else:
+                log("验证弹窗等待超时", "ERR")
+                return False
+        else:
+            log(f"验证弹窗已消失", "OK")
+            return True
+
+    log(f"验证弹窗等待失败（尝试 {retry} 次）", "ERR")
+    return False
+
 # ========== 核心：等待冷却恢复 ==========
 def wait_for_cooldown(drv, max_wait: int = 1500) -> bool:
     """等待按钮变回 Watch Ad 状态（默认 25 分钟）"""
@@ -370,6 +428,13 @@ def process_account(drv, name: str, url: str, cookie: str) -> bool:
                 log("❌ Cookie 失效，仍在登录页", "ERR")
                 save_screenshot(drv, f"{name}_login_fail")
                 return False
+
+            # 检查验证弹窗
+            if is_verify_human_state(drv):
+                log("⚠️ 检测到验证弹窗，等待消失...", "WAIT")
+                if not wait_for_verify_dialog(drv):
+                    log("验证弹窗等待失败，跳过本轮", "WARN")
+                    continue
         except Exception as e:
             log(f"检查页面状态失败: {e}", "WARN")
 
@@ -448,12 +513,30 @@ def process_account(drv, name: str, url: str, cookie: str) -> bool:
         time.sleep(CLICK_DELAY)
         handle_confirm_dialog(drv)
 
-        # 5.6 等待续期生效（最多 30s）
+        # 5.6 等待验证弹窗消失（新增）
+        log("等待验证弹窗消失...", "WAIT")
+        if not wait_for_verify_dialog(drv):
+            log("验证弹窗等待失败，跳过本轮", "WARN")
+            time.sleep(10)
+            try:
+                drv.refresh()
+                time.sleep(3)
+            except:
+                pass
+            continue
+
+        # 5.7 等待续期生效（增加等待时间）
         log("等待续期生效...", "WAIT")
         success = False
-        wait_end = time.time() + 30
+        wait_end = time.time() + 60  # 增加到 60 秒
         while time.time() < wait_end:
             time.sleep(3)
+
+            # 检查验证弹窗是否再次出现
+            if is_verify_human_state(drv):
+                log("验证弹窗再次出现，继续等待...", "WAIT")
+                continue
+
             _, cur_sec = get_remaining_seconds(drv)
             if cur_sec > pre_sec + 300:  # 至少增加 5 分钟
                 diff = cur_sec - pre_sec
@@ -461,7 +544,7 @@ def process_account(drv, name: str, url: str, cookie: str) -> bool:
                 success = True
                 break
 
-        # 5.7 最终验证
+        # 5.8 最终验证
         final_text, final_sec = get_remaining_seconds(drv)
         diff = final_sec - pre_sec
         log(f"本轮结果: {final_text} ({final_sec}s), 增量: {diff}s")
@@ -469,21 +552,10 @@ def process_account(drv, name: str, url: str, cookie: str) -> bool:
         if diff > 300:
             log(f"🎉 续期成功! +{diff//60} 分钟", "OK")
             zero_diff_count = 0  # 重置连续失败计数
-
-            # 发送成功通知
             try:
-                tg_result = send_tg(
-                    f"🎉 续期成功",
-                    f"[{name}] {final_text}",
-                    f"+{diff//60} 分钟"
-                )
-                if tg_result:
-                    log("✅ TG 通知发送成功", "OK")
-                else:
-                    log("⚠️  TG 通知发送失败", "WARN")
-            except Exception as e:
-                log(f"⚠️  TG 通知异常: {e}", "WARN")
-
+                send_tg(f"🎉 [{name}] Pro 续期成功 (+{diff//60}分钟)", name, final_text)
+            except:
+                pass
             # 成功后等待 30s 再下一轮
             time.sleep(30)
             try:
@@ -496,21 +568,6 @@ def process_account(drv, name: str, url: str, cookie: str) -> bool:
             log(f"续期失败，增量不足: {diff}s", "ERR")
             zero_diff_count += 1
             save_screenshot(drv, f"{name}_fail_r{round_num}")
-
-            # 发送失败通知
-            try:
-                tg_result = send_tg(
-                    f"❌ 续期失败",
-                    f"[{name}] {rem_text}",
-                    f"增量: {diff}s"
-                )
-                if tg_result:
-                    log("✅ TG 通知发送成功", "OK")
-                else:
-                    log("⚠️  TG 通知发送失败", "WARN")
-            except Exception as e:
-                log(f"⚠️  TG 通知异常: {e}", "WARN")
-
             time.sleep(10)
             try:
                 drv.refresh()
@@ -527,7 +584,7 @@ def build_driver() -> Driver:
     """创建 SeleniumBase UC Driver"""
     proxy = get_proxy_url()
     log(f"代理: {proxy or '直连'}")
-    
+
     drv = Driver(
         uc=True,                    # Undetected-Chromedriver 模式（绕过 CF/Turnstile）
         headless=HEADLESS,
@@ -546,24 +603,7 @@ def build_driver() -> Driver:
     return drv
 
 def main():
-    log("========== Gaming4Free Pro 自动续期启动 (SeleniumBase UC v32) ==========")
-
-    # 检查 TG 配置
-    log("🔍 检查 Telegram 通知配置...")
-    from tg import check_tg_config, send_tg
-    tg_config_ok = check_tg_config()
-
-    # 如果配置了 TG，发送测试通知
-    if tg_config_ok:
-        log("📤 发送 TG 测试通知...", "INFO")
-        try:
-            test_result = send_tg("🧪 TG 通知测试", "Gaming4Free Pro", "配置检查通过")
-            if test_result:
-                log("✅ TG 测试通知发送成功", "OK")
-            else:
-                log("⚠️  TG 测试通知发送失败", "WARN")
-        except Exception as e:
-            log(f"⚠️  TG 测试通知异常: {e}", "WARN")
+    log("========== Gaming4Free Pro 自动续期启动 (SeleniumBase UC v33 - 修复版) ==========")
 
     if not ACCOUNTS:
         log("❌ 未配置任何账号 (GAME4FREE_ACCOUNTS / GAME4FREE_ACCOUNT)", "ERR")
