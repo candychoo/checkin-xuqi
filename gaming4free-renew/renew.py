@@ -374,6 +374,9 @@ def run():
 
     # UC mode 启动
     log.info("正在启动浏览器 (uc=True, headless=True)...")
+    # 设置系统级代理环境变量
+    os.environ["ALL_PROXY"] = PROXY_URL
+    
     with SB(
         browser="chrome",
         uc=False,
@@ -382,8 +385,8 @@ def run():
         agent="Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
               "(KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
         disable_cookies=False,
-        proxy=PROXY_URL,
         ad_block=False,
+        start_args=[f"--proxy-server={PROXY_URL}"],
     ) as sb:
         log.info("✅ 浏览器启动成功")
 
