@@ -635,6 +635,7 @@ def run_single_server(sb, site_url: str, server_num: str, region: str,
     # 点击续期按钮 - 尝试多种选择器 (按真实页面结构优先排序)
     # 真实页面: <BUTTON class='rt-btn-free'> '+ 90 min'
     #          <BUTTON class='rt-btn-paid'> '+24h $0.15'
+    # 注意: 按钮可能存在但不可见 (在折叠区域), 所以用 is_element_present 而非 is_element_visible
     vote_btn_selectors = [
         # 1. 真实 class (最高优先级)
         "button.rt-btn-free",                       # 续期 +90 分钟 (免费)
@@ -657,23 +658,72 @@ def run_single_server(sb, site_url: str, server_num: str, region: str,
     clicked = False
     for sel in vote_btn_selectors:
         try:
-            if sb.is_element_visible(sel, timeout=3):
+            # 关键: 用 is_element_present 而非 is_element_visible
+            # 因为按钮可能存在但不可见 (在折叠区域)
+            if sb.is_element_present(sel):
                 log.info(f"🖱️ 找到续期按钮 [{sel}], 正在点击...")
-                sb.click(sel, timeout=5)
+                # 先滚动到按钮位置
+                try:
+                    sb.scroll_to(sel)
+                    human_wait(0.5, 1.0)
+                except Exception:
+                    pass
+                # 尝试用 sb.click, 失败则用 JS click
+                try:
+                    sb.click(sel, timeout=5)
+                except Exception as click_e:
+                    log.warning(f"sb.click 失败 ({click_e}), 尝试 JS click")
+                    sb.execute_script(
+                        "var el = document.querySelector(arguments[0]); "
+                        "if (el) { el.scrollIntoView({block: 'center'}); el.click(); }",
+                        sel,
+                    )
                 clicked = True
                 break
         except Exception:
             continue
 
     if not clicked:
-        log.warning("所有选择器都未找到续期按钮，尝试 Livewire extend...")
+        # 终极兜底: 用 JS 直接找 class 含 rt-btn-free 的元素并点击
+        try:
+            log.warning("所有选择器都未找到续期按钮, 尝试 JS 直接点击 rt-btn-free...")
+            js_result = sb.execute_script("""
+                try {
+                    var btn = document.querySelector('.rt-btn-free') ||
+                              document.querySelector('button[class*=\"rt-btn-free\"]');
+                    if (btn) {
+                        btn.scrollIntoView({block: 'center', behavior: 'instant'});
+                        btn.click();
+                        return 'clicked: ' + btn.className + ' | ' + (btn.innerText || '').substring(0, 50);
+                    }
+                    // 兜底: 找所有 button, 文字含 '+ 90 min' 或 '90 min'
+                    var btns = document.querySelectorAll('button');
+                    for (var i = 0; i < btns.length; i++) {
+                        var t = (btns[i].innerText || '').trim();
+                        if (t.indexOf('90 min') !== -1 || t.indexOf('+ 90') !== -1) {
+                            btns[i].scrollIntoView({block: 'center', behavior: 'instant'});
+                            btns[i].click();
+                            return 'clicked_text_match: ' + t;
+                        }
+                    }
+                    return 'not_found';
+                } catch(e) { return 'error: ' + e.message; }
+            """)
+            log.info(f"JS 点击结果: {js_result}")
+            if js_result and "clicked" in str(js_result).lower():
+                clicked = True
+        except Exception as e:
+            log.warning(f"JS 直接点击失败: {e}")
+
+    if not clicked:
+        log.warning("所有方法都未找到续期按钮，尝试 Livewire extend...")
         lw_result = livewire_extend(sb)
         if not lw_result["success"]:
             # 关键: 失败时跑页面诊断, 把页面所有按钮信息打到日志
             log.error("❌ 仍未找到续期按钮, 开始页面诊断...")
             screenshot(sb, f"no_btn_{server_num}")
             diagnose_page(sb)
-            raise Exception(f"未找到续期按钮 (已尝试 {len(vote_btn_selectors)} 种选择器, 见上方诊断)")
+            raise Exception(f"未找到续期按钮 (已尝试 {len(vote_btn_selectors)} 种选择器 + JS 兜底, 见上方诊断)")
 
     # 破解 Turnstile
     human_wait(2, 4)
@@ -705,14 +755,59 @@ def run_single_server(sb, site_url: str, server_num: str, region: str,
     submitted = False
     for sel in submit_selectors:
         try:
-            if sb.is_element_visible(sel, timeout=5):
+            # 用 is_element_present 而非 is_element_visible
+            if sb.is_element_present(sel):
                 log.info(f"🖱️ 找到提交按钮 [{sel}], 正在点击...")
-                sb.uc_click(sel)
-                human_wait(8, 12)
+                try:
+                    sb.scroll_to(sel)
+                    human_wait(0.3, 0.8)
+                except Exception:
+                    pass
+                try:
+                    sb.uc_click(sel)
+                    human_wait(8, 12)
+                except Exception as click_e:
+                    log.warning(f"sb.uc_click 失败 ({click_e}), 尝试 JS click")
+                    sb.execute_script(
+                        "var el = document.querySelector(arguments[0]); "
+                        "if (el) { el.scrollIntoView({block: 'center'}); el.click(); }",
+                        sel,
+                    )
+                    human_wait(8, 12)
                 submitted = True
                 break
         except Exception:
             continue
+
+    if not submitted:
+        # 终极兜底: JS 找 Confirm/Submit 按钮并点击
+        try:
+            log.warning("未找到提交按钮, 尝试 JS 直接点击 Confirm/Submit...")
+            js_result = sb.execute_script("""
+                try {
+                    var btns = document.querySelectorAll('button, a, [role=button]');
+                    var keywords = ['confirm', 'submit', 'yes', 'ok', 'vote + add', 'add 90 minutes'];
+                    for (var i = 0; i < btns.length; i++) {
+                        var t = (btns[i].innerText || '').trim().toLowerCase();
+                        if (t.length > 0 && t.length < 40) {
+                            for (var k = 0; k < keywords.length; k++) {
+                                if (t.indexOf(keywords[k]) !== -1 && !btns[i].disabled) {
+                                    btns[i].scrollIntoView({block: 'center', behavior: 'instant'});
+                                    btns[i].click();
+                                    return 'clicked: ' + (btns[i].innerText || '').trim();
+                                }
+                            }
+                        }
+                    }
+                    return 'not_found';
+                } catch(e) { return 'error: ' + e.message; }
+            """)
+            log.info(f"JS 提交点击结果: {js_result}")
+            if js_result and "clicked" in str(js_result).lower():
+                submitted = True
+                human_wait(8, 12)
+        except Exception as e:
+            log.warning(f"JS 提交点击失败: {e}")
 
     if not submitted:
         log.warning("未找到提交按钮, 尝试 Livewire extend...")
