@@ -725,93 +725,125 @@ def run_single_server(sb, site_url: str, server_num: str, region: str,
             diagnose_page(sb)
             raise Exception(f"未找到续期按钮 (已尝试 {len(vote_btn_selectors)} 种选择器 + JS 兜底, 见上方诊断)")
 
-    # 破解 Turnstile
+    # 破解 Turnstile (点击 +90 min 前可能有)
     human_wait(2, 4)
     bypass_turnstile(sb)
 
-    # 点击最终提交按钮 - 尝试多种选择器
-    # 点击 + 90 min 后可能弹出确认对话框, 含 "Confirm" / "Submit" 按钮
-    submit_selectors = [
-        # 1. 真实页面可能的 class (基于 Filament 框架)
-        "button.fi-btn-action",
-        "button.fi-ac-btn-action",
-        ".fi-modal-confirm-btn",
-        # 2. 旧版 ID
-        "#vm-submit",
-        'button[id="vm-submit"]',
-        # 3. 文字匹配
-        'button:contains("Confirm")',
-        'button:contains("Submit")',
-        'button:contains("VOTE + ADD")',
-        'button:contains("ADD 90 MINUTES")',
-        'button:contains("Yes")',
-        'button:contains("OK")',
-        # 4. 通用 submit
-        'button[type="submit"]',
-        # 5. XPath
-        '//button[contains(., "Confirm")]',
-        '//button[contains(., "Submit")]',
-    ]
-    submitted = False
-    for sel in submit_selectors:
-        try:
-            # 用 is_element_present 而非 is_element_visible
-            if sb.is_element_present(sel):
-                log.info(f"🖱️ 找到提交按钮 [{sel}], 正在点击...")
-                try:
-                    sb.scroll_to(sel)
-                    human_wait(0.3, 0.8)
-                except Exception:
-                    pass
-                try:
-                    sb.uc_click(sel)
-                    human_wait(8, 12)
-                except Exception as click_e:
-                    log.warning(f"sb.uc_click 失败 ({click_e}), 尝试 JS click")
-                    sb.execute_script(
-                        "var el = document.querySelector(arguments[0]); "
-                        "if (el) { el.scrollIntoView({block: 'center'}); el.click(); }",
-                        sel,
-                    )
-                    human_wait(8, 12)
-                submitted = True
-                break
-        except Exception:
-            continue
+    # 等待可能的 modal 出现 (点击 +90 min 后可能弹出确认对话框)
+    log.info("⏳ 等待可能的确认对话框出现...")
+    human_wait(3, 5)
 
-    if not submitted:
-        # 终极兜底: JS 找 Confirm/Submit 按钮并点击
+    # 再次检测 Turnstile (modal 内可能有)
+    bypass_turnstile(sb)
+
+    # 检测是否有 modal 出现
+    # 线索: 'Cancel' 按钮存在 / modal class 存在 / body 有 modal-open
+    modal_detected = False
+    try:
+        modal_check = sb.execute_script("""
+            try {
+                // 1. 检查是否有 Cancel 按钮 (说明有对话框)
+                var cancelBtn = null;
+                var btns = document.querySelectorAll('button, a, [role=button]');
+                for (var i = 0; i < btns.length; i++) {
+                    var t = (btns[i].innerText || '').trim().toLowerCase();
+                    if (t === 'cancel' || t === '取消') { cancelBtn = btns[i]; break; }
+                }
+                // 2. 检查 modal/dialog class
+                var modalEl = document.querySelector(
+                    '.fi-modal, .modal, [role=dialog], [class*=\"modal\"], [class*=\"dialog\"], [class*=\"overlay\"]'
+                );
+                // 3. 检查 body class
+                var bodyModal = document.body.classList.contains('modal-open') ||
+                                document.body.style.overflow === 'hidden';
+                return JSON.stringify({
+                    hasCancel: !!cancelBtn,
+                    hasModal: !!modalEl,
+                    bodyModal: bodyModal,
+                    modalClass: modalEl ? (modalEl.className || '').substring(0, 100) : '',
+                });
+            } catch(e) { return JSON.stringify({error: e.message}); }
+        """)
+        import json as _json
+        info = _json.loads(modal_check) if modal_check else {}
+        log.info(f"🔍 Modal 检测: {info}")
+        modal_detected = info.get("hasCancel") or info.get("hasModal") or info.get("bodyModal")
+    except Exception as e:
+        log.warning(f"Modal 检测失败: {e}")
+
+    if modal_detected:
+        log.info("🪟 检测到确认对话框, 在对话框内找提交按钮...")
+
+        # 在 modal 内找 confirm 按钮 (排除 Cancel/Restart/Kill/Start 等已知按钮)
+        # 优先用 JS 精准定位
         try:
-            log.warning("未找到提交按钮, 尝试 JS 直接点击 Confirm/Submit...")
             js_result = sb.execute_script("""
                 try {
-                    var btns = document.querySelectorAll('button, a, [role=button]');
-                    var keywords = ['confirm', 'submit', 'yes', 'ok', 'vote + add', 'add 90 minutes'];
-                    for (var i = 0; i < btns.length; i++) {
-                        var t = (btns[i].innerText || '').trim().toLowerCase();
-                        if (t.length > 0 && t.length < 40) {
-                            for (var k = 0; k < keywords.length; k++) {
-                                if (t.indexOf(keywords[k]) !== -1 && !btns[i].disabled) {
-                                    btns[i].scrollIntoView({block: 'center', behavior: 'instant'});
-                                    btns[i].click();
-                                    return 'clicked: ' + (btns[i].innerText || '').trim();
-                                }
+                    // 已知要排除的按钮文字 (这些不是提交按钮)
+                    var exclude = ['cancel', '取消', 'restart', 'kill', 'delete', 'start', 'stop', 'close', 'x', ''];
+                    // 优先关键词 (按顺序匹配)
+                    var preferKeywords = ['confirm', 'vote', 'add 90', 'add 90 min', 'extend', 'renew', 'submit', 'yes', 'ok', 'continue', 'proceed', 'go'];
+
+                    // 找所有可见的 button / a / [role=button]
+                    var candidates = [];
+                    var els = document.querySelectorAll('button, a, [role=button], input[type=submit], input[type=button]');
+                    for (var i = 0; i < els.length; i++) {
+                        var el = els[i];
+                        if (el.disabled) continue;
+                        var t = (el.innerText || el.textContent || el.value || '').trim();
+                        var tl = t.toLowerCase();
+                        if (t.length === 0 || t.length > 40) continue;
+                        // 排除已知按钮
+                        var isExcluded = false;
+                        for (var j = 0; j < exclude.length; j++) {
+                            if (tl === exclude[j]) { isExcluded = true; break; }
+                        }
+                        if (isExcluded) continue;
+                        candidates.push({el: el, text: t, tl: tl});
+                    }
+
+                    // 优先匹配关键词
+                    for (var k = 0; k < preferKeywords.length; k++) {
+                        for (var c = 0; c < candidates.length; c++) {
+                            if (candidates[c].tl.indexOf(preferKeywords[k]) !== -1) {
+                                var target = candidates[c].el;
+                                target.scrollIntoView({block: 'center', behavior: 'instant'});
+                                target.click();
+                                return 'clicked_prefer: ' + preferKeywords[k] + ' | ' + candidates[c].text;
                             }
                         }
                     }
-                    return 'not_found';
+
+                    // 如果没有匹配关键词, 找 class 含 primary/action/submit/confirm 的
+                    var classKeywords = ['primary', 'action', 'submit', 'confirm', 'success'];
+                    for (var ck = 0; ck < classKeywords.length; ck++) {
+                        for (var c2 = 0; c2 < candidates.length; c2++) {
+                            var cls = (candidates[c2].el.className || '').toLowerCase();
+                            if (cls.indexOf(classKeywords[ck]) !== -1) {
+                                var target2 = candidates[c2].el;
+                                target2.scrollIntoView({block: 'center', behavior: 'instant'});
+                                target2.click();
+                                return 'clicked_class: ' + classKeywords[ck] + ' | ' + candidates[c2].text;
+                            }
+                        }
+                    }
+
+                    return 'not_found_in_modal (candidates=' + candidates.length + ')';
                 } catch(e) { return 'error: ' + e.message; }
             """)
             log.info(f"JS 提交点击结果: {js_result}")
             if js_result and "clicked" in str(js_result).lower():
-                submitted = True
                 human_wait(8, 12)
+            else:
+                log.warning("对话框内未找到提交按钮, 可能 +90 min 已直接生效")
         except Exception as e:
             log.warning(f"JS 提交点击失败: {e}")
-
-    if not submitted:
-        log.warning("未找到提交按钮, 尝试 Livewire extend...")
-        livewire_extend(sb)
+            # 兜底: Livewire
+            livewire_extend(sb)
+            human_wait(5, 8)
+    else:
+        log.info("✅ 未检测到确认对话框, 假设 +90 min 已直接生效")
+        # 多等一会, 让续期请求完成
         human_wait(5, 8)
 
     time.sleep(5)
