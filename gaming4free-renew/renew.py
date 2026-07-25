@@ -358,7 +358,7 @@ def run():
 
     log.info("=" * 60)
     log.info("gaming4free 续期启动")
-    log.info(f"代理地址: {PROXY_URL}")
+    log.info(f"代理地址: {PROXY_URL or '(未配置)'}")
     log.info(f"目标站点: {SITE_URL}")
     log.info(f"MC 用户:  {USERNAME or '(未配置)'}")
     log.info("=" * 60)
@@ -375,8 +375,13 @@ def run():
         tg(f"❌ gaming4free 续期失败：代理端口 {proxy_port} 未就绪")
         sys.exit(1)
 
-    # 启动浏览器，通过 proxy= 参数设置 SOCKS5 代理
-    log.info("正在启动浏览器 (uc=False, headless=True)...")
+    # 启动浏览器，通过 chrome_options 设置代理（绕过 SeleniumBase proxy= 验证）
+    from selenium.webdriver.chrome.options import Options as ChromeOptions
+    _proxy = PROXY_URL or "socks5://127.0.0.1:1080"
+    chrome_opts = ChromeOptions()
+    chrome_opts.add_argument(f"--proxy-server={_proxy}")
+    
+    log.info(f"正在启动浏览器 (uc=False, headless=True, proxy={_proxy})...")
     with SB(
         browser="chrome",
         uc=False,
@@ -384,7 +389,7 @@ def run():
         incognito=False,
         disable_cookies=False,
         ad_block=False,
-        proxy=PROXY_URL,
+        chrome_options=chrome_opts,
     ) as sb:
         log.info("✅ 浏览器启动成功")
 
