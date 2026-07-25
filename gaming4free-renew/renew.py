@@ -30,17 +30,8 @@ USERNAME       = os.getenv("MC_USERNAME", "")
 PASSWORD       = os.getenv("MC_PASSWORD", "")
 COOKIE_STR     = os.getenv("GF_COOKIE", "")
 
-# 代理地址：sing-box 默认监听 127.0.0.1:1080
-# SeleniumBase 的 proxy= 参数需要 http/https 格式，SOCKS5 会导致连接被拒绝
-_raw_proxy = os.getenv("PROXY_URL", "").strip()
-if "?" in _raw_proxy or "://" not in _raw_proxy:
-    PROXY_URL = "http://127.0.0.1:1080"
-else:
-    # 如果传入的是 http://... 就保留，否则用 http
-    if _raw_proxy.startswith("http"):
-        PROXY_URL = _raw_proxy
-    else:
-        PROXY_URL = "http://127.0.0.1:1080"
+# 代理地址：暂时禁用，排查是否代理问题
+PROXY_URL = None
 
 MAX_HOURS      = 48            # 续期上限 48 小时
 ADD_MINUTES    = 90            # 每次点击 +90 分钟
@@ -372,18 +363,13 @@ def run():
         tg(f"❌ gaming4free 续期失败：代理端口 {proxy_port} 未就绪")
         sys.exit(1)
 
-    # 启动浏览器，通过 ChromeOptions 设置代理
-    from selenium.webdriver.chrome.options import Options as ChromeOptions
-    chrome_opts = ChromeOptions()
-    chrome_opts.add_argument(f"--proxy-server={PROXY_URL}")
-    
+    # 启动浏览器
     log.info("正在启动浏览器 (uc=False, headless=True)...")
     with SB(
         browser="chrome",
         uc=False,
         headless=True,
         incognito=False,
-        options=chrome_opts,
         disable_cookies=False,
         ad_block=False,
     ) as sb:
