@@ -381,49 +381,155 @@ def get_remaining_seconds(sb) -> int:
 # 单服务器续期
 # ---------------------------------------------------------------------------
 def diagnose_page(sb):
-    """诊断当前页面, 打印所有按钮和 Livewire 组件信息"""
-    from util import _LW_DIAGNOSE_JS
-    try:
-        result = sb.execute_script(_LW_DIAGNOSE_JS)
-        log.info("🔍 页面诊断:")
-        try:
-            import json as _json
-            info = _json.loads(result)
-            log.info(f"   Livewire v3: {info.get('livewire_v3')}")
-            log.info(f"   Livewire v2: {info.get('livewire_v2')}")
-            log.info(f"   wire 元素数: {info.get('wire_elements')}")
-            for w in (info.get('wire_ids') or [])[:5]:
-                log.info(f"     - id={w.get('id')} tag={w.get('tag')} class={w.get('class')[:50]} wire:click={w.get('wireClick')}")
-            btns = info.get('renew_buttons') or []
-            log.info(f"   含 '90 min' 的按钮: {len(btns)} 个")
-            for b in btns[:5]:
-                log.info(f"     - tag={b.get('tag')} text={b.get('text')!r} disabled={b.get('disabled')} class={b.get('class')[:50]}")
-                log.info(f"       wire:click={b.get('wireClick')}")
-                log.info(f"       html={b.get('html')[:150]}")
-        except Exception as e:
-            log.info(f"   (原始输出) {result[:500]}")
+    """诊断当前页面, 打印所有按钮和 Livewire 组件信息 (健壮版)"""
+    def _safe_str(v, n=80):
+        """安全转字符串并截断, 处理 None"""
+        if v is None:
+            return "(none)"
+        s = str(v)
+        return s[:n] if len(s) > n else s
 
-        # 额外: 打印所有 button/a 的文本和 id/class (前 20 个)
-        all_btns_info = sb.execute_script("""
-            var result = [];
-            var els = document.querySelectorAll('button, a, [role=button], input[type=submit]');
-            for (var i = 0; i < els.length && i < 30; i++) {
-                var el = els[i];
-                var t = (el.innerText || el.textContent || el.value || '').trim().substring(0, 50);
-                if (t) result.push({tag: el.tagName, id: el.id, class: (el.className||'').substring(0,60), text: t});
-            }
-            return JSON.stringify(result);
-        """)
+    def _safe_get(d, key, default=""):
+        """安全取 dict 字段"""
         try:
-            import json as _json
-            arr = _json.loads(all_btns_info)
-            log.info(f"   页面所有可见按钮/链接 (前 {len(arr)} 个):")
-            for b in arr:
-                log.info(f"     <{b.get('tag')} id={b.get('id')!r} class={b.get('class')!r}> {b.get('text')!r}")
+            v = d.get(key, default) if isinstance(d, dict) else default
+            return v if v is not None else default
         except Exception:
-            pass
+            return default
+
+    log.info("🔍 页面诊断开始:")
+    log.info(f"   当前 URL: {_safe_str(sb.get_current_url())}")
+    log.info(f"   页面标题: {_safe_str(sb.get_title())}")
+
+    # 1. 打印 body 文本前 800 字符 (看页面到底显示什么)
+    try:
+        body_text = sb.get_text("body")
+        log.info(f"   页面 body 文本 (前 800 字符):")
+        for i in range(0, min(len(body_text), 800), 200):
+            log.info(f"     | {body_text[i:i+200]}")
     except Exception as e:
-        log.warning(f"页面诊断失败: {e}")
+        log.warning(f"   获取 body 文本失败: {e}")
+
+    # 2. Livewire 诊断
+    try:
+        from util import _LW_DIAGNOSE_JS
+        result = sb.execute_script(_LW_DIAGNOSE_JS)
+        if result:
+            try:
+                import json as _json
+                info = _json.loads(result)
+                log.info(f"   [Livewire] v3={_safe_get(info, 'livewire_v3')} v2={_safe_get(info, 'livewire_v2')}")
+                log.info(f"   [Livewire] wire 元素数: {_safe_get(info, 'wire_elements')}")
+                wire_ids = info.get('wire_ids') if isinstance(info, dict) else None
+                if wire_ids:
+                    for w in wire_ids[:5]:
+                        if isinstance(w, dict):
+                            log.info(f"     - id={_safe_get(w, 'id')} tag={_safe_get(w, 'tag')} "
+                                      f"class={_safe_str(_safe_get(w, 'class'), 50)} "
+                                      f"wire:click={_safe_get(w, 'wireClick')}")
+                btns = info.get('renew_buttons') if isinstance(info, dict) else None
+                log.info(f"   [Livewire] 含 '90 min' 的按钮: {len(btns) if btns else 0} 个")
+                if btns:
+                    for b in btns[:5]:
+                        if isinstance(b, dict):
+                            log.info(f"     - tag={_safe_get(b, 'tag')} text={_safe_get(b, 'text')!r} "
+                                      f"disabled={_safe_get(b, 'disabled')} "
+                                      f"class={_safe_str(_safe_get(b, 'class'), 50)}")
+                            log.info(f"       wire:click={_safe_get(b, 'wireClick')}")
+                            log.info(f"       html={_safe_str(_safe_get(b, 'html'), 180)}")
+            except Exception as e:
+                log.info(f"   [Livewire] 原始输出: {_safe_str(result, 500)}")
+    except Exception as e:
+        log.warning(f"   Livewire 诊断失败: {e}")
+
+    # 3. 列出页面所有按钮/链接 (含 id/class/text)
+    try:
+        all_btns_info = sb.execute_script("""
+            try {
+                var result = [];
+                var els = document.querySelectorAll('button, a, [role=button], input[type=submit], input[type=button]');
+                for (var i = 0; i < els.length && i < 40; i++) {
+                    var el = els[i];
+                    var t = (el.innerText || el.textContent || el.value || '').trim().substring(0, 80);
+                    var cls = el.className || '';
+                    if (typeof cls !== 'string') cls = '';
+                    result.push({tag: el.tagName, id: el.id || '', class: cls.substring(0,80), text: t, disabled: el.disabled || false});
+                }
+                return JSON.stringify(result);
+            } catch(e) { return JSON.stringify({error: e.message}); }
+        """)
+        if all_btns_info:
+            try:
+                import json as _json
+                arr = _json.loads(all_btns_info)
+                if isinstance(arr, list):
+                    log.info(f"   页面所有可见按钮/链接 (前 {len(arr)} 个):")
+                    for b in arr:
+                        if isinstance(b, dict):
+                            dis = " [disabled]" if b.get('disabled') else ""
+                            log.info(f"     <{b.get('tag')} id={b.get('id')!r} class={b.get('class')!r}>{dis} {b.get('text')!r}")
+                else:
+                    log.info(f"   按钮诊断返回: {arr}")
+            except Exception as e:
+                log.info(f"   按钮诊断原始输出: {_safe_str(all_btns_info, 500)}")
+    except Exception as e:
+        log.warning(f"   按钮诊断失败: {e}")
+
+    # 4. 查找可能的续期相关元素 (更宽松的搜索)
+    try:
+        renew_hints = sb.execute_script("""
+            try {
+                var result = {forms: [], voteBtns: [], renewLinks: [], iframes: []};
+                // 所有 form
+                var forms = document.querySelectorAll('form');
+                for (var i = 0; i < forms.length; i++) {
+                    result.forms.push({action: forms[i].action || '', method: forms[i].method || '', id: forms[i].id || ''});
+                }
+                // 所有含 vote/renew/extend 文字的元素
+                var all = document.querySelectorAll('*');
+                for (var j = 0; j < all.length; j++) {
+                    var el = all[j];
+                    var t = (el.innerText || el.textContent || '').trim();
+                    if (t.length > 0 && t.length < 50) {
+                        var tl = t.toLowerCase();
+                        if (tl.indexOf('vote') !== -1 || tl.indexOf('renew') !== -1 || tl.indexOf('extend') !== -1 || tl.indexOf('+90') !== -1 || tl.indexOf('add 90') !== -1) {
+                            if (el.children.length === 0 || el.tagName === 'BUTTON' || el.tagName === 'A') {
+                                result.voteBtns.push({tag: el.tagName, id: el.id || '', class: (el.className||'').toString().substring(0,80), text: t});
+                            }
+                        }
+                    }
+                }
+                // 所有 iframe (Turnstile)
+                var iframes = document.querySelectorAll('iframe');
+                for (var k = 0; k < iframes.length; k++) {
+                    result.iframes.push({src: (iframes[k].src || '').substring(0, 200), width: iframes[k].width || '', id: iframes[k].id || ''});
+                }
+                return JSON.stringify(result);
+            } catch(e) { return JSON.stringify({error: e.message}); }
+        """)
+        if renew_hints:
+            try:
+                import json as _json
+                info = _json.loads(renew_hints)
+                if isinstance(info, dict):
+                    forms = info.get('forms', [])
+                    log.info(f"   [表单] 共 {len(forms)} 个 form:")
+                    for f in forms[:5]:
+                        log.info(f"     - action={f.get('action')} method={f.get('method')} id={f.get('id')}")
+                    voteBtns = info.get('voteBtns', [])
+                    log.info(f"   [续期线索] 含 vote/renew/extend/+90 文字的元素: {len(voteBtns)} 个")
+                    for v in voteBtns[:10]:
+                        log.info(f"     - <{v.get('tag')} id={v.get('id')!r} class={v.get('class')!r}> {v.get('text')!r}")
+                    iframes = info.get('iframes', [])
+                    log.info(f"   [iframe] 共 {len(iframes)} 个 iframe:")
+                    for ifr in iframes[:5]:
+                        log.info(f"     - id={ifr.get('id')!r} width={ifr.get('width')!r} src={ifr.get('src')!r}")
+            except Exception as e:
+                log.info(f"   续期线索原始输出: {_safe_str(renew_hints, 500)}")
+    except Exception as e:
+        log.warning(f"   续期线索诊断失败: {e}")
+
+    log.info("🔍 页面诊断结束")
 
 
 def run_single_server(sb, site_url: str, server_num: str, region: str,
