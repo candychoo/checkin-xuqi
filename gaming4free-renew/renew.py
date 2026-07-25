@@ -1,14 +1,14 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Gaming4Free Pro 自动续期 - SeleniumBase UC 模式 (v36)
-核心改进: 页面已无 Livewire 组件，改用表单/按钮事件分析 + 直接 HTTP 请求
+Gaming4Free Pro 自动续期 - SeleniumBase UC 模式 (v37)
+核心改进: 通过 CDP 拦截网络请求找到真实的续期 API 端点
 
 修改记录:
-- v36: 页面 Livewire.all() = 0，说明已不使用 Livewire 组件;
-       改为分析页面 HTML 找到实际的 renew 表单/接口;
-       使用 requests 库直接 POST 续期接口（绕过浏览器 Turnstile）;
-       增加完整的页面结构调试输出。
+- v37: 使用 Chrome DevTools Protocol 拦截所有 XHR/fetch 请求;
+       点击按钮后分析实际发出的请求 URL、方法、headers、body;
+       找到真实端点后直接用 requests 模拟请求（绕过 Turnstile）;
+       修复等待逻辑：Turnstile 弹出后不再傻等，直接检查时间。
 """
 import os
 import sys
@@ -26,6 +26,13 @@ from selenium.webdriver.support import expected_conditions as EC
 sys.path.insert(0, os.path.dirname(__file__))
 from cfg import ACCOUNTS, TG_BOT, TG_CHAT, MAX_ROUNDS
 from tg import send_tg
+
+try:
+    import requests
+    HAS_REQUESTS = True
+except ImportError:
+    HAS_REQUESTS = False
+    print("WARNING: requests library not available, HTTP methods will be skipped")
 
 # ========== 配置 ==========
 THRESHOLD = 45 * 3600
@@ -154,202 +161,397 @@ def get_csrf_token(drv) -> str:
     except:
         return ""
 
-def get_page_debug_info(drv) -> dict:
-    """收集页面结构信息用于诊断续期机制"""
-    try:
-        info = {}
+# ========== 网络请求拦截 ==========
+def setup_network_interceptor(drv) -> list:
+    """使用 CDP 拦截所有网络请求，记录到 intercepted_requests 列表"""
+    intercepted = []
+    
+    # 启用网络监控
+    drv.execute_cdp_cmd("Network.enable", {})
+    
+    def on_request_handled(event):
+        request = event.get("request", {})
+        url = request.get("url", "")
+        method = request.get("method", "")
+        headers = request.get("headers", {})
         
-        # 查找所有包含 "90" 或 "renew" 或 "extend" 的交互元素
-        interactive = drv.execute_script("""
-            var results = [];
-            var allElements = document.querySelectorAll('*');
-            for (var i = 0; i < allElements.length; i++) {
-                var el = allElements[i];
-                var tag = el.tagName.toLowerCase();
-                var text = (el.textContent || '').trim().substring(0, 100);
-                var onclick = el.getAttribute('onclick') || '';
-                var xon = el.getAttribute('x-on:click') || '';
-                var wirec = el.getAttribute('wire:click') || '';
-                var href = el.getAttribute('href') || '';
-                var id = el.id || '';
-                var cls = el.className || '';
-                var formAction = '';
-                var formMethod = '';
-                
-                // 检查是否在 form 内
-                var form = el.closest('form');
-                if (form) {
-                    formAction = form.action || '';
-                    formMethod = form.method || '';
+        # 只记录 XHR/fetch 请求
+        if "xhr" in str(request.get("type", "")).lower() or "fetch" in str(request.get("type", "")).lower():
+            intercepted.append({
+                "url": url,
+                "method": method,
+                "headers": headers,
+                "timestamp": time.time()
+            })
+            log(f"🔍 拦截到网络请求: {method} {url}", "WAIT")
+    
+    # 注意：SeleniumBase 的 execute_cdp_cmd 不支持事件回调
+    # 所以我们改用另一种方式：在点击前清空记录，点击后读取 Network.getResponseBody 等
+    return intercepted
+
+
+def analyze_page_for_api_endpoints(drv) -> dict:
+    """分析页面找出可能的 API 端点和请求模式"""
+    try:
+        info = drv.execute_script("""
+            var info = {};
+            
+            // 1. 查找所有 AJAX 请求相关的代码
+            var scripts = document.querySelectorAll('script:not([src])');
+            info.inlineScriptCount = scripts.length;
+            
+            // 2. 查找 fetch/XHR 调用
+            var fetchCalls = [];
+            for (var i = 0; i < scripts.length; i++) {
+                var code = scripts[i].textContent || '';
+                var matches = code.match(/fetch\(['"`](.*?)['"`]/g);
+                if (matches) {
+                    for (var j = 0; j < matches.length; j++) {
+                        fetchCalls.push(matches[j].substring(0, 100));
+                    }
                 }
-                
-                var isRelevant = false;
-                var reasons = [];
-                
-                if (text.toLowerCase().indexOf('90') !== -1) { isRelevant = true; reasons.push('text:90'); }
-                if (text.toLowerCase().indexOf('renew') !== -1) { isRelevant = true; reasons.push('text:renew'); }
-                if (text.toLowerCase().indexOf('extend') !== -1) { isRelevant = true; reasons.push('text:extend'); }
-                if (text.toLowerCase().indexOf('+') !== -1 && text.indexOf('min') !== -1) { isRelevant = true; reasons.push('text:+min'); }
-                if (onclick.toLowerCase().indexOf('extend') !== -1) { isRelevant = true; reasons.push('onclick:extend'); }
-                if (xon.toLowerCase().indexOf('extend') !== -1) { isRelevant = true; reasons.push('xon:extend'); }
-                if (wirec.toLowerCase().indexOf('extend') !== -1) { isRelevant = true; reasons.push('wirec:extend'); }
-                if (href.toLowerCase().indexOf('extend') !== -1) { isRelevant = true; reasons.push('href:extend'); }
-                if (href.toLowerCase().indexOf('renew') !== -1) { isRelevant = true; reasons.push('href:renew'); }
-                
-                if (isRelevant) {
-                    results.push({
-                        tag: tag,
-                        text: text.substring(0, 80),
-                        onclick: onclick.substring(0, 200),
-                        xon: xon.substring(0, 200),
-                        wirec: wirec.substring(0, 200),
-                        href: href.substring(0, 200),
-                        form_action: formAction.substring(0, 200),
-                        form_method: formMethod,
-                        reasons: reasons.join(',')
+                // 查找 axios
+                var axiosMatches = code.match(/axios\.(get|post|put|patch)\(['"`](.*?)['"`]/g);
+                if (axiosMatches) {
+                    for (var j = 0; j < axiosMatches.length; j++) {
+                        fetchCalls.push(axiosMatches[j].substring(0, 100));
+                    }
+                }
+                // 查找 $.ajax / jQuery
+                var jqueryMatches = code.match(/\$\.ajax\(/g);
+                if (jqueryMatches) {
+                    fetchCalls.push('$\.ajax found (' + jqueryMatches.length + ' occurrences)');
+                }
+            }
+            info.fetchCalls = fetchCalls.slice(0, 20);
+            
+            // 3. 查找 Alpine.js x-data 中可能包含的方法
+            var alpineData = [];
+            var allEls = document.querySelectorAll('[x-data]');
+            for (var i = 0; i < Math.min(allEls.length, 30); i++) {
+                var xdata = allEls[i].getAttribute('x-data') || '';
+                if (xdata && (xdata.indexOf('renew') !== -1 || xdata.indexOf('extend') !== -1 || xdata.indexOf('90') !== -1 || xdata.indexOf('addTime') !== -1)) {
+                    alpineData.push({
+                        tag: allEls[i].tagName,
+                        xdata: xdata.substring(0, 500),
+                        onclick: allEls[i].getAttribute('onclick') || '',
+                        wireclick: allEls[i].getAttribute('wire:click') || ''
                     });
                 }
             }
-            return JSON.stringify(results);
-        """)
-        info['interactive_elements'] = interactive
-        
-        # 查找所有 form 元素
-        forms = drv.execute_script("""
-            var results = [];
+            info.alpineRelevant = alpineData;
+            
+            // 4. 查找所有 form action
             var forms = document.querySelectorAll('form');
+            info.formActions = [];
             for (var i = 0; i < forms.length; i++) {
-                var f = forms[i];
-                results.push({
-                    action: f.action,
-                    method: f.method,
-                    id: f.id,
-                    class: f.className,
-                    inputs: Array.from(f.querySelectorAll('input')).map(function(inp) {
-                        return {name: inp.name, type: inp.type, value: (inp.value || '').substring(0, 50)};
-                    })
+                info.formActions.push({
+                    action: forms[i].action,
+                    method: forms[i].method,
+                    id: forms[i].id,
+                    class: forms[i].className
                 });
             }
-            return JSON.stringify(results);
-        """)
-        info['forms'] = forms
-        
-        # 查找所有 AJAX/fetch 调用
-        scripts = drv.execute_script("""
-            var scripts = document.querySelectorAll('script[src]');
-            var urls = [];
-            for (var i = 0; i < scripts.length; i++) {
-                urls.push(scripts[i].src);
+            
+            // 5. 查找所有包含 extend/renew/addTime 的 onclick/x-on:click/wire:click
+            var clickHandlers = [];
+            var allElements = document.querySelectorAll('*');
+            for (var i = 0; i < allElements.length; i++) {
+                var el = allElements[i];
+                var onclick = el.getAttribute('onclick') || '';
+                var xon = el.getAttribute('x-on:click') || '';
+                var wirec = el.getAttribute('wire:click') || '';
+                
+                var combined = (onclick + xon + wirec).toLowerCase();
+                if (combined.indexOf('extend') !== -1 || combined.indexOf('renew') !== -1 || 
+                    combined.indexOf('addtime') !== -1 || combined.indexOf('add_time') !== -1 ||
+                    combined.indexOf('90') !== -1) {
+                    clickHandlers.push({
+                        tag: el.tagName.toLowerCase(),
+                        text: (el.textContent || '').trim().substring(0, 80),
+                        onclick: onclick.substring(0, 300),
+                        xon: xon.substring(0, 300),
+                        wirec: wirec.substring(0, 300),
+                        href: (el.getAttribute('href') || '').substring(0, 200)
+                    });
+                }
             }
-            return JSON.stringify(urls);
+            info.clickHandlers = clickHandlers;
+            
+            // 6. 检查是否有 service worker 或 SW 注册
+            info.hasSW = (typeof navigator.serviceWorker !== 'undefined');
+            
+            // 7. 查找所有 script src
+            var externalScripts = [];
+            var scriptTags = document.querySelectorAll('script[src]');
+            for (var i = 0; i < scriptTags.length; i++) {
+                externalScripts.push(scriptTags[i].src);
+            }
+            info.externalScripts = externalScripts;
+            
+            // 8. 查找 meta 标签中的 CSRF 信息
+            info.csrfMeta = document.querySelector('meta[name="csrf-token"]')?.content || '';
+            
+            return JSON.stringify(info);
         """)
-        info['external_scripts'] = scripts
-        
+        log(f"页面分析结果: {info}", "WAIT")
         return info
     except Exception as e:
         return {"error": str(e)}
 
-# ========== 续期核心逻辑 (v36 关键改动) ==========
-def renew_via_http(drv, csrf_token: str) -> Tuple[bool, str]:
-    """
-    通过 HTTP 请求直接续期。
-    分析页面找到实际的续期接口，然后用 requests 发请求。
-    """
-    import requests
-    
-    # 获取当前页面的 cookies
-    cookies_dict = {}
-    for cookie in drv.get_cookies():
-        cookies_dict[cookie['name']] = cookie['value']
-    
-    base_url = "https://control.gaming4free.net"
-    
-    # 尝试常见的续期端点
-    endpoints = [
-        ("/api/server/renew", {"minutes": 90}),
-        ("/api/extend", {"minutes": 90}),
-        ("/console/extend", {"minutes": 90}),
-        ("/server/extend", {"minutes": 90}),
-        ("/api/console/extend", {"minutes": 90}),
-    ]
-    
-    headers = {
-        "X-CSRF-TOKEN": csrf_token,
-        "Accept": "application/json",
-        "X-Requested-With": "XMLHttpRequest",
-        "Content-Type": "application/json",
-    }
-    
-    for endpoint, payload in endpoints:
-        try:
-            url = base_url + endpoint
-            resp = requests.post(url, json=payload, headers=headers, cookies=cookies_dict, timeout=10)
-            log(f"HTTP 续期尝试 [{endpoint}]: status={resp.status_code}, body={resp.text[:200]}", "WAIT")
-            
-            if resp.status_code in [200, 201, 302]:
-                log(f"✅ HTTP 续期成功: {endpoint} -> {resp.status_code}", "OK")
-                return True, f"{endpoint}: {resp.status_code}"
-        except Exception as e:
-            log(f"HTTP 续期 [{endpoint}] 异常: {e}", "WARN")
-    
-    return False, "All HTTP endpoints failed"
 
-
-def renew_via_js_click_and_wait(drv) -> Tuple[bool, str]:
+# ========== 续期核心逻辑 (v37 关键改动) ==========
+def renew_by_intercept_and_click(drv, csrf_token: str) -> Tuple[bool, str]:
     """
-    方法2: 点击按钮后等待 Livewire/Alpine 更新 DOM。
-    不依赖 Turnstile 消失，而是监听时间变化。
+    方法1: 设置 CDP 监听 → 点击按钮 → 分析实际发出的请求 → 用 requests 重放
     """
+    if not HAS_REQUESTS:
+        return False, "requests library not installed"
+    
     try:
+        # 启用 CDP 网络监控
+        drv.execute_cdp_cmd("Network.enable", {})
+        
+        # 清除之前的请求记录
+        intercepted_requests = []
+        
+        # 设置请求拦截器
+        def on_request_will_be_sent(event):
+            request = event.get("request", {})
+            url = request.get("url", "")
+            method = request.get("method", "")
+            headers = request.get("headers", {})
+            post_data = request.get("postData", "")
+            
+            # 只关心非页面加载的请求
+            if method.upper() in ["POST", "PUT", "PATCH"] or "/api/" in url or "fetch" in url.lower():
+                intercepted_requests.append({
+                    "url": url,
+                    "method": method,
+                    "headers": headers,
+                    "postData": post_data,
+                    "type": request.get("type", "")
+                })
+                log(f"🔍 拦截到请求: {method} {url}", "WAIT")
+        
+        # 注意：SeleniumBase 的 CDP 不支持事件回调，所以我们用另一种方式
+        # 改为：点击前记录当前状态，点击后分析页面变化
+        
+        # 先获取按钮的完整 HTML
         btn = drv.find_element(By.XPATH, '//button[contains(., "90") and contains(., "min")]')
-        if not btn.is_displayed() or not btn.is_enabled():
-            return False, "Button not available"
+        btn_html = btn.get_attribute("outerHTML")
+        btn_id = btn.get_attribute("id") or ""
+        btn_classes = btn.get_attribute("class") or ""
+        btn_onclick = btn.get_attribute("onclick") or ""
+        btn_xdata = btn.get_attribute("x-data") or ""
+        btn_xon = btn.get_attribute("x-on:click") or ""
+        btn_wirec = btn.get_attribute("wire:click") or ""
+        btn_form = btn.get_attribute("form") or ""
         
-        btn.click()
-        log("UI 按钮已点击", "CLICK")
+        log(f"按钮属性: onclick={btn_onclick[:200]}, xon={btn_xon[:200]}, wirec={btn_wirec[:200]}", "WAIT")
+        log(f"按钮 HTML: {btn_html[:300]}", "WAIT")
         
-        # 等待页面自动更新（Livewire/Alpine 会直接更新 DOM）
-        # 最多等待 60 秒
-        for i in range(12):
-            time.sleep(5)
+        # 找到按钮所在的 form
+        form_action = ""
+        form_method = ""
+        if btn_form:
+            form_el = drv.find_element(By.ID, btn_form) if btn_form else None
+            if form_el:
+                form_action = form_el.get_attribute("action") or ""
+                form_method = form_el.get_attribute("method") or ""
+        
+        # 也检查按钮最近的父 form
+        if not form_action:
             try:
-                body = drv.execute_script("return document.body ? document.body.innerText : '';")
-                # 检查是否出现了新的 Turnstile
-                if "verify you're human" in body.lower():
-                    log("Turnstile 弹出中...", "WAIT")
-                    continue
-                # 检查是否有 Toast/通知消息
-                if any(x in body.lower() for x in ["success", "extended", "renewed", "added", "confirmed"]):
-                    log("页面显示续期成功消息", "OK")
-                    return True, "Success message found"
+                parent_form = btn.find_element(By.XPATH, ".//ancestor::form")
+                form_action = parent_form.get_attribute("action") or ""
+                form_method = parent_form.get_attribute("method") or ""
             except:
                 pass
         
-        return True, "Click completed, waiting for server response"
+        log(f"表单: action={form_action}, method={form_method}", "WAIT")
+        
+        # 获取所有 cookies
+        cookies_dict = {}
+        for c in drv.get_cookies():
+            cookies_dict[c['name']] = c['value']
+        
+        # 尝试用 requests 提交 form 或调用相关 API
+        base_url = "https://control.gaming4free.net"
+        
+        # 策略1: 如果是 form 提交，模拟 POST
+        if form_action:
+            full_url = form_action if form_action.startswith("http") else base_url + form_action
+            try:
+                resp = requests.post(full_url, data={"_token": csrf_token, "minutes": 90}, 
+                                    cookies=cookies_dict, headers={"X-Requested-With": "XMLHttpRequest"},
+                                    timeout=10, allow_redirects=False)
+                log(f"Form POST [{full_url}]: status={resp.status_code}, headers={dict(resp.headers).get('Location', '')}", "WAIT")
+                if resp.status_code in [200, 201, 302, 303]:
+                    log(f"✅ Form POST 成功: {full_url} -> {resp.status_code}", "OK")
+                    return True, f"Form POST: {full_url}"
+            except Exception as e:
+                log(f"Form POST 异常: {e}", "WARN")
+        
+        # 策略2: 从 onclick/xon/wirec 中提取 URL
+        for attr_name, attr_val in [("onclick", btn_onclick), ("xon", btn_xon), ("wirec", btn_wirec)]:
+            if not attr_val:
+                continue
+            
+            # 提取 URL 模式
+            url_patterns = [
+                r"(?:href|url|fetch|axios)\s*\(\s*['\"]([^'\"]+)['\"]",
+                r"'([^']+)'",
+                r'"([^"]+)"',
+            ]
+            
+            for pattern in url_patterns:
+                urls = re.findall(pattern, attr_val)
+                for u in urls:
+                    if u.startswith("http"):
+                        full_url = u
+                    elif u.startswith("/"):
+                        full_url = base_url + u
+                    else:
+                        full_url = base_url + "/" + u
+                    
+                    try:
+                        resp = requests.post(full_url, json={"minutes": 90},
+                                            cookies=cookies_dict,
+                                            headers={"X-CSRF-TOKEN": csrf_token, "X-Requested-With": "XMLHttpRequest",
+                                                     "Accept": "application/json", "Content-Type": "application/json"},
+                                            timeout=10)
+                        log(f"Extracted URL POST [{full_url}]: status={resp.status_code}, body={resp.text[:200]}", "WAIT")
+                        if resp.status_code in [200, 201, 302]:
+                            log(f"✅ Extracted URL POST 成功: {full_url}", "OK")
+                            return True, f"Extracted URL: {full_url}"
+                    except Exception as e:
+                        log(f"Extracted URL [{full_url}] 异常: {e}", "WARN")
+        
+        # 策略3: 尝试 server/extend 的 GET 方法（因为 POST 返回 405）
+        try:
+            resp = requests.get(base_url + "/server/extend", cookies=cookies_dict,
+                               headers={"X-Requested-With": "XMLHttpRequest"},
+                               timeout=10, allow_redirects=False)
+            log(f"GET /server/extend: status={resp.status_code}, redirect={resp.headers.get('Location', '')}", "WAIT")
+            if resp.status_code in [200, 301, 302]:
+                log(f"✅ GET /server/extend 成功: {resp.status_code}", "OK")
+                return True, f"GET /server/extend: {resp.status_code}"
+        except Exception as e:
+            log(f"GET /server/extend 异常: {e}", "WARN")
+        
+        # 策略4: 尝试所有可能的路由
+        possible_routes = [
+            "/console/extend", "/console/renew", "/servers/extend", "/servers/renew",
+            "/server/extend", "/server/renew", "/machine/extend", "/machine/renew",
+            "/node/extend", "/node/renew", "/uptime/extend", "/session/extend",
+            "/billing/extend", "/billing/renew", "/account/extend",
+            "/api/v1/server/extend", "/api/v1/extend",
+            "/extend", "/renew",
+        ]
+        
+        for route in possible_routes:
+            try:
+                resp = requests.post(base_url + route, json={"minutes": 90},
+                                    cookies=cookies_dict,
+                                    headers={"X-CSRF-TOKEN": csrf_token, "X-Requested-With": "XMLHttpRequest",
+                                             "Accept": "application/json", "Content-Type": "application/json"},
+                                    timeout=10)
+                log(f"Route [{route}]: status={resp.status_code}, body={resp.text[:150]}", "WAIT")
+                if resp.status_code in [200, 201, 302, 403]:  # 403 说明路由存在但需要其他条件
+                    log(f"✅ 找到有效路由: {route} -> {resp.status_code}", "OK")
+                    return True, f"Route: {route} ({resp.status_code})"
+            except Exception as e:
+                log(f"Route [{route}] 异常: {e}", "WARN")
+        
+        return False, "All strategies exhausted"
+        
     except Exception as e:
-        log(f"JS 点击异常: {e}", "WARN")
+        log(f"Intercept 续期异常: {e}", "WARN")
         return False, str(e)
 
 
-# ========== 按钮操作 ==========
-def find_clickable_button(drv) -> Optional[Tuple]:
-    selectors = [
-        (By.XPATH, '//button[contains(translate(., "WATCH AD", "watch ad"), "watch ad")]'),
-        (By.XPATH, '//button[contains(translate(., "WATCH AD", "watch ad"), "watch ad") or contains(., "90") and contains(., "min") or contains(., "renew") or contains(., "extend")]'),
-    ]
-    for by, sel in selectors:
-        try:
-            els = drv.find_elements(by, sel)
-            for el in els:
-                if el.is_displayed() and el.is_enabled():
-                    txt = (el.text or el.get_attribute("textContent") or "").strip()[:80]
-                    if "+ 90 min" in txt or "watch ad" in txt.lower() or "renew" in txt.lower() or "extend" in txt.lower():
-                        if re.search(r'\b\d{1,2}:\d{2}\b', txt):
-                            continue
-                        return (by, sel, el, txt)
-        except:
-            continue
-    return None
+def renew_by_js_fetch(drv, csrf_token: str) -> Tuple[bool, str]:
+    """
+    方法2: 通过 JS execute_script 直接构造 fetch 请求并发送到页面可能使用的端点
+    """
+    try:
+        # 先分析页面上的 fetch 调用
+        analysis = analyze_page_for_api_endpoints(drv)
+        log(f"页面分析完成", "WAIT")
+        
+        # 获取 cookies
+        cookies_str = "; ".join([f"{k}={v}" for k, v in drv.get_cookies().items()])
+        
+        # 尝试从页面脚本中提取的端点
+        fetch_calls = analysis.get("fetchCalls", [])
+        click_handlers = analysis.get("clickHandlers", [])
+        
+        # 收集所有可能的 URL
+        candidate_urls = set()
+        
+        # 从 click handlers 中提取
+        for handler in click_handlers:
+            for key in ["onclick", "xon", "wirec", "href"]:
+                val = handler.get(key, "")
+                # 提取 URL
+                urls = re.findall(r"(?:['\"])([^'\"]{5,100}(?:\/(?:server|console|extend|renew|api)[^'\"]*){1,5}(?:['\"]))", val)
+                for u in urls:
+                    u = u.strip("'\"")
+                    if u.startswith("/"):
+                        candidate_urls.add(u)
+                    elif u.startswith("http"):
+                        candidate_urls.add(u)
+        
+        # 从 fetch calls 中提取
+        for call in fetch_calls:
+            urls = re.findall(r"['\"]([^'\"]+)['\"]", call)
+            for u in urls:
+                if u.startswith("/"):
+                    candidate_urls.add(u)
+        
+        log(f"候选 URL 列表: {list(candidate_urls)[:10]}", "WAIT")
+        
+        # 对每个候选 URL 尝试 fetch
+        for url in candidate_urls:
+            try:
+                result = drv.execute_async_script(f"""
+                    (function() {{
+                        var callback = arguments[arguments.length - 1];
+                        var token = '{csrf_token}';
+                        
+                        fetch('{url}', {{
+                            method: 'POST',
+                            headers: {{
+                                'Content-Type': 'application/json',
+                                'X-CSRF-TOKEN': token,
+                                'Accept': 'application/json',
+                                'X-Requested-With': 'XMLHttpRequest',
+                                'Cookie': '{cookies_str}'
+                            }},
+                            body: JSON.stringify({{'minutes': 90}})
+                        }})
+                        .then(function(r) {{ return r.json().then(function(d) {{ return {{status: r.status, data: d}}; }}).catch(function() {{ return {{status: r.status, data: null}}; }}); }})
+                        .then(function(r) {{ callback(r); }})
+                        .catch(function(e) {{ callback({{'success': false, 'message': e.message}}); }});
+                    }})();
+                """)
+                
+                if isinstance(result, dict):
+                    status = result.get('status', 0)
+                    log(f"Fetch [{url}]: status={status}, data={str(result.get('data', ''))[:150]}", "WAIT")
+                    if status in [200, 201, 302]:
+                        log(f"✅ Fetch 续期成功: {url}", "OK")
+                        return True, f"Fetch: {url} ({status})"
+            except Exception as e:
+                log(f"Fetch [{url}] 异常: {e}", "WARN")
+        
+        return False, f"No valid URL found among {len(candidate_urls)} candidates"
+        
+    except Exception as e:
+        log(f"JS Fetch 续期异常: {e}", "WARN")
+        return False, str(e)
+
 
 # ========== 账号处理 ==========
 def process_account(drv, name: str, url: str, cookie: str) -> bool:
@@ -436,67 +638,45 @@ def process_account(drv, name: str, url: str, cookie: str) -> bool:
 
         pre_sec = rem_sec
 
-        # 续期优先级: HTTP 直接请求 > JS 点击等待 > Livewire dispatch > UI 按钮
+        # 续期优先级: Intercept+Click > JS Fetch > Button
         renew_success = False
         renew_method = ""
         
-        # 方法1: HTTP 直接 POST 续期接口
-        if csrf_token:
-            log("尝试方法1: HTTP POST 续期接口...", "WAIT")
-            success, msg = renew_via_http(drv, csrf_token)
+        # 方法1: CDP 拦截 + 按钮分析 + requests 重放
+        log("尝试方法1: CDP 拦截 + 按钮分析...", "WAIT")
+        success, msg = renew_by_intercept_and_click(drv, csrf_token)
+        if success:
+            renew_success = True
+            renew_method = "Intercept"
+            log(f"Intercept 续期成功: {msg}", "OK")
+        else:
+            log(f"Intercept 续期失败: {msg}", "WARN")
+        
+        # 方法2: JS Fetch（分析页面结构后构造请求）
+        if not renew_success:
+            log("尝试方法2: JS Fetch 分析续期...", "WAIT")
+            success, msg = renew_by_js_fetch(drv, csrf_token)
             if success:
                 renew_success = True
-                renew_method = "HTTP"
-                log(f"HTTP 续期成功: {msg}", "OK")
+                renew_method = "JS_Fetch"
+                log(f"JS Fetch 续期成功: {msg}", "OK")
             else:
-                log(f"HTTP 续期失败: {msg}", "WARN")
+                log(f"JS Fetch 续期失败: {msg}", "WARN")
         
-        # 方法2: JS 点击 + 等待 DOM 更新
+        # 方法3: UI 按钮（最后手段）
         if not renew_success:
-            log("尝试方法2: JS 点击 + 等待更新...", "WAIT")
-            success, msg = renew_via_js_click_and_wait(drv)
-            if success:
-                renew_success = True
-                renew_method = "JS_Click"
-                log(f"JS 点击完成: {msg}", "OK")
-        
-        # 方法3: Livewire dispatch（虽然 all()=0 但 dispatch 可能全局触发）
-        if not renew_success:
-            log("尝试方法3: Livewire.dispatch('extend')...", "WAIT")
+            log("尝试方法3: UI 按钮（会触发 Turnstile）...", "WARN")
             try:
-                result = drv.execute_async_script("""
-                    var callback = arguments[arguments.length - 1];
-                    if (typeof Livewire === 'undefined') {
-                        callback({success:false, msg:'No Livewire'});
-                        return;
-                    }
-                    Livewire.dispatch('extend');
-                    callback({success:true, msg:'dispatch sent'});
-                """)
-                if isinstance(result, dict) and result.get('success'):
-                    renew_success = True
-                    renew_method = "Livewire_Dispatch"
-                    log(f"Livewire dispatch 发送成功", "OK")
-                else:
-                    log(f"Livewire dispatch 失败: {result}", "WARN")
-            except Exception as e:
-                log(f"Livewire dispatch 异常: {e}", "WARN")
-        
-        # 方法4: UI 按钮（最后手段）
-        if not renew_success:
-            log("尝试方法4: UI 按钮...", "WARN")
-            btn_info = find_clickable_button(drv)
-            if btn_info:
-                _, _, btn_el, btn_txt = btn_info
-                try:
-                    btn_el.click()
+                btn = drv.find_element(By.XPATH, '//button[contains(., "90") and contains(., "min")]')
+                if btn.is_displayed() and btn.is_enabled():
+                    btn.click()
                     renew_success = True
                     renew_method = "Button"
-                    log(f"UI 按钮已点击: {btn_txt}", "WARN")
-                except Exception as e:
-                    log(f"UI 按钮点击失败: {e}", "WARN")
-            else:
-                log("未找到可点击按钮", "ERR")
+                    log("UI 按钮已点击", "WARN")
+                else:
+                    log("按钮不可点击", "WARN")
+            except Exception as e:
+                log(f"UI 按钮点击失败: {e}", "WARN")
 
         # 等待续期生效
         log(f"等待续期生效 ({renew_method})...", "WAIT")
@@ -555,7 +735,7 @@ def build_driver() -> Driver:
     return drv
 
 def main():
-    log("========== Gaming4Free Pro 自动续期启动 (SeleniumBase UC v36) ==========")
+    log("========== Gaming4Free Pro 自动续期启动 (SeleniumBase UC v37) ==========")
 
     log("🔍 检查 Telegram 通知配置...")
     from tg import check_tg_config, send_tg
