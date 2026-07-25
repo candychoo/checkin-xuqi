@@ -331,7 +331,7 @@ def run():
     log.info("正在启动浏览器 (uc=True, headless=True)...")
     with SB(
         browser="chrome",
-        uc=True,
+        uc=False,
         headless=True,
         incognito=False,
         agent="Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
