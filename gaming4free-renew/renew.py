@@ -31,12 +31,16 @@ PASSWORD       = os.getenv("MC_PASSWORD", "")
 COOKIE_STR     = os.getenv("GF_COOKIE", "")
 
 # 代理地址：sing-box 默认监听 127.0.0.1:1080
-# 如果 secrets.PROXY_URL 是复杂 URL（含 ? 等），忽略它，直接用本地 sing-box
+# SeleniumBase 的 proxy= 参数需要 http/https 格式，SOCKS5 会导致连接被拒绝
 _raw_proxy = os.getenv("PROXY_URL", "").strip()
 if "?" in _raw_proxy or "://" not in _raw_proxy:
-    PROXY_URL = "socks5://127.0.0.1:1080"
+    PROXY_URL = "http://127.0.0.1:1080"
 else:
-    PROXY_URL = _raw_proxy if _raw_proxy else "socks5://127.0.0.1:1080"
+    # 如果传入的是 http://... 就保留，否则用 http
+    if _raw_proxy.startswith("http"):
+        PROXY_URL = _raw_proxy
+    else:
+        PROXY_URL = "http://127.0.0.1:1080"
 
 MAX_HOURS      = 48            # 续期上限 48 小时
 ADD_MINUTES    = 90            # 每次点击 +90 分钟
