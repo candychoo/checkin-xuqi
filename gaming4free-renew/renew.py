@@ -1,11 +1,15 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Gaming4Free Pro 服务器自动续期 - SeleniumBase UC 模式
-兼容 Turnstile/Cloudflare 验证，支持代理，多账号轮询
+Gaming4Free Pro 自动续期 - SeleniumBase UC 模式 (v33)
+修复 Turnstile 检测 + 时间解析 + TG 通知
 
-修复记录:
-- v32: 增加会话上限检测 (48h cap)，剩余>6h 跳过续期；连续失败自动停止；按钮未找到时刷新重试
+修改记录:
+- v33: 修复 Turnstile iframe src 检测(改用 class="cf-turnstile" 和 visibility);
+       修复 get_remaining_seconds() 避免匹配 JS 代码中的时间;
+       修复 TG 通知失败时不中断流程;
+       增加点击后等待 Turnstile 消失后再检查时间;
+       增加重试机制: 如果 Turnstile 未解决则刷新页面重新尝试。
 """
 import os
 import sys
@@ -21,29 +25,29 @@ from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
 
-# 本地模块
+# 导入模块
 sys.path.insert(0, os.path.dirname(__file__))
 from cfg import ACCOUNTS, TG_BOT, TG_CHAT, MAX_ROUNDS
 from tg import send_tg
 
 # ========== 配置 ==========
-THRESHOLD = 45 * 3600          # 剩余时间低于 45h 才续期
-MAX_SESSION_CAP = 45 * 3600     # 会话上限保护：剩余 > 45h 视为已达上限，跳过续期 (实测 48h cap 但广告仅在快过期时生效)
-MAX_ZERO_DIFF_ROUNDS = 2       # 连续多少轮增量<=0 判定达上限，结束该账号
-HEADLESS = True                # True=无头，False=有头（调试用）
+THRESHOLD = 45 * 3600          # 剩余时间阈值 45h
+MAX_SESSION_CAP = 45 * 3600     # 会话最大限制 (48h cap)
+MAX_ZERO_DIFF_ROUNDS = 2       # 连续增量<=0 判定次数
+HEADLESS = True                # True=无头 / False=有头
 PAGE_LOAD_TIMEOUT = 120
 IMPLICIT_WAIT = 10
-CLICK_DELAY = 1.5              # 点击后等待
-BUTTON_RETRY_REFRESH = True    # 按钮未找到时是否刷新重试一次
+CLICK_DELAY = 1.5              # 点击等待
+BUTTON_RETRY_REFRESH = True    # 按钮未找到时是否刷新页面
 
-# 调试截图目录
+# 截图目录
 DEBUG_DIR = "debug_output"
 os.makedirs(DEBUG_DIR, exist_ok=True)
 
-# ========== 工具函数 ==========
+# ========== 日志工具 ==========
 def log(msg: str, level: str = "INFO"):
     ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    prefix = {"INFO": "📋", "OK": "✅", "WARN": "⚠️", "ERR": "❌", "WAIT": "⏳", "CLICK": "🖱️"}.get(level, "•")
+    prefix = {"INFO": "[INFO]", "OK": "[OK]", "WARN": "[WARN]", "ERR": "[ERR]", "WAIT": "[WAIT]", "CLICK": "[CLICK]"}.get(level, "[INFO]")
     print(f"[{ts}] {prefix} {msg}", flush=True)
 
 def save_screenshot(drv, name: str):
@@ -54,200 +58,225 @@ def save_screenshot(drv, name: str):
     except Exception as e:
         log(f"截图失败: {e}", "WARN")
 
+def send_tg_safe(title: str, body: str, detail: str = ""):
+    """安全发送 TG 通知，失败不影响主流程"""
+    try:
+        result = send_tg(title, body, detail)
+        if result:
+            log("TG 通知发送成功", "OK")
+        else:
+            log("TG 通知返回失败", "WARN")
+    except Exception as e:
+        log(f"TG 通知异常: {e}", "WARN")
+
 def get_proxy_url() -> Optional[str]:
-    """获取代理地址：
-    1. 优先用工作流 sing-box 建立的本地 socks5://127.0.0.1:1080 (IS_PROXY=true)
-    2. 回退解析 PROXY_URL 基础格式
-    """
-    # 1. 工作流 sing-box 成功时会设置 IS_PROXY=true
+    """获取代理地址"""
     if os.environ.get("IS_PROXY") == "true":
         log("使用 sing-box 本地代理: socks5://127.0.0.1:1080")
         return "socks5://127.0.0.1:1080"
 
-    # 2. 解析 PROXY_URL 环境变量
     raw = os.environ.get("PROXY_URL") or os.environ.get("PROXY") or ""
     raw = raw.strip()
     if not raw:
         return None
 
-    # 已经是标准格式
     if raw.startswith(("http://", "https://", "socks5://", "socks5h://")):
         return raw
 
-    # 简单 ip:port
     if re.match(r'^[\d.]+:\d+$', raw):
         return f"http://{raw}"
 
-    # VLESS/VMess/TUIC 等复杂链接：无法直接用，记录警告并返回 None（直连）
-    log(f"代理链接格式不支持直接使用: {raw[:50]}... (将直连)", "WARN")
+    log(f"不支持的代理格式: {raw[:50]}... (跳过)", "WARN")
     return None
 
-# ========== 核心：解析剩余时间 ==========
-def parse_remaining_time(text: str) -> Optional[int]:
-    """从文本提取剩余秒数，支持 HH:MM:SS / H:MM:SS / MM:SS"""
+# ========== 时间解析 ==========
+def parse_time_str(text: str) -> Optional[int]:
+    """从文本中解析 HH:MM:SS / H:MM:SS / MM:SS 为秒数"""
     text = text.strip()
-    # HH:MM:SS
     m = re.search(r'(\d{1,2}):(\d{2}):(\d{2})', text)
     if m:
-        h, m_, s = map(int, m.groups())
-        return h * 3600 + m_ * 60 + s
-    # MM:SS
+        h, mi, s = map(int, m.groups())
+        return h * 3600 + mi * 60 + s
     m = re.search(r'(?:^|\s)(\d{1,2}):(\d{2})(?:\s|$)', text)
     if m:
-        m_, s = map(int, m.groups())
-        return m_ * 60 + s
+        mi, s = map(int, m.groups())
+        total = mi * 60 + s
+        # 排除纯分钟数 < 1小时的时间 (如倒计时)
+        if total >= 3600:
+            return total
     return None
 
 def get_remaining_seconds(drv) -> Tuple[Optional[str], int]:
-    """获取当前剩余时间 (显示文本, 总秒数)"""
-    # 1. 优先找包含 remaining 的元素
-    for xpath in [
-        "//*[contains(translate(text(), 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'remaining')]",
-        "//*[contains(@class, 'remaining')]",
-        "//*[contains(@id, 'remaining')]",
-    ]:
-        try:
-            els = drv.find_elements(By.XPATH, xpath)
-            for el in els:
-                txt = (el.text or el.get_attribute("textContent") or "").strip()
-                log(f"找到剩余时间元素: {txt}", "INFO")
-                sec = parse_remaining_time(txt)
-                if sec is not None:
-                    return txt, sec
-        except Exception as e:
-            log(f"查找剩余时间元素失败: {e}", "WARN")
+    """获取当前剩余时间 (显示文本, 秒数)"""
+    # 策略1: 查找包含 "remaining" 关键字的元素
+    remaining_elements = drv.find_elements(By.XPATH, "//*[contains(translate(text(), 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'remaining')]")
+    
+    best_match = None
+    best_sec = 0
+    
+    for el in remaining_elements:
+        txt = (el.text or el.get_attribute("textContent") or "").strip()
+        if not txt:
+            continue
+        
+        # 跳过 JS 代码块
+        if txt.startswith("function ") or "return {" in txt or "async send" in txt:
+            continue
+        
+        # 跳过广告/奖励相关文本
+        if "ad rewards" in txt.lower() or "balance" in txt.lower():
+            continue
+        
+        sec = parse_time_str(txt)
+        if sec is not None and sec >= 3600:  # 至少1小时
+            best_match = txt
+            best_sec = sec
+            log(f"找到剩余时间元素: {txt} => {sec}s", "INFO")
+    
+    if best_sec > 0:
+        return best_match, best_sec
 
-    # 2. 全文正则兜底
+    # 策略2: 从 body 全文正则提取
     try:
         body = drv.execute_script("return document.body ? document.body.innerText : '';")
-        log(f"页面文本长度: {len(body)}", "INFO")
-        log(f"页面文本片段: {body[:500]}...", "INFO")
-
-        # 常见的剩余时间格式
-        for pattern in [
-            r'(\d{1,2}:\d{2}:\d{2})\s*remaining',
-            r'remaining[^\d]*(\d{1,2}:\d{2}:\d{2})',
-            r'(\d{1,2}:\d{2}:\d{2})',
-            r'(\d{1,2}:\d{2})\s*(hour|hr|hours|h)',
-            r'(\d+)\s*(hour|hr|hours|h)',
-        ]:
-            m = re.search(pattern, body, re.IGNORECASE)
+        
+        # 先找 "XX:XX:XXremaining" 模式
+        m = re.search(r'(\d{1,2}:\d{2}:\d{2})\s*remaining', body, re.IGNORECASE)
+        if m:
+            sec = parse_time_str(m.group(1))
+            if sec and sec >= 3600:
+                log(f"通过正则找到剩余时间: {m.group(1)} ({sec}s)", "INFO")
+                return m.group(1), sec
+        
+        # 再找 "expires XX:XX PM" 模式
+        m = re.search(r'expires\s+(\d{1,2}:\d{2}\s*(?:AM|PM))', body, re.IGNORECASE)
+        if m:
+            # 转换12小时制为秒数不太现实，跳过
+            pass
+        
+        # 最后兜底: 找所有 HH:MM:SS
+        for pattern in [r'(\d{1,2}:\d{2}:\d{2})']:
+            m = re.search(pattern, body)
             if m:
-                sec = parse_remaining_time(m.group(1))
-                if sec is not None:
-                    log(f"通过正则找到剩余时间: {m.group(1)}", "INFO")
+                sec = parse_time_str(m.group(1))
+                if sec and sec >= 3600:
+                    log(f"通过兜底正则找到时间: {m.group(1)} ({sec}s)", "INFO")
                     return m.group(1), sec
+                    
     except Exception as e:
-        log(f"正则查找剩余时间失败: {e}", "WARN")
+        log(f"获取剩余时间失败: {e}", "WARN")
 
     return None, 0
 
 def check_session_cap(drv) -> bool:
-    """检测页面是否包含 48h cap / 会话上限提示"""
+    """检查页面是否出现 48h cap 提示"""
     try:
         body = drv.execute_script("return document.body ? document.body.innerText : '';")
         body_lower = body.lower()
-        # 常见上限关键词
-        cap_patterns = ['48h cap', 'cap 48h', '48h limit', 'maximum 48', 'max 48h', 'session cap']
-        for pat in cap_patterns:
-            if pat in body_lower:
-                return True
+        cap_patterns = ['48h cap', 'cap 48h', '48h limit', 'maximum 48', 'max 48h']
+        return any(pat in body_lower for pat in cap_patterns)
     except:
-        pass
+        return False
+
+# ========== Turnstile 处理 ==========
+def is_turnstile_active(drv) -> bool:
+    """检测 Turnstile CAPTCHA 是否正在显示（未完成）"""
+    try:
+        # 方法1: 检查 cf-turnstile div 是否存在且可见
+        turnstile_divs = drv.find_elements(By.CSS_SELECTOR, "div.cf-turnstile")
+        for div in turnstile_divs:
+            if div.is_displayed():
+                return True
+        
+        # 方法2: 检查 Turnstile iframe 是否存在
+        iframes = drv.find_elements(By.TAG_NAME, "iframe")
+        for iframe in iframes:
+            src = iframe.get_attribute("src") or ""
+            if "turnstile" in src.lower() or "challenges.cloudflare" in src.lower():
+                return True
+        
+        # 方法3: 检查页面上是否有 "Verify you're human" 文字
+        body = drv.execute_script("return document.body ? document.body.innerText : '';")
+        if "verify you're human" in body.lower() or "cloudflare" in body.lower():
+            # 还要确认不是已完成的状态
+            # 已完成时 Turnstile 通常会消失或显示绿色勾
+            return True
+            
+        return False
+    except:
+        return False
+
+def wait_for_turnstile_complete(drv, timeout: int = 120) -> bool:
+    """等待 Turnstile 完成或消失"""
+    start = time.time()
+    while time.time() - start < timeout:
+        if not is_turnstile_active(drv):
+            log("Turnstile 已通过/未出现", "OK")
+            return True
+        elapsed = int(time.time() - start)
+        if elapsed % 10 == 0:
+            log(f"Turnstile 验证中... ({elapsed}s)", "WAIT")
+        time.sleep(5)
+    
+    log(f"Turnstile 等待超时 ({timeout}s)", "WARN")
     return False
 
+# ========== 按钮操作 ==========
+BUTTON_SELECTORS = [
+    (By.XPATH, '//button[contains(translate(., "WATCH AD", "watch ad"), "watch ad")]'),
+    (By.XPATH, '//a[contains(translate(., "WATCH AD", "watch ad"), "watch ad")]'),
+    (By.XPATH, '//button[normalize-space(text()) = "+ 90 min" or translate(text(), "+", "") = "90 min"]'),
+    (By.XPATH, '//a[normalize-space(text()) = "+ 90 min" or translate(text(), "+", "") = "90 min"]'),
+    (By.XPATH, '//button[contains(translate(., "WATCH AD", "watch ad"), "watch ad") or contains(., "90") and contains(., "min") or contains(., "renew") or contains(., "extend")]'),
+    (By.XPATH, '//a[contains(translate(., "WATCH AD", "watch ad"), "watch ad") or contains(., "90") and contains(., "min") or contains(., "renew") or contains(., "extend")]'),
+]
+
 def is_watch_ad_state(btn_txt: str) -> bool:
-    """判断按钮是否处于可点击的续期状态（Watch Ad / + 90 min 等）"""
+    """判断按钮是否在可点击状态（非冷却）"""
     import re
     t = btn_txt.lower()
 
-    # 特殊处理："+ 90 min" 是可点击状态（无倒计时）
-    # 但 "+ 90 min 05:00" 是冷却状态（有倒计时）
     if re.search(r'\+\s*90\s*min', t):
-        # 检查是否有倒计时
         if re.search(r'\b\d{1,2}:\d{2}\b', t) or re.search(r'\b\d{1,2}:\d{2}:\d{2}\b', t):
-            log(f"❌ 检测到冷却按钮: {btn_txt} (包含倒计时)", "WARN")
-            return False  # 冷却状态
+            log(f"⚠️ 检测到等待按钮: {btn_txt} (含冷却时间)", "WARN")
+            return False
         log(f"✅ 可点击按钮: {btn_txt}", "OK")
-        return True  # 可点击状态
+        return True
 
-    # 可点击的续期按钮特征
-    clickable_patterns = [
-        r'watch\s*ad',           # Watch Ad
-        r'watch',                # Watch
-        r'renew',               # Renew
-        r'extend',              # Extend
-    ]
-
+    clickable_patterns = [r'watch\s*ad', r'renew', r'extend']
     has_clickable = any(re.search(p, t) for p in clickable_patterns)
     if not has_clickable:
-        log(f"⚠️ 无效按钮文本: {btn_txt}", "WARN")
+        log(f"❓ 无效按钮文本: {btn_txt}", "WARN")
         return False
 
-    # 冷却特征：含倒计时时间格式 (MM:SS / H:MM:SS / 5m / 5min / 5 min)
-    cooldown_patterns = [
-        r'\b\d{1,2}:\d{2}\b',           # 05:00, 5:00, 12:34 (MM:SS 或 H:MM)
-        r'\b\d{1,2}:\d{2}:\d{2}\b',     # 1:05:00 (H:MM:SS)
-        r'\b\d+\s*m(?:in)?\b',          # 5m, 5min, 5 min
-    ]
-
+    cooldown_patterns = [r'\b\d{1,2}:\d{2}\b', r'\b\d+\s*m(?:in)?\b']
     is_cooldown = any(re.search(p, t) for p in cooldown_patterns)
     if is_cooldown:
-        log(f"❌ 冷却按钮: {btn_txt}", "WARN")
+        log(f"⏳ 等待按钮: {btn_txt}", "WARN")
         return False
 
     log(f"✅ 可点击按钮: {btn_txt}", "OK")
     return True
 
-
-# ========== 核心：按钮检测与点击 ==========
-BUTTON_SELECTORS = [
-    # 优先：精确文本匹配（Watch Ad）
-    (By.XPATH, '//button[contains(translate(., "WATCH AD", "watch ad"), "watch ad")]'),
-    (By.XPATH, '//a[contains(translate(., "WATCH AD", "watch ad"), "watch ad")]'),
-    # 精确匹配：+ 90 min（无倒计时）
-    (By.XPATH, '//button[normalize-space(text()) = "+ 90 min" or translate(text(), "+", "") = "90 min"]'),
-    (By.XPATH, '//a[normalize-space(text()) = "+ 90 min" or translate(text(), "+", "") = "90 min"]'),
-    # 精确匹配：90 min（无倒计时，无+号）
-    (By.XPATH, '//button[normalize-space(text()) = "90 min"]'),
-    (By.XPATH, '//a[normalize-space(text()) = "90 min"]'),
-    # 兜底：包含 90 和 min 的按钮
-    (By.XPATH, '//button[contains(translate(., "WATCH AD", "watch ad"), "watch ad") or contains(., "90") and contains(., "min") or contains(., "renew") or contains(., "extend")]'),
-    (By.XPATH, '//a[contains(translate(., "WATCH AD", "watch ad"), "watch ad") or contains(., "90") and contains(., "min") or contains(., "renew") or contains(., "extend")]'),
-    # CSS 选择器兜底
-    (By.CSS_SELECTOR, 'button.btn-renew, button.renew-btn, button[onclick*="renew"], a[href*="renew"]'),
-    (By.CSS_SELECTOR, '.renew-button, #renew-button, .btn-renew'),
-]
-
-CONFIRM_SELECTORS = [
-    (By.XPATH, '//button[contains(., "Confirm")]'),
-    (By.XPATH, '//button[contains(., "Yes")]'),
-    (By.XPATH, '//button[contains(., "OK")]'),
-    (By.XPATH, '//button[contains(., "Renew")]'),
-    (By.XPATH, '//button[contains(., "Extend")]'),
-    (By.CSS_SELECTOR, '.swal2-confirm, .modal-footer button.btn-primary, .btn-confirm'),
-]
-
-def find_clickable_button(drv) -> Optional[Tuple[str, str]]:
-    """返回 (by, selector, element, button_text) 或 None"""
+def find_clickable_button(drv) -> Optional[Tuple]:
+    """查找可点击按钮 (by, selector, element, button_text)"""
     for by, sel in BUTTON_SELECTORS:
         try:
             els = drv.find_elements(by, sel)
             for el in els:
                 if el.is_displayed() and el.is_enabled():
                     txt = (el.text or el.get_attribute("textContent") or "").strip()[:80]
-                    # 验证按钮状态
                     if is_watch_ad_state(txt):
                         log(f"找到可点击按钮: {txt} ({by}={sel})", "OK")
                         return (by, sel, el, txt)
                     else:
-                        log(f"找到按钮但不可点击: {txt} ({by}={sel})", "WARN")
+                        log(f"⚠️ 按钮不可点击: {txt} ({by}={sel})", "WARN")
         except:
             continue
     return None
 
 def click_button(drv, el) -> bool:
-    """多策略点击"""
+    """点击元素"""
     try:
         drv.execute_script("arguments[0].scrollIntoView({block:'center'});", el)
         time.sleep(0.3)
@@ -264,31 +293,8 @@ def click_button(drv, el) -> bool:
         log(f"原生点击失败: {e}", "WARN")
     return False
 
-def handle_confirm_dialog(drv) -> bool:
-    """处理确认弹窗 / alert"""
-    # 1. 网页模态框
-    for by, sel in CONFIRM_SELECTORS:
-        try:
-            btn = WebDriverWait(drv, 3).until(EC.element_to_be_clickable((by, sel)))
-            btn.click()
-            log(f"点击确认按钮: {sel}", "OK")
-            time.sleep(1)
-            return True
-        except:
-            continue
-    # 2. 原生 alert
-    try:
-        alert = drv.switch_to.alert
-        log(f"检测到 Alert: {alert.text}", "WARN")
-        alert.accept()
-        return True
-    except:
-        pass
-    return False
-
-# ========== 核心：等待冷却恢复 ==========
 def wait_for_cooldown(drv, max_wait: int = 1500) -> bool:
-    """等待按钮变回 Watch Ad 状态（默认 25 分钟）"""
+    """等待按钮恢复可点击状态"""
     start = time.time()
     while time.time() - start < max_wait:
         time.sleep(30)
@@ -301,24 +307,23 @@ def wait_for_cooldown(drv, max_wait: int = 1500) -> bool:
         if btn_info:
             _, _, _, txt = btn_info
             if is_watch_ad_state(txt):
-                log(f"冷却结束，按钮可用: {txt}", "OK")
+                log(f"按钮恢复可点击: {txt}", "OK")
                 return True
-        log(f"仍在冷却中... 已等 {int(time.time()-start)}s", "WAIT")
+        log(f"继续等待... 已等 {int(time.time()-start)}s", "WAIT")
     return False
 
-# ========== 单账号续期流程 ==========
+# ========== 账号处理 ==========
 def process_account(drv, name: str, url: str, cookie: str) -> bool:
     log(f"========== 开始处理账号: {name} ==========")
     log(f"目标 URL: {url}")
 
-    # 1. 先访问登录页注入 Cookie
+    # 1. 登录并注入 Cookie
     try:
         drv.get("https://control.gaming4free.net/login")
         time.sleep(2)
     except:
         pass
 
-    # 注入 Cookie
     for pair in cookie.split(";"):
         pair = pair.strip()
         if "=" in pair:
@@ -329,54 +334,48 @@ def process_account(drv, name: str, url: str, cookie: str) -> bool:
                 pass
     log("Cookie 已注入")
 
-    # 2. 访问服务器页面
+    # 2. 刷新到控制台页面
     try:
         drv.get(url)
-        # 等待页面加载（可能有 CF/Turnstile） - 使用标准 Selenium 等待
         WebDriverWait(drv, 30).until(lambda d: d.execute_script("return document.readyState") == "complete")
     except Exception as e:
         log(f"页面加载异常: {e}", "WARN")
 
-    # 3. 等待 Turnstile/Cloudflare 通过（UC 模式自动处理，额外等待）
+    # 3. 等待 Turnstile 初始验证
     time.sleep(5)
 
-    # 4. 验证是否登录成功
+    # 4. 验证登录状态
     title = drv.title
     log(f"页面标题: {title}")
     if "Login" in title or "Sign in" in title:
-        log("Cookie 失效，仍在登录页", "ERR")
+        log("Cookie 失效，跳转到登录页", "ERR")
         save_screenshot(drv, f"{name}_login_fail")
         return False
 
-    # 5. 多轮续期
-    zero_diff_count = 0  # 连续增量<=0 的轮次
+    # 5. 主循环
+    zero_diff_count = 0
     for round_num in range(1, MAX_ROUNDS + 1):
         log(f"\n--- 第 {round_num}/{MAX_ROUNDS} 轮 ---")
 
-        # 5.0 检查页面状态
+        # 5.0 安全检查
         try:
-            title = drv.title
             body = drv.execute_script("return document.body ? document.body.innerText : '';")
             body_lower = body.lower()
-
-            # 检查是否被暂停
             if "suspended" in title.lower() or "suspended" in body_lower:
                 log(f"⚠️ 检测到账号被暂停: {title}", "ERR")
                 save_screenshot(drv, f"{name}_suspended")
                 return False
-
-            # 检查是否在登录页
             if "login" in title.lower() or "sign in" in title.lower():
-                log("❌ Cookie 失效，仍在登录页", "ERR")
+                log("⚠️ Cookie 失效，跳转到登录页", "ERR")
                 save_screenshot(drv, f"{name}_login_fail")
                 return False
         except Exception as e:
             log(f"检查页面状态失败: {e}", "WARN")
 
-        # 5.1 获取当前剩余时间
+        # 5.1 获取剩余时间
         rem_text, rem_sec = get_remaining_seconds(drv)
         if rem_sec == 0:
-            log("无法获取剩余时间，刷新重试", "WARN")
+            log("无法获取剩余时间，刷新页面", "WARN")
             save_screenshot(drv, f"{name}_no_remaining_time_r{round_num}")
             drv.refresh()
             time.sleep(5)
@@ -384,15 +383,14 @@ def process_account(drv, name: str, url: str, cookie: str) -> bool:
 
         log(f"当前剩余: {rem_text} ({rem_sec} 秒)")
 
-        # --- 新增：会话上限保护 ---
+        # --- 会话上限检查 ---
         if rem_sec > MAX_SESSION_CAP:
-            log(f"剩余 {rem_sec//3600}h > 保护上限 {MAX_SESSION_CAP//3600}h，判定已达会话上限，跳过续期", "WARN")
-            # 再确认一次页面是否有 cap 提示
+            log(f"剩余 {rem_sec//3600}h > 会话上限 {MAX_SESSION_CAP//3600}h，判定已达会话上限，结束", "WARN")
             if check_session_cap(drv):
-                log("页面检测到 '48h cap' 字样，确认会话上限", "WARN")
-            return True  # 正常结束，不算失败
+                log("页面检测到 '48h cap' 提示，确认会话已满", "WARN")
+            return True
 
-        # --- 新增：连续失败保护 ---
+        # --- 连续失败检查 ---
         if zero_diff_count >= MAX_ZERO_DIFF_ROUNDS:
             log(f"连续 {zero_diff_count} 轮增量<=0，判定已达上限，结束该账号", "WARN")
             return True
@@ -403,7 +401,7 @@ def process_account(drv, name: str, url: str, cookie: str) -> bool:
 
         pre_sec = rem_sec
 
-        # 5.2 找按钮（含一次刷新重试）
+        # 5.2 找按钮
         btn_info = find_clickable_button(drv)
         if not btn_info and BUTTON_RETRY_REFRESH:
             log("首次未找到按钮，刷新页面重试...", "WARN")
@@ -412,7 +410,7 @@ def process_account(drv, name: str, url: str, cookie: str) -> bool:
             btn_info = find_clickable_button(drv)
 
         if not btn_info:
-            log("未找到续期按钮", "ERR")
+            log("未找到可点击按钮", "ERR")
             save_screenshot(drv, f"{name}_no_btn_r{round_num}")
             drv.refresh()
             time.sleep(10)
@@ -421,22 +419,21 @@ def process_account(drv, name: str, url: str, cookie: str) -> bool:
         by, sel, btn_el, btn_txt = btn_info
         is_watch_ad = is_watch_ad_state(btn_txt)
 
-        # 5.3 如果在冷却，等待恢复
+        # 5.3 如果按钮在冷却中，等待恢复
         if not is_watch_ad:
-            log(f"按钮非 Watch Ad 状态: {btn_txt}，进入冷却等待", "WAIT")
+            log(f"按钮不在 Watch Ad 状态: {btn_txt}，等待冷却恢复", "WAIT")
             if not wait_for_cooldown(drv, max_wait=1500):
-                log("冷却等待超时，跳过本轮", "WARN")
+                log("冷却等待超时，继续下一轮", "WARN")
                 continue
-            # 冷却后重新获取按钮
             btn_info = find_clickable_button(drv)
             if not btn_info:
                 continue
             by, sel, btn_el, btn_txt = btn_info
 
-        # 5.4 点击按钮前截图
+        # 5.4 点击前截图
         save_screenshot(drv, f"{name}_before_click_r{round_num}")
 
-        # 5.4 点击按钮
+        # 5.5 点击按钮
         log(f"点击按钮: {btn_txt}", "CLICK")
         if not click_button(drv, btn_el):
             log("点击失败", "ERR")
@@ -444,31 +441,18 @@ def process_account(drv, name: str, url: str, cookie: str) -> bool:
             time.sleep(5)
             continue
 
-        # 5.5 处理 Turnstile / Cloudflare 验证
-        # Turnstile 可能以 iframe 形式出现，需要等待通过
+        # 5.6 等待 Turnstile 完成
         log("检测 Turnstile/Cloudflare...", "TURNSTILE")
         ts_start = time.time()
-        while time.time() - ts_start < 180:  # 最多等 3 分钟
-            # 先检查时间是否已增加（提前跳出）
+        while time.time() - ts_start < 180:
+            # 先检查时间是否已经增加（说明 Turnstile 已完成）
             _, cur_sec = get_remaining_seconds(drv)
             if cur_sec > pre_sec + 300:
-                log("检测到时间增加 (Turnstile 前)", "OK")
+                log(f"✅ 检测到时间增加 (Turnstile 完成): +{cur_sec - pre_sec}s", "OK")
                 break
             
-            # 检查 Turnstile iframe 是否存在
-            has_turnstile = drv.execute_script("""
-                var frames = document.querySelectorAll('iframe');
-                for (var i = 0; i < frames.length; i++) {
-                    var src = frames[i].src || '';
-                    if (src.indexOf('turnstile') !== -1 || 
-                        src.indexOf('challenges.cloudflare.com') !== -1) {
-                        return true;
-                    }
-                }
-                return false;
-            """)
-            
-            if not has_turnstile:
+            # 检查 Turnstile 是否还在
+            if not is_turnstile_active(drv):
                 log("Turnstile 已通过/未出现", "OK")
                 break
             
@@ -476,45 +460,21 @@ def process_account(drv, name: str, url: str, cookie: str) -> bool:
             time.sleep(5)
         
         else:
-            log("Turnstile 等待超时，但仍检查时间", "WARN")
+            log("Turnstile 等待超时，尝试检查时间", "WARN")
 
-        # 5.6 等待续期生效（最多 30s）
+        # 5.7 等待续期生效（额外等待 10s 让 Livewire 响应）
         log("等待续期生效...", "WAIT")
-        success = False
-        wait_end = time.time() + 30
-        while time.time() < wait_end:
-            time.sleep(3)
-            _, cur_sec = get_remaining_seconds(drv)
-            if cur_sec > pre_sec + 300:  # 至少增加 5 分钟
-                diff = cur_sec - pre_sec
-                log(f"检测到时间增加: +{diff} 秒 ({diff//60} 分)", "OK")
-                success = True
-                break
+        time.sleep(10)
 
-        # 5.7 最终验证
+        # 5.8 验证结果
         final_text, final_sec = get_remaining_seconds(drv)
         diff = final_sec - pre_sec
         log(f"本轮结果: {final_text} ({final_sec}s), 增量: {diff}s")
 
         if diff > 300:
-            log(f"🎉 续期成功! +{diff//60} 分钟", "OK")
-            zero_diff_count = 0  # 重置连续失败计数
-
-            # 发送成功通知
-            try:
-                tg_result = send_tg(
-                    f"🎉 续期成功",
-                    f"[{name}] {final_text}",
-                    f"+{diff//60} 分钟"
-                )
-                if tg_result:
-                    log("✅ TG 通知发送成功", "OK")
-                else:
-                    log("⚠️  TG 通知发送失败", "WARN")
-            except Exception as e:
-                log(f"⚠️  TG 通知异常: {e}", "WARN")
-
-            # 成功后等待 30s 再下一轮
+            log(f"✅ 续期成功! +{diff//60} 分钟", "OK")
+            zero_diff_count = 0
+            send_tg_safe("✅ 续期成功", f"[{name}] {final_text}", f"+{diff//60} 分钟")
             time.sleep(30)
             try:
                 drv.refresh()
@@ -523,28 +483,16 @@ def process_account(drv, name: str, url: str, cookie: str) -> bool:
                 pass
             continue
         else:
-            log(f"续期失败，增量不足: {diff}s", "ERR")
+            log(f"❌ 续期失败，增量不足: {diff}s", "ERR")
             zero_diff_count += 1
             save_screenshot(drv, f"{name}_fail_r{round_num}")
+            send_tg_safe("❌ 续期失败", f"[{name}] {rem_text}", f"增量: {diff}s")
 
-            # 发送失败通知
-            try:
-                tg_result = send_tg(
-                    f"❌ 续期失败",
-                    f"[{name}] {rem_text}",
-                    f"增量: {diff}s"
-                )
-                if tg_result:
-                    log("✅ TG 通知发送成功", "OK")
-                else:
-                    log("⚠️  TG 通知发送失败", "WARN")
-            except Exception as e:
-                log(f"⚠️  TG 通知异常: {e}", "WARN")
-
-            time.sleep(10)
+            # 刷新页面重试
+            time.sleep(5)
             try:
                 drv.refresh()
-                time.sleep(3)
+                time.sleep(5)
             except:
                 pass
             continue
@@ -552,14 +500,14 @@ def process_account(drv, name: str, url: str, cookie: str) -> bool:
     log(f"达到最大轮次 ({MAX_ROUNDS})，结束该账号")
     return True
 
-# ========== 主入口 ==========
+# ========== 驱动构建 ==========
 def build_driver() -> Driver:
-    """创建 SeleniumBase UC Driver"""
+    """构建 SeleniumBase UC Driver"""
     proxy = get_proxy_url()
     log(f"代理: {proxy or '直连'}")
     
     drv = Driver(
-        uc=True,                    # Undetected-Chromedriver 模式（绕过 CF/Turnstile）
+        uc=True,
         headless=HEADLESS,
         incognito=True,
         proxy=proxy,
@@ -567,33 +515,31 @@ def build_driver() -> Driver:
         page_load_strategy="eager",
         window_size="1920,1080",
         agent="Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-        # SeleniumBase 特有参数
-        undetectable=True,          # 启用更强的反检测
-        headless2=HEADLESS,         # 新版 headless 模式
+        undetectable=True,
+        headless2=HEADLESS,
     )
     drv.set_page_load_timeout(PAGE_LOAD_TIMEOUT)
     drv.implicitly_wait(IMPLICIT_WAIT)
     return drv
 
 def main():
-    log("========== Gaming4Free Pro 自动续期启动 (SeleniumBase UC v32) ==========")
+    log("========== Gaming4Free Pro 自动续期启动 (SeleniumBase UC v33) ==========")
 
     # 检查 TG 配置
     log("🔍 检查 Telegram 通知配置...")
     from tg import check_tg_config, send_tg
     tg_config_ok = check_tg_config()
 
-    # 如果配置了 TG，发送测试通知
     if tg_config_ok:
         log("📤 发送 TG 测试通知...", "INFO")
         try:
-            test_result = send_tg("🧪 TG 通知测试", "Gaming4Free Pro", "配置检查通过")
+            test_result = send_tg("🧪 TG 通知测试", "Gaming4Free Pro", "配置正常")
             if test_result:
                 log("✅ TG 测试通知发送成功", "OK")
             else:
-                log("⚠️  TG 测试通知发送失败", "WARN")
+                log("⚠️ TG 测试通知发送失败", "WARN")
         except Exception as e:
-            log(f"⚠️  TG 测试通知异常: {e}", "WARN")
+            log(f"⚠️ TG 测试通知异常: {e}", "WARN")
 
     if not ACCOUNTS:
         log("❌ 未配置任何账号 (GAME4FREE_ACCOUNTS / GAME4FREE_ACCOUNT)", "ERR")
@@ -614,7 +560,7 @@ def main():
                 if ok:
                     break
             except Exception as e:
-                log(f"第 {attempt+1} 次尝试异常: {e}", "ERR")
+                log(f"第 {attempt+1} 次运行异常: {e}", "ERR")
                 log(traceback.format_exc(), "ERR")
                 if drv:
                     save_screenshot(drv, f"{name}_exc_attempt{attempt+1}")
