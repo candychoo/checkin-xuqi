@@ -8,9 +8,10 @@ from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
 
-def log(msg):
+def log(msg, level=""):
     ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    print(f"[{ts}] {msg}", flush=True)
+    prefix = f"[{level}]" if level else ""
+    print(f"[{ts}] {prefix} {msg}", flush=True)
 
 def get_chromedriver():
     for p in ["/usr/bin/chromedriver", "/usr/local/bin/chromedriver", "/opt/chrome/chromedriver"]:
