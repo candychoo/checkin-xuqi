@@ -23,6 +23,13 @@ jobs:
         with:
           python-version: "3.12"
 
+      - name: Debug cookie length
+        run: |
+          echo "ACL_COOKIES length: ${#ACL_COOKIES}"
+          echo "ACL_COOKIES starts with: ${ACL_COOKIES:0:20}..."
+        env:
+          ACL_COOKIES: ${{ secrets.ACL_COOKIES }}
+
       - name: Install dependencies
         run: |
           pip install --upgrade pip
