@@ -96,7 +96,7 @@ def build_session(cookie_str):
         "Origin": BASE_URL,
         "Referer": f"{BASE_URL}/projects",
     })
-    # 解析 cookie 字符串
+    # 解析 cookie 字符串 - 处理 __Host- 和 __Secure- 前缀
     for kv in cookie_str.split(";"):
         kv = kv.strip()
         if not kv or "=" not in kv:
@@ -104,7 +104,21 @@ def build_session(cookie_str):
         k, v = kv.split("=", 1)
         k = k.strip()
         v = v.strip()
-        s.cookies.set(k, v, domain="dash.aclclouds.com", path="/")
+        # 移除 __Host- 和 __Secure- 前缀（requests 不支持这些前缀）
+        clean_k = k
+        if k.startswith("__Host-"):
+            clean_k = k[9:]  # 移除 "__Host-"
+        elif k.startswith("__Secure-"):
+            clean_k = k[9:]  # 移除 "__Secure-"
+        
+        # 设置 domain 为 dash.aclclouds.com
+        s.cookies.set(clean_k, v, domain="dash.aclclouds.com", path="/")
+    
+    # 调试: 打印设置的 Cookie
+    log(f"🔍 Session 中设置了 {len(s.cookies)} 个 Cookie:")
+    for cookie in s.cookies:
+        log(f"   - {cookie.name} = {cookie.value[:30]}...")
+    
     return s
 
 
