@@ -1,4 +1,4 @@
-name: AclClouds-Kaka-Renew
+name: ACLClouds-卡卡续期
 
 on:
   schedule:
@@ -15,27 +15,32 @@ jobs:
     timeout-minutes: 10
 
     steps:
-      - name: Checkout
+      - name: 检出代码
         uses: actions/checkout@v4
 
-      - name: Setup Python
+      - name: 设置 Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.12"
 
-      - name: Debug cookie length
+      - name: 调试 Cookie 长度
         run: |
-          echo "ACL_COOKIES length: ${#ACL_COOKIES}"
-          echo "ACL_COOKIES starts with: ${ACL_COOKIES:0:20}..."
+          echo "ACL_COOKIES 长度: ${#ACL_COOKIES}"
+          if [ "${#ACL_COOKIES}" -eq 0 ]; then
+            echo "⚠️ 警告: ACL_COOKIES 为空！"
+            echo "请检查 Settings → Secrets and variables → Actions 中是否已配置 ACL_COOKIES"
+          else
+            echo "✅ Cookie 已读取，前20字符: ${ACL_COOKIES:0:20}..."
+          fi
         env:
           ACL_COOKIES: ${{ secrets.ACL_COOKIES }}
 
-      - name: Install dependencies
+      - name: 安装依赖
         run: |
           pip install --upgrade pip
           pip install -r ACLClouds-server/requirements.txt
 
-      - name: Run renewal
+      - name: 运行续期脚本
         env:
           ACL_COOKIES: ${{ secrets.ACL_COOKIES }}
           RENEW_THRESHOLD_HOURS: ${{ vars.RENEW_THRESHOLD_HOURS || '48' }}
