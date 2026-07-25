@@ -386,7 +386,7 @@ def run():
               "(KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
         disable_cookies=False,
         ad_block=False,
-        start_args=[f"--proxy-server={PROXY_URL}"],
+        proxy_server=PROXY_URL,
     ) as sb:
         log.info("✅ 浏览器启动成功")
 
