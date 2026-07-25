@@ -30,8 +30,8 @@ USERNAME       = os.getenv("MC_USERNAME", "")
 PASSWORD       = os.getenv("MC_PASSWORD", "")
 COOKIE_STR     = os.getenv("GF_COOKIE", "")
 
-# 代理地址：暂时禁用，排查是否代理问题
-PROXY_URL = None
+# 代理地址：sing-box 默认监听 SOCKS5 在 127.0.0.1:1080
+PROXY_URL = "socks5://127.0.0.1:1080"
 
 MAX_HOURS      = 48            # 续期上限 48 小时
 ADD_MINUTES    = 90            # 每次点击 +90 分钟
@@ -365,13 +365,18 @@ def run():
         tg(f"❌ gaming4free 续期失败：代理端口 {proxy_port} 未就绪")
         sys.exit(1)
 
-    # 启动浏览器
+    # 启动浏览器，通过 ChromeOptions 设置 SOCKS5 代理
+    from selenium.webdriver.chrome.options import Options as ChromeOptions
+    chrome_opts = ChromeOptions()
+    chrome_opts.add_argument(f"--proxy-server={PROXY_URL}")
+    
     log.info("正在启动浏览器 (uc=False, headless=True)...")
     with SB(
         browser="chrome",
         uc=False,
         headless=True,
         incognito=False,
+        options=chrome_opts,
         disable_cookies=False,
         ad_block=False,
     ) as sb:
