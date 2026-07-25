@@ -376,7 +376,7 @@ def run():
         uc=False,
         headless=True,
         incognito=False,
-        options=chrome_opts,
+        chrome_options=chrome_opts,
         disable_cookies=False,
         ad_block=False,
     ) as sb:
