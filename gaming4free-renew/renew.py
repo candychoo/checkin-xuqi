@@ -380,9 +380,61 @@ def get_remaining_seconds(sb) -> int:
 # ---------------------------------------------------------------------------
 # 单服务器续期
 # ---------------------------------------------------------------------------
-def run_single_server(sb, site_url: str, server_num: str, region: str) -> bool:
+def diagnose_page(sb):
+    """诊断当前页面, 打印所有按钮和 Livewire 组件信息"""
+    from util import _LW_DIAGNOSE_JS
+    try:
+        result = sb.execute_script(_LW_DIAGNOSE_JS)
+        log.info("🔍 页面诊断:")
+        try:
+            import json as _json
+            info = _json.loads(result)
+            log.info(f"   Livewire v3: {info.get('livewire_v3')}")
+            log.info(f"   Livewire v2: {info.get('livewire_v2')}")
+            log.info(f"   wire 元素数: {info.get('wire_elements')}")
+            for w in (info.get('wire_ids') or [])[:5]:
+                log.info(f"     - id={w.get('id')} tag={w.get('tag')} class={w.get('class')[:50]} wire:click={w.get('wireClick')}")
+            btns = info.get('renew_buttons') or []
+            log.info(f"   含 '90 min' 的按钮: {len(btns)} 个")
+            for b in btns[:5]:
+                log.info(f"     - tag={b.get('tag')} text={b.get('text')!r} disabled={b.get('disabled')} class={b.get('class')[:50]}")
+                log.info(f"       wire:click={b.get('wireClick')}")
+                log.info(f"       html={b.get('html')[:150]}")
+        except Exception as e:
+            log.info(f"   (原始输出) {result[:500]}")
+
+        # 额外: 打印所有 button/a 的文本和 id/class (前 20 个)
+        all_btns_info = sb.execute_script("""
+            var result = [];
+            var els = document.querySelectorAll('button, a, [role=button], input[type=submit]');
+            for (var i = 0; i < els.length && i < 30; i++) {
+                var el = els[i];
+                var t = (el.innerText || el.textContent || el.value || '').trim().substring(0, 50);
+                if (t) result.push({tag: el.tagName, id: el.id, class: (el.className||'').substring(0,60), text: t});
+            }
+            return JSON.stringify(result);
+        """)
+        try:
+            import json as _json
+            arr = _json.loads(all_btns_info)
+            log.info(f"   页面所有可见按钮/链接 (前 {len(arr)} 个):")
+            for b in arr:
+                log.info(f"     <{b.get('tag')} id={b.get('id')!r} class={b.get('class')!r}> {b.get('text')!r}")
+        except Exception:
+            pass
+    except Exception as e:
+        log.warning(f"页面诊断失败: {e}")
+
+
+def run_single_server(sb, site_url: str, server_num: str, region: str,
+                      renew_url: str = None) -> bool:
     """对一个服务器执行续期，返回是否成功"""
-    url_app = f"{site_url.rstrip('/')}/servers/{server_num}"
+    # 优先用用户提供的完整 URL, 否则尝试多种路径格式
+    if renew_url and "/server/" in renew_url:
+        url_app = renew_url
+    else:
+        # 兜底: 尝试单数和复数两种路径
+        url_app = f"{site_url.rstrip('/')}/server/{server_num}"
 
     log.info("=" * 40)
     log.info(f"🚀 开始续期 [{region}] ({server_num})")
@@ -409,6 +461,7 @@ def run_single_server(sb, site_url: str, server_num: str, region: str) -> bool:
 
     # 检查登录状态
     current_url = sb.get_current_url().lower()
+    log.info(f"📍 当前 URL: {sb.get_current_url()}")
     if "login" in current_url or "auth" in current_url:
         raise Exception("登录状态失效或权限被拒绝")
 
@@ -445,29 +498,68 @@ def run_single_server(sb, site_url: str, server_num: str, region: str) -> bool:
     except Exception:
         pass
 
-    # 点击续期按钮
-    try:
-        log.info("🖱️ 正在点击 'VOTE + ADD 90 MIN'...")
-        sb.wait_for_element_visible("#sd-vote-btn", timeout=10)
-        sb.click("#sd-vote-btn")
-    except Exception as e:
-        log.warning("按钮点击失败，尝试 Livewire extend...")
+    # 点击续期按钮 - 尝试多种选择器
+    vote_btn_selectors = [
+        "#sd-vote-btn",                            # 原始 ID
+        'button[id="sd-vote-btn"]',
+        'button:contains("VOTE")',
+        'button:contains("90")',
+        'button:contains("+90")',
+        'button:contains("ADD 90")',
+        'a:contains("VOTE")',
+        'a:contains("90 min")',
+        '//button[contains(., "VOTE")]',
+        '//button[contains(., "90 min")]',
+        '//a[contains(., "VOTE")]',
+    ]
+    clicked = False
+    for sel in vote_btn_selectors:
+        try:
+            if sb.is_element_visible(sel, timeout=3):
+                log.info(f"🖱️ 找到续期按钮 [{sel}], 正在点击...")
+                sb.click(sel, timeout=5)
+                clicked = True
+                break
+        except Exception:
+            continue
+
+    if not clicked:
+        log.warning("所有选择器都未找到续期按钮，尝试 Livewire extend...")
         lw_result = livewire_extend(sb)
         if not lw_result["success"]:
-            raise Exception(f"未找到续期按钮: {e}")
+            # 关键: 失败时跑页面诊断, 把页面所有按钮信息打到日志
+            log.error("❌ 仍未找到续期按钮, 开始页面诊断...")
+            screenshot(sb, f"no_btn_{server_num}")
+            diagnose_page(sb)
+            raise Exception(f"未找到续期按钮 (已尝试 {len(vote_btn_selectors)} 种选择器, 见上方诊断)")
 
     # 破解 Turnstile
     human_wait(2, 4)
     bypass_turnstile(sb)
 
-    # 点击最终提交按钮
-    try:
-        log.info("🖱️ 正在点击最终提交按钮 'VOTE + ADD 90 MINUTES'...")
-        sb.wait_for_element_visible("#vm-submit", timeout=15)
-        sb.uc_click("#vm-submit")
-        human_wait(8, 12)
-    except Exception as e:
-        log.warning(f"提交按钮点击失败: {e}")
+    # 点击最终提交按钮 - 尝试多种选择器
+    submit_selectors = [
+        "#vm-submit",
+        'button[id="vm-submit"]',
+        'button:contains("VOTE + ADD")',
+        'button:contains("ADD 90 MINUTES")',
+        'button:contains("Submit")',
+        'button[type="submit"]',
+    ]
+    submitted = False
+    for sel in submit_selectors:
+        try:
+            if sb.is_element_visible(sel, timeout=5):
+                log.info(f"🖱️ 找到提交按钮 [{sel}], 正在点击...")
+                sb.uc_click(sel)
+                human_wait(8, 12)
+                submitted = True
+                break
+        except Exception:
+            continue
+
+    if not submitted:
+        log.warning("未找到提交按钮, 尝试 Livewire extend...")
         livewire_extend(sb)
         human_wait(5, 8)
 
@@ -598,7 +690,13 @@ def process_account(account: dict) -> dict:
             fail_count = 0
             for server in servers_to_renew:
                 try:
-                    if run_single_server(sb, site, server["num"], server["region"]):
+                    # 把 renew_url 传给 run_single_server, 优先用用户提供的完整 URL
+                    if not SERVER_LIST and server_num_from_url:
+                        url_to_use = renew_url  # 用用户提供的完整 URL
+                    else:
+                        url_to_use = None  # 让函数自己拼
+                    if run_single_server(sb, site, server["num"], server["region"],
+                                          renew_url=url_to_use):
                         success_count += 1
                     else:
                         fail_count += 1
