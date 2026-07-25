@@ -469,10 +469,21 @@ def process_account(drv, name: str, url: str, cookie: str) -> bool:
         if diff > 300:
             log(f"🎉 续期成功! +{diff//60} 分钟", "OK")
             zero_diff_count = 0  # 重置连续失败计数
+
+            # 发送成功通知
             try:
-                send_tg(f"🎉 [{name}] Pro 续期成功 (+{diff//60}分钟)", name, final_text)
-            except:
-                pass
+                tg_result = send_tg(
+                    f"🎉 续期成功",
+                    f"[{name}] {final_text}",
+                    f"+{diff//60} 分钟"
+                )
+                if tg_result:
+                    log("✅ TG 通知发送成功", "OK")
+                else:
+                    log("⚠️  TG 通知发送失败", "WARN")
+            except Exception as e:
+                log(f"⚠️  TG 通知异常: {e}", "WARN")
+
             # 成功后等待 30s 再下一轮
             time.sleep(30)
             try:
@@ -485,6 +496,21 @@ def process_account(drv, name: str, url: str, cookie: str) -> bool:
             log(f"续期失败，增量不足: {diff}s", "ERR")
             zero_diff_count += 1
             save_screenshot(drv, f"{name}_fail_r{round_num}")
+
+            # 发送失败通知
+            try:
+                tg_result = send_tg(
+                    f"❌ 续期失败",
+                    f"[{name}] {rem_text}",
+                    f"增量: {diff}s"
+                )
+                if tg_result:
+                    log("✅ TG 通知发送成功", "OK")
+                else:
+                    log("⚠️  TG 通知发送失败", "WARN")
+            except Exception as e:
+                log(f"⚠️  TG 通知异常: {e}", "WARN")
+
             time.sleep(10)
             try:
                 drv.refresh()
@@ -521,6 +547,23 @@ def build_driver() -> Driver:
 
 def main():
     log("========== Gaming4Free Pro 自动续期启动 (SeleniumBase UC v32) ==========")
+
+    # 检查 TG 配置
+    log("🔍 检查 Telegram 通知配置...")
+    from tg import check_tg_config, send_tg
+    tg_config_ok = check_tg_config()
+
+    # 如果配置了 TG，发送测试通知
+    if tg_config_ok:
+        log("📤 发送 TG 测试通知...", "INFO")
+        try:
+            test_result = send_tg("🧪 TG 通知测试", "Gaming4Free Pro", "配置检查通过")
+            if test_result:
+                log("✅ TG 测试通知发送成功", "OK")
+            else:
+                log("⚠️  TG 测试通知发送失败", "WARN")
+        except Exception as e:
+            log(f"⚠️  TG 测试通知异常: {e}", "WARN")
 
     if not ACCOUNTS:
         log("❌ 未配置任何账号 (GAME4FREE_ACCOUNTS / GAME4FREE_ACCOUNT)", "ERR")

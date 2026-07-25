@@ -33,6 +33,44 @@ tail -f debug_output/*.log
 
 ---
 
+## 📱 配置 Telegram 通知（可选）
+
+如果需要接收续期成功/失败的 Telegram 通知：
+
+### 快速配置（推荐）
+```bash
+# 1. 运行配置脚本
+./setup_tg.sh
+
+# 2. 编辑配置文件，填入你的 Bot Token 和 Chat ID
+nano .env
+# 或
+vi .env
+
+# 3. 测试通知
+./test_tg.sh
+
+# 4. 运行脚本
+xvfb-run --auto-servernum --server-args="-screen 0 1920x1080x24" python3 renew.py
+```
+
+### 手动配置
+```bash
+# 设置环境变量
+export TG_BOT_TOKEN="123456789:ABCdefGHIjklMNOpqrsTUVwxyz"
+export TG_CHAT_ID="123456789"
+
+# 验证配置
+./test_tg.sh
+
+# 运行脚本
+xvfb-run --auto-servernum --server-args="-screen 0 1920x1080x24" python3 renew.py
+```
+
+**详细说明**：[TG_SETUP.md](./TG_SETUP.md)
+
+---
+
 ## 📁 修复文件清单
 
 | 文件 | 说明 |
@@ -41,6 +79,9 @@ tail -f debug_output/*.log
 | `renew.py.bak` | 原脚本备份（自动生成） |
 | `apply_fix.sh` | 一键应用修复脚本 |
 | `test_fix.sh` | 测试脚本（检查环境和语法） |
+| `setup_tg.sh` | TG 配置快速设置脚本 |
+| `test_tg.sh` | TG 通知测试脚本 |
+| `TG_SETUP.md` | Telegram 通知详细配置指南 |
 | `REPAIR_NOTES.md` | 详细修复说明文档 |
 
 ---
