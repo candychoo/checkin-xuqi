@@ -339,7 +339,6 @@ def run():
         disable_cookies=False,
         proxy=PROXY_URL,
         ad_block=False,
-        localized=False,
     ) as sb:
 
         sb.set_window_size(1280, 800)
