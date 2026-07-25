@@ -2,7 +2,7 @@ name: AclClouds-Kaka-Renew
 
 on:
   schedule:
-    # 每天 UTC 01:00（北京时间 09:00）
+    # UTC 01:00（北京时间 09:00）
     - cron: "0 1 * * *"
   workflow_dispatch: {}
 
@@ -25,13 +25,13 @@ jobs:
 
       - name: Install dependencies
         run: |
-          pip install playwright
-          playwright install chromium
+          pip install --upgrade pip
+          pip install -r ACLClouds-server/requirements.txt
 
       - name: Run renewal
         env:
-          KAKA_GOOGLE_EMAIL: ${{ secrets.KAKA_GOOGLE_EMAIL }}
-          KAKA_GOOGLE_PASSWORD: ${{ secrets.KAKA_GOOGLE_PASSWORD }}
+          ACL_COOKIES: ${{ secrets.ACL_COOKIES }}
+          RENEW_THRESHOLD_HOURS: ${{ vars.RENEW_THRESHOLD_HOURS || '48' }}
           TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
           TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
-        run: python aclclouds-kaka-renew/renew.py
+        run: python ACLClouds-server/renew.py
