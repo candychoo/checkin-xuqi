@@ -341,8 +341,10 @@ def run():
     from seleniumbase import SB
 
     # 解析代理端口用于预检
-    port_match = re.search(r':(\d+)$', PROXY_URL.rstrip('/'))
-    proxy_port = int(port_match.group(1)) if port_match else 1080
+    proxy_port = 1080
+    if PROXY_URL:
+        port_match = re.search(r':(\d+)$', PROXY_URL.rstrip('/'))
+        proxy_port = int(port_match.group(1)) if port_match else 1080
 
     log.info("=" * 60)
     log.info("gaming4free 续期启动")
