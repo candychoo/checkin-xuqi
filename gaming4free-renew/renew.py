@@ -234,9 +234,33 @@ def do_rounds(dr, sn, su, max_rounds=10):
             except: pass
             continue
 
-        # 检测确认弹窗
-        time.sleep(1.5)
-        confirm_selectors = [
+        # ===== 检测 Turnstile 验证弹窗 =====
+        log("⏳ 等待 Turnstile 验证...")
+        for _ in range(60):  # 最多等 3 分钟
+            time.sleep(3)
+            # 检查 Turnstile 是否消失（通过检查 iframe）
+            turnstile_iframe = dr.execute_script("""
+                var iframes = document.querySelectorAll('iframe');
+                for (var i = 0; i < iframes.length; i++) {
+                    if (iframes[i].src && (iframes[i].src.indexOf('turnstile') !== -1 || iframes[i].src.indexOf('challenges.cloudflare.com') !== -1)) {
+                        return 'present';
+                    }
+                }
+                return 'gone';
+            """)
+            if turnstile_iframe == 'gone':
+                log("✅ Turnstile 验证通过")
+                break
+            # 检查时间是否已增加（提前跳出）
+            ct, cs = get_time(dr)
+            if ct:
+                diff = int(cs) - int(pre_time)
+                if diff > 300:
+                    log(f"✅ 检测到时间增加 → {ct}, +{diff}秒 (Turnstile 前)")
+                    break
+        else:
+            log("⚠️ Turnstile 等待超时")
+
             (By.XPATH, "//button[contains(text(), 'Confirm')]"),
             (By.XPATH, "//button[contains(text(), 'Yes')]"),
             (By.XPATH, "//button[contains(text(), 'OK')]"),
