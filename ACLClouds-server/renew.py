@@ -232,17 +232,49 @@ def find_expire(attrs, detail=None):
 
 
 def renew_server(session, sid):
-    """调用续期 API, 返回 (response, captcha_required_bool)"""
-    r = api_post(session, f"/api/client/servers/{sid}/upgrade/renew")
-    captcha_required = False
-    if r.status_code == 403:
-        try:
-            j = r.json()
-            if isinstance(j, dict) and j.get("code") == "captcha_required":
-                captcha_required = True
-        except Exception:
-            pass
-    return r, captcha_required
+    """调用续期 API, 返回 (response, captcha_required_bool)
+    尝试多个可能的续期 endpoint, 因为 ACLClouds 可能用不同路径
+    """
+    # 按优先级尝试多个续期 endpoint
+    renew_paths = [
+        f"/api/client/servers/{sid}/upgrade/renew",      # 原始路径
+        f"/api/client/servers/{sid}/renew",              # 简化路径
+        f"/api/client/servers/{sid}/extend",             # extend 路径
+        f"/api/client/servers/{sid}/renewal",            # renewal 路径
+    ]
+
+    last_r = None
+    for path in renew_paths:
+        r = api_post(session, path)
+        last_r = r
+        log(f"🔄 POST {path} → HTTP {r.status_code}")
+
+        # 成功就返回
+        if r.status_code in (200, 201, 202, 204):
+            return r, False
+
+        # 404 = endpoint 不存在, 试下一个
+        if r.status_code == 404:
+            continue
+
+        # 其他状态码: 打印完整响应供诊断, 但不再尝试其他 endpoint
+        captcha_required = False
+        if r.status_code == 403:
+            try:
+                j = r.json()
+                if isinstance(j, dict):
+                    # 多种可能的 captcha 字段
+                    code = j.get("code", "")
+                    if code == "captcha_required" or "captcha" in str(j).lower() or "turnstile" in str(j).lower():
+                        captcha_required = True
+            except Exception:
+                pass
+        # 打印完整响应 (调试用)
+        log(f"   响应 body: {r.text[:500]}")
+        return r, captcha_required
+
+    # 所有 endpoint 都 404
+    return last_r, False
 
 
 # ==================== 单账号续期流程 ====================
@@ -301,6 +333,17 @@ def process_account(label, cookie_str):
             continue
 
         log(f"\n[{idx}/{len(servers)}] 🖥️ {name} (id={sid}, type={stype})")
+
+        # 打印续期相关字段 (诊断用)
+        can_renew = attrs.get("can_renew")
+        is_free = attrs.get("is_free")
+        free_used = attrs.get("free_renewals_used")
+        free_remaining = attrs.get("free_renewals_remaining")
+        free_max = attrs.get("free_renewals_max")
+        auto_renew = attrs.get("auto_renew")
+        log(f"📊 续期状态: can_renew={can_renew} is_free={is_free} "
+            f"free_renewals={free_used}/{free_max} (剩余 {free_remaining}) "
+            f"auto_renew={auto_renew}")
 
         # 取到期时间 - 列表可能没有, 调详情
         _, expire_str = find_expire(attrs)
