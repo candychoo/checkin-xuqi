@@ -107,9 +107,9 @@ def build_session(cookie_str):
         # 移除 __Host- 和 __Secure- 前缀（requests 不支持这些前缀）
         clean_k = k
         if k.startswith("__Host-"):
-            clean_k = k[9:]  # 移除 "__Host-"
+            clean_k = k[7:]  # 移除 "__Host-" (7个字符)
         elif k.startswith("__Secure-"):
-            clean_k = k[9:]  # 移除 "__Secure-"
+            clean_k = k[9:]  # 移除 "__Secure-" (9个字符)
         
         # 设置 domain 为 dash.aclclouds.com
         s.cookies.set(clean_k, v, domain="dash.aclclouds.com", path="/")
