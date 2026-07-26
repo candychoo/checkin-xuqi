@@ -266,17 +266,19 @@ def inject_cookies(sb, site_url: str, cookie_str: str):
 # Cloudflare Turnstile 破解
 # ---------------------------------------------------------------------------
 def bypass_turnstile(sb) -> bool:
-    """处理 Cloudflare Turnstile - 新版 CF 自动验证, 只需等待, 不要点击
+    """处理 Cloudflare Turnstile - 对中风险 IP 需要点击 checkbox
 
-    关键: VLM 截图分析发现 CF 对话框里有 spinner '正在验证...'
-    说明 CF 在自动验证浏览器指纹, 不需要点击 checkbox
-    策略: 耐心等待 30-60 秒让 CF 自动完成验证
+    关键: IP 风险评分 60% (中度风险) 时, CF 不会自动通过, 需要点击 checkbox
+    策略:
+    1. 先等待 10 秒看是否自动通过 (低风险 IP 会自动通过)
+    2. 没通过则点击 CF checkbox (用 ActionChains, 不用 uc_gui_click_captcha)
+    3. 再等待 60 秒验证完成
     """
     try:
-        # 检测是否有 CF 验证对话框
+        # 检测是否有 CF 验证
         has_cf = False
+        cf_iframe = None
         try:
-            # 用 IIFE 包裹, 避免 'Illegal return statement' 错误
             cf_check = sb.execute_script("""
                 return (function() {
                     try {
@@ -315,6 +317,7 @@ def bypass_turnstile(sb) -> bool:
                             size = f.size
                             if size.get("width", 0) > 50:
                                 has_cf = True
+                                cf_iframe = f
                                 log.info(f"🎯 检测到 CF Turnstile iframe ({size.get('width')}x{size.get('height')})")
                                 break
                     except Exception:
@@ -326,20 +329,109 @@ def bypass_turnstile(sb) -> bool:
             log.info("未检测到 CF 验证, 跳过")
             return True
 
-        # 关键策略: CF 新版自动验证, 只需等待, 不要点击
-        # VLM 截图显示有 spinner '正在验证...', 说明正在自动验证
-        log.info("⏳ CF 正在自动验证浏览器指纹, 耐心等待 (最多 90 秒)...")
-
-        for attempt in range(18):  # 18 次 × 5 秒 = 90 秒
+        # 阶段 1: 先等待 10 秒看是否自动通过 (低风险 IP 会自动通过)
+        log.info("⏳ 阶段 1: 等待 CF 自动验证 (10 秒)...")
+        for attempt in range(2):
             time.sleep(5)
-            passed = _check_cf_passed(sb)
-            if passed:
+            if _check_cf_passed(sb):
+                log.info(f"✅ CF 自动验证通过 (第 {attempt+1} 次检测)")
+                return True
+
+        # 阶段 2: 没自动通过, 尝试点击 CF checkbox
+        # 关键: 中风险 IP (60%) 需要点击 checkbox 才能验证
+        log.info("🖱️ 阶段 2: CF 未自动通过, 尝试点击 checkbox...")
+
+        # 方法 A: 找 CF iframe 并用 ActionChains 点击 checkbox 区域
+        if cf_iframe:
+            try:
+                size = cf_iframe.size
+                width = size.get("width", 0)
+                height = size.get("height", 0)
+                log.info(f"   CF iframe 尺寸: {width}x{height}")
+                # checkbox 通常在 iframe 左侧, 距左边约 25-35px
+                for offset_x in [25, 30, 35, -25, -30]:
+                    try:
+                        ac = ActionChains(sb.driver)
+                        ac.move_to_element_with_offset(cf_iframe, offset_x - width // 2, 0).click().perform()
+                        log.info(f"   点击 iframe offset_x={offset_x}")
+                        time.sleep(1)
+                    except Exception:
+                        continue
+            except Exception as e:
+                log.warning(f"   iframe 点击失败: {e}")
+
+        # 方法 B: 用 JS 找 CF checkbox shadow DOM 并点击
+        try:
+            js_click_result = sb.execute_script("""
+                return (function() {
+                    try {
+                        // 找所有 iframe, 看 shadow DOM 里是否有 checkbox
+                        var iframes = document.querySelectorAll('iframe');
+                        for (var i = 0; i < iframes.length; i++) {
+                            var src = (iframes[i].src || '').toLowerCase();
+                            if (src.indexOf('challenges.cloudflare') === -1 && src.indexOf('turnstile') === -1) continue;
+                            // 尝试访问 iframe 内部 (同源才行)
+                            try {
+                                var doc = iframes[i].contentDocument || iframes[i].contentWindow.document;
+                                if (doc) {
+                                    var cb = doc.querySelector('input[type=checkbox], [class*="checkbox"], [class*="cb"], #cf-stage');
+                                    if (cb) {
+                                        cb.click();
+                                        return 'clicked_checkbox_in_iframe';
+                                    }
+                                    // 点击 body
+                                    var body = doc.body;
+                                    if (body) {
+                                        body.click();
+                                        return 'clicked_body_in_iframe';
+                                    }
+                                }
+                            } catch(e) {
+                                // 跨域, 无法访问
+                            }
+                        }
+                        return 'no_clickable_element';
+                    } catch(e) { return 'error: ' + e.message; }
+                })();
+            """)
+            log.info(f"   JS 点击结果: {js_click_result}")
+        except Exception as e:
+            log.warning(f"   JS 点击失败: {e}")
+
+        # 方法 C: 用 CDP 命令点击 CF iframe 中心 (绕过 Selenium 限制)
+        try:
+            if cf_iframe:
+                rect = cf_iframe.rect
+                # 用 ActionChains 点击 iframe 中心偏左 (checkbox 位置)
+                center_x = rect['x'] + 30
+                center_y = rect['y'] + rect['height'] // 2
+                log.info(f"   尝试 CDP 点击 ({center_x}, {center_y})")
+                sb.driver.execute_cdp_cmd("Input.dispatchMouseEvent", {
+                    "type": "mousePressed",
+                    "x": center_x, "y": center_y,
+                    "button": "left", "clickCount": 1,
+                })
+                time.sleep(0.2)
+                sb.driver.execute_cdp_cmd("Input.dispatchMouseEvent", {
+                    "type": "mouseReleased",
+                    "x": center_x, "y": center_y,
+                    "button": "left", "clickCount": 1,
+                })
+                log.info("   CDP 点击完成")
+        except Exception as e:
+            log.warning(f"   CDP 点击失败: {e}")
+
+        # 阶段 3: 点击后等待 60 秒验证完成
+        log.info("⏳ 阶段 3: 点击后等待 CF 验证完成 (最多 60 秒)...")
+        for attempt in range(12):  # 12 次 × 5 秒 = 60 秒
+            time.sleep(5)
+            if _check_cf_passed(sb):
                 log.info(f"✅ CF 验证通过 (第 {attempt+1} 次检测)")
                 return True
-            if attempt % 3 == 0:  # 每 15 秒打印一次状态
-                log.info(f"⏳ 等待 CF 自动验证 ({attempt+1}/18)...")
+            if attempt % 3 == 0:
+                log.info(f"⏳ 等待 CF 验证 ({attempt+1}/12)...")
 
-        log.warning("⚠️ CF 验证 90 秒未通过 (浏览器指纹可能被识别)")
+        log.warning("⚠️ CF 验证未通过 (IP 风险评分可能太高, 需要换更干净的代理)")
         return False
 
     except Exception as e:
