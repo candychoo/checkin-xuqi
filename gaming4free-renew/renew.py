@@ -266,50 +266,132 @@ def inject_cookies(sb, site_url: str, cookie_str: str):
 # Cloudflare Turnstile 破解
 # ---------------------------------------------------------------------------
 def bypass_turnstile(sb) -> bool:
-    """手动破解 Cloudflare Turnstile，返回是否成功"""
+    """手动破解 Cloudflare Turnstile, 支持 iframe 和 inline widget 两种模式"""
     try:
+        # 模式 1: 找 Turnstile iframe (传统模式)
         cf_iframe = None
         iframes = sb.driver.find_elements("tag name", "iframe")
         for f in iframes:
             src = f.get_attribute("src") or ""
-            if "cloudflare" in src.lower() or "turnstile" in src.lower():
+            if "cloudflare" in src.lower() or "turnstile" in src.lower() or "challenges.cloudflare" in src.lower():
                 cf_iframe = f
                 break
 
-        if not cf_iframe:
-            log.info("未检测到 Turnstile iframe，跳过")
+        # 模式 2: 找 Cloudflare 验证对话框 (inline widget, 新模式)
+        # 截图显示: "Verify you're human to continue" + "正在验证..." + Cancel 按钮
+        cf_dialog = None
+        try:
+            cf_dialog = sb.execute_script("""
+                try {
+                    // 找含 'Verify' / 'human' / '验证' 文字的对话框
+                    var els = document.querySelectorAll('div, section, [role=dialog], [class*="cf"], [class*="cloudflare"], [class*="turnstile"]');
+                    for (var i = 0; i < els.length; i++) {
+                        var t = (els[i].innerText || '').toLowerCase();
+                        if ((t.indexOf('verify') !== -1 && t.indexOf('human') !== -1) ||
+                            t.indexOf('正在验证') !== -1 ||
+                            t.indexOf('人机验证') !== -1 ||
+                            (t.indexOf('cloudflare') !== -1 && els[i].getBoundingClientRect().width > 100)) {
+                            return els[i];
+                        }
+                    }
+                    return null;
+                } catch(e) { return null; }
+            """)
+        except Exception:
+            pass
+
+        if not cf_iframe and not cf_dialog:
+            log.info("未检测到 Turnstile iframe 或验证对话框，跳过")
             return True
 
-        size = cf_iframe.size
-        width = size.get("width", 0)
-        log.info(f"🎯 锁定 Turnstile iframe! 尺寸: {width}x{size.get('height', '?')}")
+        target = cf_iframe if cf_iframe else cf_dialog
+        target_type = "iframe" if cf_iframe else "dialog"
+        log.info(f"🎯 锁定 Turnstile {target_type}!")
 
-        if width > 0:
-            center_x_offset = int(-(width / 2) + 30)
-            for offset in [center_x_offset - 15, center_x_offset, center_x_offset + 15]:
+        # 尝试点击 (iframe 用 offset 点击, dialog 直接点击)
+        if cf_iframe:
+            size = cf_iframe.size
+            width = size.get("width", 0)
+            log.info(f"   iframe 尺寸: {width}x{size.get('height', '?')}")
+            if width > 0:
+                center_x_offset = int(-(width / 2) + 30)
+                for offset in [center_x_offset - 15, center_x_offset, center_x_offset + 15]:
+                    try:
+                        ac = ActionChains(sb.driver)
+                        ac.move_to_element(cf_iframe).move_by_offset(offset, 0).click().perform()
+                        time.sleep(0.5)
+                    except Exception:
+                        pass
+        else:
+            # dialog 模式: 找里面的 checkbox 或直接点击
+            try:
+                size = cf_dialog.size
+                log.info(f"   dialog 尺寸: {size.get('width')}x{size.get('height')}")
+                # 尝试点击 dialog 内的 checkbox / button
+                sb.execute_script("""
+                    try {
+                        var d = arguments[0];
+                        // 找 checkbox
+                        var cb = d.querySelector('input[type=checkbox], [class*="checkbox"], [class*="cb"]');
+                        if (cb) { cb.click(); return; }
+                        // 找 button (排除 Cancel)
+                        var btns = d.querySelectorAll('button, [role=button]');
+                        for (var i = 0; i < btns.length; i++) {
+                            var t = (btns[i].innerText || '').trim().toLowerCase();
+                            if (t && t !== 'cancel' && t !== '取消') {
+                                btns[i].click(); return;
+                            }
+                        }
+                    } catch(e) {}
+                """, cf_dialog)
+                # 也用 ActionChains 点击 dialog 中心
                 try:
                     ac = ActionChains(sb.driver)
-                    ac.move_to_element(cf_iframe).move_by_offset(offset, 0).click().perform()
+                    ac.move_to_element(cf_dialog).click().perform()
                     time.sleep(0.5)
                 except Exception:
                     pass
+            except Exception as e:
+                log.warning(f"点击 dialog 失败: {e}")
 
-        # 等待验证回调
-        for attempt in range(4):
-            log.info(f"⏳ 等待验证回调 ({attempt+1}/4)...")
-            time.sleep(6)
+        # 等待验证回调 (Cloudflare 自动通过后会返回 token)
+        for attempt in range(8):  # 增加等待次数到 8
+            log.info(f"⏳ 等待 Cloudflare 验证 ({attempt+1}/8)...")
+            time.sleep(5)
             try:
+                # 检测 1: cf-turnstile-response 隐藏 input
                 token = sb.execute_script(
-                    "var el = document.querySelector('[name=\"cf-turnstile-response\"]');"
-                    "return el ? el.value : '';"
+                    "var els = document.querySelectorAll('[name=\"cf-turnstile-response\"], [name=\"g-recaptcha-response\"]');"
+                    "for (var i = 0; i < els.length; i++) { if (els[i].value && els[i].value.length > 20) return els[i].value; }"
+                    "return '';"
                 )
                 if token and len(token) > 20:
-                    log.info("✅ 已获取 Cloudflare 凭证")
+                    log.info("✅ 已获取 Cloudflare 凭证 (token)")
                     return True
+
+                # 检测 2: 验证对话框是否消失 (说明验证通过)
+                still_there = sb.execute_script("""
+                    try {
+                        var els = document.querySelectorAll('div, section, [role=dialog]');
+                        for (var i = 0; i < els.length; i++) {
+                            var t = (els[i].innerText || '').toLowerCase();
+                            if ((t.indexOf('verify') !== -1 && t.indexOf('human') !== -1) ||
+                                t.indexOf('正在验证') !== -1) {
+                                var rect = els[i].getBoundingClientRect();
+                                if (rect.width > 100) return true;
+                            }
+                        }
+                        return false;
+                    } catch(e) { return false; }
+                """)
+                if not still_there:
+                    log.info("✅ Cloudflare 验证对话框已消失 (验证通过)")
+                    return True
+
             except Exception:
                 pass
 
-        log.warning("⚠️ 未确认凭证")
+        log.warning("⚠️ Cloudflare 验证未通过 (8 次检测均未确认)")
         return False
     except Exception as e:
         log.warning(f"Turnstile 处理异常: {e}")
