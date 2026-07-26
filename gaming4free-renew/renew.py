@@ -765,7 +765,7 @@ def run_single_server(sb, site_url: str, server_num: str, region: str,
                     resp.clone().text().then(function(t) {
                         window.__renew_fetch_log.push({
                             method: method, url: url,
-                            status: resp.status, response: t.substring(0, 200)
+                            status: resp.status, response: t.substring(0, 300)
                         });
                     });
                     return resp;
@@ -784,7 +784,7 @@ def run_single_server(sb, site_url: str, server_num: str, region: str,
         try:
             toast = sb.execute_script("""
                 try {
-                    // 找 toast / notification / alert
+                    // 找 toast / notification / alert (排除 Server Installation 等无关通知)
                     var sels = [
                         '.fi-notification', '.fi-toast', '.toast', '.alert',
                         '[class*=\"toast\"]', '[class*=\"notification\"]',
@@ -840,6 +840,9 @@ def run_single_server(sb, site_url: str, server_num: str, region: str,
         log.warning(f"URL 检查失败: {e}")
 
     # 打印捕获的网络请求 (关键诊断!)
+    # 同时分析是否有续期相关请求 + 冷却状态
+    in_cooldown = False
+    cooldown_seconds = 0
     try:
         xhr_log = sb.execute_script("return JSON.stringify(window.__renew_xhr_log || [])")
         fetch_log = sb.execute_script("return JSON.stringify(window.__renew_fetch_log || [])")
@@ -851,10 +854,32 @@ def run_single_server(sb, site_url: str, server_num: str, region: str,
             log.info(f"   XHR {x.get('method')} {x.get('url')} → {x.get('status')}")
             log.info(f"      响应: {x.get('response', '')[:150]}")
         for f in fetches:
+            resp_str = f.get('response', '') or ''
             log.info(f"   FETCH {f.get('method')} {f.get('url')} → {f.get('status')}")
-            log.info(f"      响应: {f.get('response', '')[:150]}")
+            log.info(f"      响应: {resp_str[:200]}")
+            # 关键: 检测响应中是否含 cooldown 信息
+            if 'cooldownExpiry' in resp_str or 'cooldown' in resp_str.lower():
+                # 提取 cooldownExpiry 的值
+                import re as _re
+                m = _re.search(r'"cooldownExpiry"\s*:\s*(\d+)', resp_str)
+                if m:
+                    cooldown_seconds = int(m.group(1))
+                    if cooldown_seconds > 0:
+                        in_cooldown = True
+                        log.info(f"   ⏳ 检测到冷却: cooldownExpiry={cooldown_seconds}s")
+                # 也检测 expiresTimestamp (续期后的新到期时间)
+                m2 = _re.search(r'"expiresTimestamp"\s*:\s*(\d+)', resp_str)
+                if m2:
+                    exp_ts = int(m2.group(1))
+                    from datetime import datetime as _dt, timezone as _tz
+                    exp_dt = _dt.fromtimestamp(exp_ts, tz=_tz.utc)
+                    log.info(f"   📅 检测到到期时间戳: {exp_dt.isoformat()} (timestamp={exp_ts})")
     except Exception as e:
         log.warning(f"获取网络日志失败: {e}")
+
+    if in_cooldown:
+        log.info(f"✅ 检测到冷却状态 ({cooldown_seconds}s), 说明续期请求已被服务器接收!")
+        log.info(f"✅ 冷却期内再次点击不会增加时间, 但本次点击已生效")
 
     # 检查是否有真正的 modal
     try:
@@ -885,59 +910,6 @@ def run_single_server(sb, site_url: str, server_num: str, region: str,
         import json as _json
         modal_info = _json.loads(real_modal) if real_modal else {}
         log.info(f"🔍 真 Modal 检测: {modal_info}")
-        if modal_info.get("found"):
-            log.info("🪟 检测到真正的确认对话框, 按钮列表:")
-            for btn_text in (modal_info.get("buttons") or []):
-                log.info(f"     - {btn_text!r}")
-            js_result = sb.execute_script("""
-                try {
-                    var modal = document.querySelector(
-                        '[role=\"dialog\"], .fi-modal-content, .fi-modal-body, [class*=\"modal-content\"], [class*=\"dialog-content\"]'
-                    );
-                    if (!modal) return 'no_modal';
-                    var btns = modal.querySelectorAll('button, a, [role=button]');
-                    var exclude = ['cancel', '取消', 'close', '关闭', 'x', ''];
-                    var preferKeywords = ['confirm', 'vote', 'add 90', 'extend', 'renew', 'submit', 'yes', 'ok', 'continue', 'proceed', 'go', 'add'];
-                    for (var i = 0; i < btns.length; i++) {
-                        var el = btns[i];
-                        if (el.disabled) continue;
-                        var t = (el.innerText || '').trim();
-                        var tl = t.toLowerCase();
-                        if (t.length === 0 || t.length > 40) continue;
-                        var isExcluded = false;
-                        for (var j = 0; j < exclude.length; j++) {
-                            if (tl === exclude[j]) { isExcluded = true; break; }
-                        }
-                        if (isExcluded) continue;
-                        for (var k = 0; k < preferKeywords.length; k++) {
-                            if (tl.indexOf(preferKeywords[k]) !== -1) {
-                                el.scrollIntoView({block: 'center', behavior: 'instant'});
-                                el.click();
-                                return 'clicked: ' + t;
-                            }
-                        }
-                    }
-                    var candidates = [];
-                    for (var i2 = 0; i2 < btns.length; i2++) {
-                        var t2 = (btns[i2].innerText || '').trim().toLowerCase();
-                        if (t2 && t2 !== 'cancel' && t2 !== 'close' && !btns[i2].disabled) {
-                            candidates.push(btns[i2]);
-                        }
-                    }
-                    if (candidates.length > 0) {
-                        var last = candidates[candidates.length - 1];
-                        last.scrollIntoView({block: 'center', behavior: 'instant'});
-                        last.click();
-                        return 'clicked_last: ' + (last.innerText || '').trim();
-                    }
-                    return 'no_btn_in_modal';
-                } catch(e) { return 'error: ' + e.message; }
-            """)
-            log.info(f"JS modal 内点击结果: {js_result}")
-            if js_result and "clicked" in str(js_result).lower():
-                human_wait(8, 12)
-                bypass_turnstile(sb)
-                human_wait(3, 5)
     except Exception as e:
         log.warning(f"真 Modal 检测失败: {e}")
 
@@ -979,6 +951,22 @@ def run_single_server(sb, site_url: str, server_num: str, region: str,
     sec_after = time_to_seconds(timestamp_after)
 
     # 判断是否成功
+    # 关键改进: 如果检测到冷却状态, 即使时间没增加也视为成功
+    # (冷却期内再次点击不增加时间, 但本次点击已生效)
+    if in_cooldown:
+        log.info(f"✅ 续期成功 (冷却状态, 时间未增加但请求已生效)")
+        log.info(f"   冷却剩余: {cooldown_seconds}s, 期间无法再次续期")
+        final_shot = screenshot(sb, f"cooldown_{server_num}")
+        msg = (
+            f"✅ [{region}] 续期成功 (冷却中)\n"
+            f"🖥️ 编号: {server_num}\n"
+            f"🕒 续期前: {timestamp_before}\n"
+            f"🕒 续期后: {timestamp_after}\n"
+            f"⏳ 冷却剩余: {cooldown_seconds}s"
+        )
+        tg(msg, photo_path=str(final_shot))
+        return True
+
     if sec_after <= sec_before + 60 and sec_before != 0:
         raise Exception(
             f"❌ 时间未增加！(前: {timestamp_before}, 后: {timestamp_after})"
