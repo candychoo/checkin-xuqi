@@ -266,169 +266,124 @@ def inject_cookies(sb, site_url: str, cookie_str: str):
 # Cloudflare Turnstile 破解
 # ---------------------------------------------------------------------------
 def bypass_turnstile(sb) -> bool:
-    """破解 Cloudflare Turnstile, 支持 iframe / inline widget / SeleniumBase 内置方法"""
+    """处理 Cloudflare Turnstile - 新版 CF 自动验证, 只需等待, 不要点击
+
+    关键: VLM 截图分析发现 CF 对话框里有 spinner '正在验证...'
+    说明 CF 在自动验证浏览器指纹, 不需要点击 checkbox
+    策略: 耐心等待 30-60 秒让 CF 自动完成验证
+    """
     try:
-        # 方法 1: 优先用 SeleniumBase 内置的 UC GUI click (最有效)
-        # SeleniumBase 4.x 有 uc_gui_click_captcha() 专门处理 CF Turnstile
+        # 检测是否有 CF 验证对话框
+        has_cf = False
         try:
-            log.info("🛡️ 尝试 SeleniumBase uc_gui_click_captcha()...")
-            sb.uc_gui_click_captcha()
-            log.info("✅ uc_gui_click_captcha() 已调用")
-            time.sleep(3)
-            # 检测是否通过
-            if _check_cf_passed(sb):
-                return True
-        except AttributeError:
-            log.info("ℹ️ SeleniumBase 版本不支持 uc_gui_click_captcha, 用手动方法")
-        except Exception as e:
-            log.warning(f"uc_gui_click_captcha 失败: {e}")
-
-        # 方法 2: 找 Turnstile iframe (传统模式)
-        cf_iframe = None
-        iframes = sb.driver.find_elements("tag name", "iframe")
-        for f in iframes:
-            try:
-                src = f.get_attribute("src") or ""
-                if "cloudflare" in src.lower() or "turnstile" in src.lower() or "challenges.cloudflare" in src.lower():
-                    size = f.size
-                    if size.get("width", 0) > 50:  # 排除隐藏的 iframe
-                        cf_iframe = f
-                        break
-            except Exception:
-                continue
-
-        # 方法 3: 找 Cloudflare 验证对话框 (inline widget)
-        # 关键: 要找小尺寸的对话框 (300-600px), 不是整个页面 (1266px)
-        cf_dialog = None
-        try:
-            cf_dialog_info = sb.execute_script("""
-                try {
-                    var best = null;
-                    var bestArea = 999999999;
-                    var els = document.querySelectorAll('div, section, [role=dialog]');
-                    for (var i = 0; i < els.length; i++) {
-                        var el = els[i];
-                        var rect = el.getBoundingClientRect();
-                        if (rect.width < 100 || rect.height < 50) continue;
-                        var t = (el.innerText || '').toLowerCase();
-                        // 匹配 Cloudflare 验证文字
-                        var isCf = ((t.indexOf('verify') !== -1 && t.indexOf('human') !== -1) ||
-                                    t.indexOf('正在验证') !== -1 ||
-                                    t.indexOf('人机验证') !== -1);
-                        if (!isCf) continue;
-                        // 选择面积最小的 (最精确的对话框)
-                        var area = rect.width * rect.height;
-                        if (area < bestArea) {
-                            bestArea = area;
-                            best = {
-                                width: rect.width, height: rect.height,
-                                top: rect.top, left: rect.left,
-                                text: t.substring(0, 100)
-                            };
+            # 用 IIFE 包裹, 避免 'Illegal return statement' 错误
+            cf_check = sb.execute_script("""
+                (function() {
+                    try {
+                        var els = document.querySelectorAll('div, section, [role=dialog]');
+                        for (var i = 0; i < els.length; i++) {
+                            var rect = els[i].getBoundingClientRect();
+                            if (rect.width < 100 || rect.width > 900) continue;
+                            var t = (els[i].innerText || '').toLowerCase();
+                            if ((t.indexOf('verify') !== -1 && t.indexOf('human') !== -1) ||
+                                t.indexOf('正在验证') !== -1 ||
+                                t.indexOf('人机验证') !== -1) {
+                                return JSON.stringify({found: true, width: rect.width, text: t.substring(0, 80)});
+                            }
                         }
-                    }
-                    return best ? JSON.stringify(best) : '';
-                } catch(e) { return ''; }
+                        return JSON.stringify({found: false});
+                    } catch(e) { return JSON.stringify({found: false, error: e.message}); }
+                })();
             """)
-            if cf_dialog_info:
-                import json as _json
-                info = _json.loads(cf_dialog_info)
-                log.info(f"🎯 找到 Cloudflare 对话框: {info['width']:.0f}x{info['height']:.0f} @ ({info['left']:.0f},{info['top']:.0f})")
-                log.info(f"   文字: {info['text'][:80]}")
-                # 真正的对话框尺寸应该是 300-800px, 不是 1266px
-                if 200 < info['width'] < 900 and 100 < info['height'] < 600:
-                    cf_dialog = info
-                    log.info(f"✅ 对话框尺寸合理, 视为有效")
-                else:
-                    log.info(f"⚠️ 对话框尺寸异常 (太大或太小), 跳过")
+            import json as _json
+            info = _json.loads(cf_check) if cf_check else {}
+            if info.get("found"):
+                has_cf = True
+                log.info(f"🎯 检测到 CF 验证对话框 (宽 {info.get('width', 0):.0f}px)")
+                log.info(f"   文字: {info.get('text', '')[:80]}")
         except Exception as e:
-            log.warning(f"检测 Cloudflare 对话框失败: {e}")
+            log.warning(f"CF 检测失败: {e}")
 
-        if not cf_iframe and not cf_dialog:
-            log.info("未检测到 Turnstile iframe 或验证对话框，跳过")
+        # 也检测 iframe 模式
+        if not has_cf:
+            try:
+                iframes = sb.driver.find_elements("tag name", "iframe")
+                for f in iframes:
+                    try:
+                        src = f.get_attribute("src") or ""
+                        if "challenges.cloudflare" in src or "turnstile" in src.lower():
+                            size = f.size
+                            if size.get("width", 0) > 50:
+                                has_cf = True
+                                log.info(f"🎯 检测到 CF Turnstile iframe ({size.get('width')}x{size.get('height')})")
+                                break
+                    except Exception:
+                        continue
+            except Exception:
+                pass
+
+        if not has_cf:
+            log.info("未检测到 CF 验证, 跳过")
             return True
 
-        # 尝试点击 iframe (如果有)
-        if cf_iframe:
-            try:
-                size = cf_iframe.size
-                width = size.get("width", 0)
-                log.info(f"🎯 锁定 Turnstile iframe! 尺寸: {width}x{size.get('height', '?')}")
-                if width > 0:
-                    center_x_offset = int(-(width / 2) + 30)
-                    for offset in [center_x_offset - 15, center_x_offset, center_x_offset + 15]:
-                        try:
-                            ac = ActionChains(sb.driver)
-                            ac.move_to_element(cf_iframe).move_by_offset(offset, 0).click().perform()
-                            time.sleep(0.5)
-                        except Exception:
-                            pass
-            except Exception as e:
-                log.warning(f"点击 iframe 失败: {e}")
+        # 关键策略: CF 新版自动验证, 只需等待, 不要点击
+        # VLM 截图显示有 spinner '正在验证...', 说明正在自动验证
+        log.info("⏳ CF 正在自动验证浏览器指纹, 耐心等待 (最多 90 秒)...")
 
-        # 等待 Cloudflare 自动验证 (新版 CF 通常自动验证, 不需要点击)
-        # 关键改进: 等待更长时间 (CF 自动验证可能需要 30-60 秒)
-        for attempt in range(12):  # 12 次 × 5 秒 = 60 秒
-            log.info(f"⏳ 等待 Cloudflare 自动验证 ({attempt+1}/12)...")
+        for attempt in range(18):  # 18 次 × 5 秒 = 90 秒
             time.sleep(5)
-            if _check_cf_passed(sb):
-                log.info(f"✅ Cloudflare 验证通过 (第 {attempt+1} 次检测)")
+            passed = _check_cf_passed(sb)
+            if passed:
+                log.info(f"✅ CF 验证通过 (第 {attempt+1} 次检测)")
                 return True
+            if attempt % 3 == 0:  # 每 15 秒打印一次状态
+                log.info(f"⏳ 等待 CF 自动验证 ({attempt+1}/18)...")
 
-        log.warning("⚠️ Cloudflare 验证未通过 (60 秒内未确认)")
+        log.warning("⚠️ CF 验证 90 秒未通过 (浏览器指纹可能被识别)")
         return False
+
     except Exception as e:
         log.warning(f"Turnstile 处理异常: {e}")
-        return True
+        return False
 
 
 def _check_cf_passed(sb) -> bool:
-    """检测 Cloudflare 验证是否通过"""
+    """检测 CF 验证是否通过 (用 IIFE 包裹 JS 避免 return 错误)"""
     try:
-        # 检测 1: cf-turnstile-response 隐藏 input 有 token
-        token = sb.execute_script(
-            "var els = document.querySelectorAll('[name=\"cf-turnstile-response\"], [name=\"g-recaptcha-response\"]');"
-            "for (var i = 0; i < els.length; i++) { if (els[i].value && els[i].value.length > 20) return els[i].value; }"
-            "return '';"
-        )
-        if token and len(token) > 20:
-            log.info("✅ 检测到 Cloudflare token")
-            return True
-
-        # 检测 2: 验证对话框消失 (说明验证通过, modal 关闭)
-        still_there = sb.execute_script("""
-            try {
-                var els = document.querySelectorAll('div, section, [role=dialog]');
-                for (var i = 0; i < els.length; i++) {
-                    var rect = els[i].getBoundingClientRect();
-                    if (rect.width < 100) continue;
-                    var t = (els[i].innerText || '').toLowerCase();
-                    if ((t.indexOf('verify') !== -1 && t.indexOf('human') !== -1) ||
-                        t.indexOf('正在验证') !== -1) {
-                        return true;
+        result = sb.execute_script("""
+            (function() {
+                try {
+                    // 检测 1: cf-turnstile-response 有 token
+                    var els = document.querySelectorAll('[name="cf-turnstile-response"], [name="g-recaptcha-response"]');
+                    for (var i = 0; i < els.length; i++) {
+                        if (els[i].value && els[i].value.length > 20) return 'token';
                     }
-                }
-                return false;
-            } catch(e) { return false; }
+                    // 检测 2: CF 验证对话框消失
+                    var dialogs = document.querySelectorAll('div, section, [role=dialog]');
+                    for (var j = 0; j < dialogs.length; j++) {
+                        var rect = dialogs[j].getBoundingClientRect();
+                        if (rect.width < 100 || rect.width > 900) continue;
+                        var t = (dialogs[j].innerText || '').toLowerCase();
+                        if ((t.indexOf('verify') !== -1 && t.indexOf('human') !== -1) ||
+                            t.indexOf('正在验证') !== -1) {
+                            return 'still_there';
+                        }
+                    }
+                    // 检测 3: 页面出现 Success / Verified 文字
+                    var body = document.body.innerText || '';
+                    if (body.indexOf('Success') !== -1 || body.indexOf('Verified') !== -1) {
+                        return 'success_text';
+                    }
+                    return 'passed';
+                } catch(e) { return 'error:' + e.message; }
+            })();
         """)
-        if not still_there:
-            return True
-
-        # 检测 3: 页面文字从 "正在验证" 变成 "Success" / "Verified"
-        success_text = sb.execute_script("""
-            try {
-                var body = document.body.innerText || '';
-                if (body.indexOf('Success') !== -1 || body.indexOf('Verified') !== -1 ||
-                    body.indexOf('成功') !== -1) return true;
-                return false;
-            } catch(e) { return false; }
-        """)
-        if success_text:
-            return True
-
+        if result and result not in ('still_there',) and not result.startswith('error'):
+            if result in ('token', 'success_text', 'passed'):
+                return True
+        return False
     except Exception:
-        pass
-    return False
+        return False
 
 
 # ---------------------------------------------------------------------------
@@ -704,22 +659,21 @@ def run_single_server(sb, site_url: str, server_num: str, region: str,
     # 续期前时间 - 优先用 JS 精确提取 (页面是 Filament 框架, 时间格式 "HH:MM:SSremaining")
     timestamp_before = "未知"
     try:
-        # 用 JS 找含 HH:MM:SS 的元素 (更精确)
+        # 用 JS 找含 HH:MM:SS 的元素 (用 IIFE 包裹避免 return 错误)
         time_text = sb.execute_script("""
-            try {
-                // 1. 先找已知 class (rt-timer / sd-timer)
-                var known = document.querySelector('.rt-timer, #sd-timer, .sd-timer');
-                if (known) return known.innerText.trim();
-                // 2. 找所有元素, 匹配 HH:MM:SS 格式 (允许后面跟 'remaining' 等文字)
-                var els = document.querySelectorAll('div, span, p, h1, h2, h3, h4, h5, h6');
-                for (var i = 0; i < els.length; i++) {
-                    var t = (els[i].innerText || '').trim();
-                    // 精确匹配: 数字:数字:数字 开头, 长度 < 30
-                    var m = t.match(/^(\\d{1,2}:\\d{2}:\\d{2})/);
-                    if (m && t.length < 30) return m[1];
-                }
-                return '';
-            } catch(e) { return ''; }
+            (function() {
+                try {
+                    var known = document.querySelector('.rt-timer, #sd-timer, .sd-timer');
+                    if (known) return known.innerText.trim();
+                    var els = document.querySelectorAll('div, span, p, h1, h2, h3, h4, h5, h6');
+                    for (var i = 0; i < els.length; i++) {
+                        var t = (els[i].innerText || '').trim();
+                        var m = t.match(/^(\\d{1,2}:\\d{2}:\\d{2})/);
+                        if (m && t.length < 30) return m[1];
+                    }
+                    return '';
+                } catch(e) { return ''; }
+            })();
         """)
         if time_text:
             # 提取 HH:MM:SS 部分
@@ -1030,21 +984,23 @@ def run_single_server(sb, site_url: str, server_num: str, region: str,
 
     time.sleep(5)
 
-    # 续期后时间 - 同样用 JS 精确提取
+    # 续期后时间 - 同样用 JS 精确提取 (用 IIFE 包裹)
     timestamp_after = "未知"
     try:
         time_text = sb.execute_script("""
-            try {
-                var known = document.querySelector('.rt-timer, #sd-timer, .sd-timer');
-                if (known) return known.innerText.trim();
-                var els = document.querySelectorAll('div, span, p, h1, h2, h3, h4, h5, h6');
-                for (var i = 0; i < els.length; i++) {
-                    var t = (els[i].innerText || '').trim();
-                    var m = t.match(/^(\\d{1,2}:\\d{2}:\\d{2})/);
-                    if (m && t.length < 30) return m[1];
-                }
-                return '';
-            } catch(e) { return ''; }
+            (function() {
+                try {
+                    var known = document.querySelector('.rt-timer, #sd-timer, .sd-timer');
+                    if (known) return known.innerText.trim();
+                    var els = document.querySelectorAll('div, span, p, h1, h2, h3, h4, h5, h6');
+                    for (var i = 0; i < els.length; i++) {
+                        var t = (els[i].innerText || '').trim();
+                        var m = t.match(/^(\\d{1,2}:\\d{2}:\\d{2})/);
+                        if (m && t.length < 30) return m[1];
+                    }
+                    return '';
+                } catch(e) { return ''; }
+            })();
         """)
         if time_text:
             m = re.search(r"(\d{1,2}:\d{2}:\d{2})", time_text)
