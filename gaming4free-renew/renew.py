@@ -843,80 +843,84 @@ def run_single_server(sb, site_url: str, server_num: str, region: str,
     # 这能绕过按钮 disabled 状态, 直接触发续期
     if clicked:
         try:
-            log.info("🔧 尝试用 JS 直接调用 Livewire 续期方法 (绕过按钮状态)...")
-            # 关键: 精准定位 renewal-timer 组件 (含 expiresTimestamp/adRewardsToday)
-            # 尝试多种可能的方法名: extend / renew / watchAd / claimAdReward / addTime
+            log.info("🔧 尝试用 JS 直接调用续期方法 (绕过按钮状态)...")
+            # 关键发现: 这是 Alpine.js 组件, 不是 Livewire!
+            # 按钮 @click 逻辑:
+            #   isNativeApp ? watchAd() : (adRewardReady ? watchWebAd() : showExtendCaptcha())
+            # 方法在 Alpine.$data 上, 用 Alpine API 调用
             lw_result = sb.execute_script("""
                 return (function() {
                     try {
                         var results = [];
-                        // 1. 列出所有 Livewire 组件 (诊断用)
-                        var wireEls = document.querySelectorAll('[wire\\\\:id]');
-                        results.push('wire_elements: ' + wireEls.length);
-
-                        // 2. 找 renewal-timer 组件 (优先)
-                        var targetComponent = null;
-                        var targetWireId = null;
-                        for (var i = 0; i < wireEls.length; i++) {
-                            var wireId = wireEls[i].getAttribute('wire\\\\:id');
-                            if (!wireId || !window.Livewire) continue;
-                            try {
-                                var comp = window.Livewire.find(wireId);
-                                if (comp && comp.$wire) {
-                                    // 检查是否是 renewal-timer (含 serverId/expiresTimestamp)
-                                    var data = comp.$wire.__instance ? comp.$wire.__instance.data : null;
-                                    var dataStr = data ? JSON.stringify(data) : '';
-                                    if (dataStr.indexOf('expiresTimestamp') !== -1 || dataStr.indexOf('adRewardsToday') !== -1) {
-                                        targetComponent = comp;
-                                        targetWireId = wireId;
-                                        results.push('found renewal-timer: wireId=' + wireId);
-                                        results.push('data keys: ' + Object.keys(data || {}).join(','));
-                                        // 列出 $wire 上所有可调用的方法
-                                        var methods = [];
-                                        for (var k in comp.$wire) {
-                                            if (typeof comp.$wire[k] === 'function' && k !== 'constructor' && k.indexOf('$') !== 0) {
-                                                methods.push(k);
-                                            }
-                                        }
-                                        results.push('methods: ' + methods.join(','));
-                                        break;
-                                    }
-                                }
-                            } catch(e) {}
+                        // 1. 检查是否有 Alpine
+                        if (typeof window.Alpine === 'undefined') {
+                            results.push('no_alpine');
+                        } else {
+                            results.push('alpine_found');
                         }
 
-                        // 3. 如果没找到 renewal-timer, 用第一个组件
-                        if (!targetComponent && wireEls.length > 0) {
-                            for (var j = 0; j < wireEls.length; j++) {
-                                var wid = wireEls[j].getAttribute('wire\\\\:id');
-                                if (wid && window.Livewire) {
-                                    try {
-                                        var c = window.Livewire.find(wid);
-                                        if (c && c.$wire) {
-                                            targetComponent = c;
-                                            targetWireId = wid;
-                                            results.push('using first component: wireId=' + wid);
-                                            break;
-                                        }
-                                    } catch(e) {}
-                                }
-                            }
-                        }
-
-                        if (!targetComponent) {
-                            results.push('no_component_found');
+                        // 2. 找 rt-btn-free 按钮的 Alpine 组件
+                        var btn = document.querySelector('button.rt-btn-free');
+                        if (!btn) {
+                            results.push('no_btn');
                             return results.join(' | ');
                         }
 
-                        // 4. 尝试多种方法名
-                        var methodsToTry = ['extend', 'renew', 'watchAd', 'claimAdReward', 'addTime', 'add_time', 'vote', 'claim'];
+                        // 3. 获取 Alpine 数据 (Alpine.js 会把 $data 存在元素上)
+                        var alpineData = null;
+                        try {
+                            // Alpine 3.x: 用 Alpine.$data(el) 获取响应式数据
+                            if (window.Alpine && window.Alpine.$data) {
+                                alpineData = window.Alpine.$data(btn);
+                                results.push('alpine_data_found_via_$data');
+                            }
+                        } catch(e) {
+                            results.push('Alpine.$data error: ' + e.message);
+                        }
+
+                        // 兜底: 从父元素链找 Alpine 数据
+                        if (!alpineData) {
+                            var el = btn;
+                            for (var i = 0; i < 10 && el; i++) {
+                                try {
+                                    if (el._x_dataStack) {
+                                        alpineData = el._x_dataStack[0];
+                                        results.push('alpine_data_found_via_x_dataStack at depth=' + i);
+                                        break;
+                                    }
+                                } catch(e) {}
+                                el = el.parentElement;
+                            }
+                        }
+
+                        if (!alpineData) {
+                            results.push('no_alpine_data');
+                            return results.join(' | ');
+                        }
+
+                        // 4. 列出 alpineData 的所有属性和方法 (诊断)
+                        var keys = [];
+                        var methods = [];
+                        for (var k in alpineData) {
+                            try {
+                                if (typeof alpineData[k] === 'function') {
+                                    methods.push(k);
+                                } else {
+                                    keys.push(k + '=' + JSON.stringify(alpineData[k]).substring(0, 30));
+                                }
+                            } catch(e) {}
+                        }
+                        results.push('methods: ' + methods.join(','));
+                        results.push('state: ' + keys.join(', ').substring(0, 300));
+
+                        // 5. 尝试调用续期方法 (按优先级)
+                        var methodsToTry = ['watchWebAd', 'watchAd', 'showExtendCaptcha', 'extend', 'renew'];
                         for (var m = 0; m < methodsToTry.length; m++) {
                             var methodName = methodsToTry[m];
                             try {
-                                // 先检查方法是否存在
-                                if (typeof targetComponent.$wire[methodName] === 'function') {
+                                if (typeof alpineData[methodName] === 'function') {
                                     results.push('calling ' + methodName + '...');
-                                    var r = targetComponent.$wire.call(methodName);
+                                    var r = alpineData[methodName]();
                                     results.push(methodName + ' called: ' + JSON.stringify(r).substring(0, 100));
                                     return results.join(' | ');
                                 }
@@ -925,23 +929,14 @@ def run_single_server(sb, site_url: str, server_num: str, region: str,
                             }
                         }
 
-                        // 5. v2 emit 兜底
-                        if (window.livewire) {
-                            try {
-                                window.livewire.emit('extend');
-                                results.push('v2_emit_extend');
-                                return results.join(' | ');
-                            } catch(e) {}
-                        }
-
                         results.push('no_method_worked');
                         return results.join(' | ');
                     } catch(e) { return 'error: ' + e.message; }
                 })();
             """)
-            log.info(f"Livewire 调用结果: {lw_result}")
+            log.info(f"Alpine 调用结果: {lw_result}")
         except Exception as e:
-            log.warning(f"JS 调用 Livewire 失败: {e}")
+            log.warning(f"JS 调用 Alpine 失败: {e}")
 
     if not clicked:
         log.warning("所有方法都未找到续期按钮，尝试 Livewire extend...")
