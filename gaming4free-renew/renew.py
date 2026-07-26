@@ -725,6 +725,61 @@ def run_single_server(sb, site_url: str, server_num: str, region: str,
         '//button[contains(., "VOTE")]',
     ]
     clicked = False
+
+    # 关键诊断: 点击前检查 button.rt-btn-free 的属性
+    try:
+        btn_info = sb.execute_script("""
+            (function() {
+                try {
+                    var btn = document.querySelector('button.rt-btn-free');
+                    if (!btn) return JSON.stringify({found: false});
+                    var rect = btn.getBoundingClientRect();
+                    return JSON.stringify({
+                        found: true,
+                        text: (btn.innerText || '').trim(),
+                        disabled: btn.disabled,
+                        className: btn.className,
+                        wireClick: btn.getAttribute('wire:click') || btn.getAttribute('wire:click.prevent') || 'none',
+                        onClick: btn.getAttribute('onclick') || 'none',
+                        width: rect.width,
+                        height: rect.height,
+                        color: window.getComputedStyle(btn).color,
+                        backgroundColor: window.getComputedStyle(btn).backgroundColor,
+                        cursor: window.getComputedStyle(btn).cursor,
+                        opacity: window.getComputedStyle(btn).opacity,
+                        parentClass: btn.parentElement ? (btn.parentElement.className || '').substring(0, 80) : '',
+                        parentWireClick: btn.parentElement ? (btn.parentElement.getAttribute('wire:click') || 'none') : 'none',
+                        html: btn.outerHTML.substring(0, 300)
+                    });
+                } catch(e) { return JSON.stringify({found: false, error: e.message}); }
+            })();
+        """)
+        import json as _json
+        info = _json.loads(btn_info) if btn_info else {}
+        if info.get("found"):
+            log.info(f"🔍 续期按钮属性:")
+            log.info(f"   文字: {info.get('text')!r}")
+            log.info(f"   disabled: {info.get('disabled')}")
+            log.info(f"   尺寸: {info.get('width', 0):.0f}x{info.get('height', 0):.0f}")
+            log.info(f"   颜色: bg={info.get('backgroundColor')} color={info.get('color')}")
+            log.info(f"   cursor: {info.get('cursor')} opacity: {info.get('opacity')}")
+            log.info(f"   wire:click: {info.get('wireClick')}")
+            log.info(f"   onclick: {info.get('onClick')}")
+            log.info(f"   父元素: class={info.get('parentClass')} wire:click={info.get('parentWireClick')}")
+            log.info(f"   HTML: {info.get('html')}")
+
+            # 关键: 如果按钮 disabled 或 opacity 低, 说明不能点
+            if info.get("disabled"):
+                log.warning("⚠️ 按钮 disabled! 可能需要先完成其他操作 (如 VOTE)")
+            if info.get("opacity") and float(info.get("opacity", 1)) < 0.5:
+                log.warning(f"⚠️ 按钮 opacity={info.get('opacity')} (半透明, 可能禁用)")
+            if info.get("cursor") == "not-allowed":
+                log.warning("⚠️ 按钮 cursor=not-allowed (禁用状态)")
+        else:
+            log.warning("⚠️ 未找到 button.rt-btn-free")
+    except Exception as e:
+        log.warning(f"按钮属性诊断失败: {e}")
+
     for sel in vote_btn_selectors:
         try:
             # 关键: 用 is_element_present 而非 is_element_visible
@@ -803,6 +858,7 @@ def run_single_server(sb, site_url: str, server_num: str, region: str,
     # 现在改为: 点击后多次截图 + 监听 DOM 变化 + 等待更长时间
 
     # 注入网络请求监听器 (在点击前注入)
+    # 关键: 记录请求 body, 这样能看到 Livewire 请求调用的方法名 (如 extend)
     try:
         sb.execute_script("""
             window.__renew_xhr_log = [];
@@ -817,31 +873,43 @@ def run_single_server(sb, site_url: str, server_num: str, region: str,
             };
             XMLHttpRequest.prototype.send = function(body) {
                 var self = this;
+                var bodyStr = '';
+                try { bodyStr = typeof body === 'string' ? body : JSON.stringify(body); } catch(e) {}
                 this.addEventListener('load', function() {
                     window.__renew_xhr_log.push({
                         method: self.__method, url: self.__url,
-                        status: self.status, response: (self.responseText || '').substring(0, 200)
+                        status: self.status,
+                        body: bodyStr.substring(0, 500),
+                        response: (self.responseText || '').substring(0, 300)
                     });
                 });
                 return origSend.apply(this, arguments);
             };
-            // 拦截 fetch
+            // 拦截 fetch (记录 body)
             var origFetch = window.fetch;
             window.fetch = function(input, init) {
                 var url = typeof input === 'string' ? input : input.url;
                 var method = (init && init.method) || 'GET';
+                var bodyStr = '';
+                try {
+                    if (init && init.body) {
+                        bodyStr = typeof init.body === 'string' ? init.body : JSON.stringify(init.body);
+                    }
+                } catch(e) {}
                 return origFetch.apply(this, arguments).then(function(resp) {
                     resp.clone().text().then(function(t) {
                         window.__renew_fetch_log.push({
                             method: method, url: url,
-                            status: resp.status, response: t.substring(0, 300)
+                            status: resp.status,
+                            body: bodyStr.substring(0, 500),
+                            response: t.substring(0, 300)
                         });
                     });
                     return resp;
                 });
             };
         """)
-        log.info("📡 网络请求监听器已注入")
+        log.info("📡 网络请求监听器已注入 (含 body 记录)")
     except Exception as e:
         log.warning(f"注入网络监听器失败: {e}")
 
@@ -912,6 +980,7 @@ def run_single_server(sb, site_url: str, server_num: str, region: str,
     # 同时分析是否有续期相关请求 + 冷却状态
     in_cooldown = False
     cooldown_seconds = 0
+    extend_request_found = False
     try:
         xhr_log = sb.execute_script("return JSON.stringify(window.__renew_xhr_log || [])")
         fetch_log = sb.execute_script("return JSON.stringify(window.__renew_fetch_log || [])")
@@ -920,15 +989,31 @@ def run_single_server(sb, site_url: str, server_num: str, region: str,
         fetches = _json.loads(fetch_log) if fetch_log else []
         log.info(f"📡 捕获到 {len(xhrs)} 个 XHR 请求, {len(fetches)} 个 fetch 请求:")
         for x in xhrs:
-            log.info(f"   XHR {x.get('method')} {x.get('url')} → {x.get('status')}")
-            log.info(f"      响应: {x.get('response', '')[:150]}")
+            body_str = x.get('body', '') or ''
+            resp_str = x.get('response', '') or ''
+            # 检测请求 body 是否含 extend (Livewire 方法调用)
+            is_extend = 'extend' in body_str.lower() or 'renew' in body_str.lower()
+            marker = ' 🎯EXTEND' if is_extend else ''
+            log.info(f"   XHR {x.get('method')} {x.get('url')} → {x.get('status')}{marker}")
+            if body_str:
+                log.info(f"      请求 body: {body_str[:200]}")
+            log.info(f"      响应: {resp_str[:150]}")
+            if is_extend:
+                extend_request_found = True
         for f in fetches:
+            body_str = f.get('body', '') or ''
             resp_str = f.get('response', '') or ''
-            log.info(f"   FETCH {f.get('method')} {f.get('url')} → {f.get('status')}")
+            # 检测请求 body 是否含 extend (Livewire 方法调用)
+            is_extend = 'extend' in body_str.lower() or 'renew' in body_str.lower()
+            marker = ' 🎯EXTEND' if is_extend else ''
+            log.info(f"   FETCH {f.get('method')} {f.get('url')} → {f.get('status')}{marker}")
+            if body_str:
+                log.info(f"      请求 body: {body_str[:200]}")
             log.info(f"      响应: {resp_str[:200]}")
+            if is_extend:
+                extend_request_found = True
             # 关键: 检测响应中是否含 cooldown 信息
             if 'cooldownExpiry' in resp_str or 'cooldown' in resp_str.lower():
-                # 提取 cooldownExpiry 的值
                 import re as _re
                 m = _re.search(r'"cooldownExpiry"\s*:\s*(\d+)', resp_str)
                 if m:
@@ -936,7 +1021,6 @@ def run_single_server(sb, site_url: str, server_num: str, region: str,
                     if cooldown_seconds > 0:
                         in_cooldown = True
                         log.info(f"   ⏳ 检测到冷却: cooldownExpiry={cooldown_seconds}s")
-                # 也检测 expiresTimestamp (续期后的新到期时间)
                 m2 = _re.search(r'"expiresTimestamp"\s*:\s*(\d+)', resp_str)
                 if m2:
                     exp_ts = int(m2.group(1))
@@ -945,6 +1029,12 @@ def run_single_server(sb, site_url: str, server_num: str, region: str,
                     log.info(f"   📅 检测到到期时间戳: {exp_dt.isoformat()} (timestamp={exp_ts})")
     except Exception as e:
         log.warning(f"获取网络日志失败: {e}")
+
+    if extend_request_found:
+        log.info("✅ 检测到 extend/renew 请求! 续期按钮触发了 Livewire 方法调用")
+    else:
+        log.warning("⚠️ 未检测到 extend/renew 请求! 点击按钮没有触发 Livewire extend() 方法")
+        log.warning("   可能原因: 按钮 disabled / 需要先 VOTE / 点击事件被阻止")
 
     if in_cooldown:
         log.info(f"✅ 检测到冷却状态 ({cooldown_seconds}s), 说明续期请求已被服务器接收!")
