@@ -839,6 +839,57 @@ def run_single_server(sb, site_url: str, server_num: str, region: str,
         except Exception as e:
             log.warning(f"JS 直接点击失败: {e}")
 
+    # 关键新增: 点击按钮后, 额外用 JS 直接调用 Livewire extend() 方法
+    # 这能绕过按钮 disabled 状态, 直接触发续期
+    if clicked:
+        try:
+            log.info("🔧 尝试用 JS 直接调用 Livewire extend() 方法 (绕过按钮状态)...")
+            lw_result = sb.execute_script("""
+                (function() {
+                    try {
+                        // Livewire v3: 找所有 wire 组件, 调用 extend
+                        var wireEls = document.querySelectorAll('[wire\\\\:id]');
+                        for (var i = 0; i < wireEls.length; i++) {
+                            var wireId = wireEls[i].getAttribute('wire\\\\:id');
+                            if (wireId && window.Livewire) {
+                                try {
+                                    var component = window.Livewire.find(wireId);
+                                    if (component && component.$wire) {
+                                        // 尝试调用 extend 方法
+                                        try {
+                                            var r = component.$wire.call('extend');
+                                            return 'v3_call_extend:wireId=' + wireId + ' result=' + JSON.stringify(r).substring(0, 100);
+                                        } catch(e1) {
+                                            try {
+                                                component.$wire.extend();
+                                                return 'v3_direct_extend:wireId=' + wireId;
+                                            } catch(e2) {}
+                                        }
+                                    }
+                                } catch(e) {}
+                            }
+                        }
+                        // Livewire v2: emit extend
+                        if (window.livewire) {
+                            try {
+                                window.livewire.emit('extend');
+                                return 'v2_emit_extend';
+                            } catch(e) {}
+                        }
+                        if (window.Livewire && window.Livewire.emit) {
+                            try {
+                                window.Livewire.emit('extend');
+                                return 'v2_emit_extend_alt';
+                            } catch(e) {}
+                        }
+                        return 'no_livewire_component_found';
+                    } catch(e) { return 'error: ' + e.message; }
+                })();
+            """)
+            log.info(f"Livewire extend() 结果: {lw_result}")
+        except Exception as e:
+            log.warning(f"JS 调用 Livewire extend 失败: {e}")
+
     if not clicked:
         log.warning("所有方法都未找到续期按钮，尝试 Livewire extend...")
         lw_result = livewire_extend(sb)
@@ -985,36 +1036,51 @@ def run_single_server(sb, site_url: str, server_num: str, region: str,
         xhr_log = sb.execute_script("return JSON.stringify(window.__renew_xhr_log || [])")
         fetch_log = sb.execute_script("return JSON.stringify(window.__renew_fetch_log || [])")
         import json as _json
+        import re as _re
         xhrs = _json.loads(xhr_log) if xhr_log else []
         fetches = _json.loads(fetch_log) if fetch_log else []
         log.info(f"📡 捕获到 {len(xhrs)} 个 XHR 请求, {len(fetches)} 个 fetch 请求:")
+
+        def _check_extend(body_str):
+            """精确检测 Livewire extend 调用, 而非泛泛的 extend 关键字"""
+            if not body_str:
+                return False
+            # Livewire 请求格式: {"calls":[{"method":"extend","params":[]}]}
+            # 检测 "method":"extend" (精确匹配方法名)
+            if _re.search(r'"method"\s*:\s*"extend"', body_str):
+                return True
+            # 也检测 "method":"renew" / "method":"addTime" 等
+            if _re.search(r'"method"\s*:\s*"(renew|addTime|add_time|vote)"', body_str):
+                return True
+            return False
+
         for x in xhrs:
             body_str = x.get('body', '') or ''
             resp_str = x.get('response', '') or ''
-            # 检测请求 body 是否含 extend (Livewire 方法调用)
-            is_extend = 'extend' in body_str.lower() or 'renew' in body_str.lower()
+            is_extend = _check_extend(body_str)
             marker = ' 🎯EXTEND' if is_extend else ''
             log.info(f"   XHR {x.get('method')} {x.get('url')} → {x.get('status')}{marker}")
             if body_str:
-                log.info(f"      请求 body: {body_str[:200]}")
-            log.info(f"      响应: {resp_str[:150]}")
+                log.info(f"      请求 body (完整): {body_str[:500]}")
+            log.info(f"      响应: {resp_str[:200]}")
             if is_extend:
                 extend_request_found = True
         for f in fetches:
             body_str = f.get('body', '') or ''
             resp_str = f.get('response', '') or ''
-            # 检测请求 body 是否含 extend (Livewire 方法调用)
-            is_extend = 'extend' in body_str.lower() or 'renew' in body_str.lower()
+            is_extend = _check_extend(body_str)
             marker = ' 🎯EXTEND' if is_extend else ''
-            log.info(f"   FETCH {f.get('method')} {f.get('url')} → {f.get('status')}{marker}")
-            if body_str:
-                log.info(f"      请求 body: {body_str[:200]}")
-            log.info(f"      响应: {resp_str[:200]}")
+            # 只打印 livewire 请求 (跳过广告请求, 减少日志噪音)
+            url = f.get('url', '') or ''
+            if 'livewire' in url or is_extend:
+                log.info(f"   FETCH {f.get('method')} {url} → {f.get('status')}{marker}")
+                if body_str:
+                    log.info(f"      请求 body (完整): {body_str[:500]}")
+                log.info(f"      响应: {resp_str[:300]}")
             if is_extend:
                 extend_request_found = True
             # 关键: 检测响应中是否含 cooldown 信息
-            if 'cooldownExpiry' in resp_str or 'cooldown' in resp_str.lower():
-                import re as _re
+            if 'cooldownExpiry' in resp_str:
                 m = _re.search(r'"cooldownExpiry"\s*:\s*(\d+)', resp_str)
                 if m:
                     cooldown_seconds = int(m.group(1))
@@ -1031,10 +1097,10 @@ def run_single_server(sb, site_url: str, server_num: str, region: str,
         log.warning(f"获取网络日志失败: {e}")
 
     if extend_request_found:
-        log.info("✅ 检测到 extend/renew 请求! 续期按钮触发了 Livewire 方法调用")
+        log.info("✅ 检测到 Livewire extend() 方法调用! 续期按钮被正确触发")
     else:
-        log.warning("⚠️ 未检测到 extend/renew 请求! 点击按钮没有触发 Livewire extend() 方法")
-        log.warning("   可能原因: 按钮 disabled / 需要先 VOTE / 点击事件被阻止")
+        log.warning("⚠️ 未检测到 Livewire extend() 方法调用!")
+        log.warning("   可能原因: 按钮 disabled / 点击事件被阻止 / 需要先 VOTE")
 
     if in_cooldown:
         log.info(f"✅ 检测到冷却状态 ({cooldown_seconds}s), 说明续期请求已被服务器接收!")
