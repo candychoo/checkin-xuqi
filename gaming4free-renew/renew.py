@@ -729,30 +729,98 @@ def run_single_server(sb, site_url: str, server_num: str, region: str,
     human_wait(2, 4)
     bypass_turnstile(sb)
 
-    # 关键: 点击 +90 min 后, 续期应该直接生效, 不需要提交按钮
-    # 之前误判: 把左侧菜单 'Public Renewing' 链接当成提交按钮点了
-    # 现在改为: 点击 +90 min 后直接等待时间变化, 不再找提交按钮
+    # 关键: 点击 +90 min 后, 监听网络请求和 DOM 变化
+    # 之前点击后时间没变化, 说明续期请求没真正发出或没生效
+    # 现在改为: 点击后多次截图 + 监听 DOM 变化 + 等待更长时间
 
-    log.info("⏳ 等待续期生效 (点击 +90 min 后直接生效, 无需提交)...")
-    # 多等一会, 让续期请求完成 + 时间刷新
-    human_wait(8, 12)
+    # 注入网络请求监听器 (在点击前注入)
+    try:
+        sb.execute_script("""
+            window.__renew_xhr_log = [];
+            window.__renew_fetch_log = [];
+            // 拦截 XHR
+            var origOpen = XMLHttpRequest.prototype.open;
+            var origSend = XMLHttpRequest.prototype.send;
+            XMLHttpRequest.prototype.open = function(method, url) {
+                this.__method = method;
+                this.__url = url;
+                return origOpen.apply(this, arguments);
+            };
+            XMLHttpRequest.prototype.send = function(body) {
+                var self = this;
+                this.addEventListener('load', function() {
+                    window.__renew_xhr_log.push({
+                        method: self.__method, url: self.__url,
+                        status: self.status, response: (self.responseText || '').substring(0, 200)
+                    });
+                });
+                return origSend.apply(this, arguments);
+            };
+            // 拦截 fetch
+            var origFetch = window.fetch;
+            window.fetch = function(input, init) {
+                var url = typeof input === 'string' ? input : input.url;
+                var method = (init && init.method) || 'GET';
+                return origFetch.apply(this, arguments).then(function(resp) {
+                    resp.clone().text().then(function(t) {
+                        window.__renew_fetch_log.push({
+                            method: method, url: url,
+                            status: resp.status, response: t.substring(0, 200)
+                        });
+                    });
+                    return resp;
+                });
+            };
+        """)
+        log.info("📡 网络请求监听器已注入")
+    except Exception as e:
+        log.warning(f"注入网络监听器失败: {e}")
 
-    # 再次检测 Turnstile (如果点击后弹出了 Turnstile)
-    bypass_turnstile(sb)
-    human_wait(3, 5)
+    log.info("⏳ 等待续期生效 (点击 +90 min 后)...")
+    # 多次截图 + 检测 DOM 变化
+    for i in range(6):
+        human_wait(3, 5)
+        # 检测是否有 toast / notification / 错误提示
+        try:
+            toast = sb.execute_script("""
+                try {
+                    // 找 toast / notification / alert
+                    var sels = [
+                        '.fi-notification', '.fi-toast', '.toast', '.alert',
+                        '[class*=\"toast\"]', '[class*=\"notification\"]',
+                        '[class*=\"alert\"]', '[class*=\"message\"]', '[class*=\"flash\"]',
+                        '[role=\"alert\"]', '[role=\"status\"]'
+                    ];
+                    for (var i = 0; i < sels.length; i++) {
+                        var els = document.querySelectorAll(sels[i]);
+                        for (var j = 0; j < els.length; j++) {
+                            var t = (els[j].innerText || '').trim();
+                            if (t && t.length > 2 && t.length < 300) {
+                                return sels[i] + ': ' + t;
+                            }
+                        }
+                    }
+                    return '';
+                } catch(e) { return 'error: ' + e.message; }
+            """)
+            if toast:
+                log.info(f"💬 [{i+1}/6] 检测到提示: {toast}")
+        except Exception:
+            pass
 
-    # 检查是否跳转到了其他页面 (说明点错了按钮)
+        # 截图 (前 3 次都截)
+        if i < 3:
+            screenshot(sb, f"after_click_{i+1}_{server_num}")
+
+    # 检查是否跳转到了其他页面
     try:
         current_url_after = sb.get_current_url().lower()
         log.info(f"📍 点击后 URL: {sb.get_current_url()}")
-        # 如果跳转到了 settings/public-renewing 等页面, 说明点错了
         if "public-renewing" in current_url_after or "settings" in current_url_after:
             log.warning("⚠️ 页面跳转到了设置页, 说明点击的不是续期按钮而是菜单链接!")
             log.warning("⚠️ 尝试返回原页面并重新点击真正的 rt-btn-free...")
-            # 返回原页面
             sb.go_back()
             human_wait(3, 5)
-            # 重新点击 rt-btn-free (这次只点 button.rt-btn-free, 不点其他)
             try:
                 sb.execute_script("""
                     try {
@@ -771,18 +839,32 @@ def run_single_server(sb, site_url: str, server_num: str, region: str,
     except Exception as e:
         log.warning(f"URL 检查失败: {e}")
 
-    # 检查是否有真正的 modal (不是 fi-modal-trigger 那种触发器)
-    # 真正的 modal 会有明显的遮罩层 + 居中对话框
+    # 打印捕获的网络请求 (关键诊断!)
+    try:
+        xhr_log = sb.execute_script("return JSON.stringify(window.__renew_xhr_log || [])")
+        fetch_log = sb.execute_script("return JSON.stringify(window.__renew_fetch_log || [])")
+        import json as _json
+        xhrs = _json.loads(xhr_log) if xhr_log else []
+        fetches = _json.loads(fetch_log) if fetch_log else []
+        log.info(f"📡 捕获到 {len(xhrs)} 个 XHR 请求, {len(fetches)} 个 fetch 请求:")
+        for x in xhrs:
+            log.info(f"   XHR {x.get('method')} {x.get('url')} → {x.get('status')}")
+            log.info(f"      响应: {x.get('response', '')[:150]}")
+        for f in fetches:
+            log.info(f"   FETCH {f.get('method')} {f.get('url')} → {f.get('status')}")
+            log.info(f"      响应: {f.get('response', '')[:150]}")
+    except Exception as e:
+        log.warning(f"获取网络日志失败: {e}")
+
+    # 检查是否有真正的 modal
     try:
         real_modal = sb.execute_script("""
             try {
-                // 找真正的 modal (有固定定位 + 遮罩)
                 var modals = document.querySelectorAll(
                     '[role=\"dialog\"], .fi-modal-content, .fi-modal-body, [class*=\"modal-content\"], [class*=\"dialog-content\"]'
                 );
                 for (var i = 0; i < modals.length; i++) {
                     var rect = modals[i].getBoundingClientRect();
-                    // 真正的 modal 应该可见且有尺寸
                     if (rect.width > 100 && rect.height > 100) {
                         var btns = modals[i].querySelectorAll('button, a, [role=button]');
                         var btnTexts = [];
@@ -804,11 +886,9 @@ def run_single_server(sb, site_url: str, server_num: str, region: str,
         modal_info = _json.loads(real_modal) if real_modal else {}
         log.info(f"🔍 真 Modal 检测: {modal_info}")
         if modal_info.get("found"):
-            # 真的有 modal, 找里面的提交按钮
             log.info("🪟 检测到真正的确认对话框, 按钮列表:")
             for btn_text in (modal_info.get("buttons") or []):
                 log.info(f"     - {btn_text!r}")
-            # 用 JS 在 modal 内找提交按钮 (排除 Cancel/Close)
             js_result = sb.execute_script("""
                 try {
                     var modal = document.querySelector(
@@ -837,7 +917,6 @@ def run_single_server(sb, site_url: str, server_num: str, region: str,
                             }
                         }
                     }
-                    // 如果没匹配关键词, 点 modal 里最后一个非 Cancel 按钮 (通常是确认)
                     var candidates = [];
                     for (var i2 = 0; i2 < btns.length; i2++) {
                         var t2 = (btns[i2].innerText || '').trim().toLowerCase();
