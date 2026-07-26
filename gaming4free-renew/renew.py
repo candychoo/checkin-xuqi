@@ -839,53 +839,49 @@ def run_single_server(sb, site_url: str, server_num: str, region: str,
         except Exception as e:
             log.warning(f"JS 直接点击失败: {e}")
 
-    # 关键新增: 点击按钮后, 额外用 JS 直接调用 Livewire extend() 方法
+    # 关键新增: 点击按钮后, 额外用 JS 直接调用 Alpine 续期方法
     # 这能绕过按钮 disabled 状态, 直接触发续期
     if clicked:
         try:
-            log.info("🔧 尝试用 JS 直接调用续期方法 (绕过按钮状态)...")
-            # 关键发现: 这是 Alpine.js 组件, 不是 Livewire!
-            # 按钮 @click 逻辑:
-            #   isNativeApp ? watchAd() : (adRewardReady ? watchWebAd() : showExtendCaptcha())
-            # 方法在 Alpine.$data 上, 用 Alpine API 调用
+            log.info("🔧 尝试用 JS 直接调用 Alpine 续期方法 (绕过按钮状态)...")
+            # 关键发现: 这是 Alpine.js 组件
+            # 按钮 @click: isNativeApp ? watchAd() : (adRewardReady ? watchWebAd() : showExtendCaptcha())
+            # 方法在 Alpine.$data 上, 但需要用 .call() 绑定 this
             lw_result = sb.execute_script("""
                 return (function() {
                     try {
                         var results = [];
-                        // 1. 检查是否有 Alpine
                         if (typeof window.Alpine === 'undefined') {
                             results.push('no_alpine');
-                        } else {
-                            results.push('alpine_found');
+                            return results.join(' | ');
                         }
+                        results.push('alpine_found');
 
-                        // 2. 找 rt-btn-free 按钮的 Alpine 组件
                         var btn = document.querySelector('button.rt-btn-free');
                         if (!btn) {
                             results.push('no_btn');
                             return results.join(' | ');
                         }
 
-                        // 3. 获取 Alpine 数据 (Alpine.js 会把 $data 存在元素上)
+                        // 获取 Alpine 数据
                         var alpineData = null;
                         try {
-                            // Alpine 3.x: 用 Alpine.$data(el) 获取响应式数据
                             if (window.Alpine && window.Alpine.$data) {
                                 alpineData = window.Alpine.$data(btn);
-                                results.push('alpine_data_found_via_$data');
+                                if (alpineData) results.push('alpine_data_found');
                             }
                         } catch(e) {
                             results.push('Alpine.$data error: ' + e.message);
                         }
 
-                        // 兜底: 从父元素链找 Alpine 数据
+                        // 兜底: 从父元素链找
                         if (!alpineData) {
                             var el = btn;
                             for (var i = 0; i < 10 && el; i++) {
                                 try {
-                                    if (el._x_dataStack) {
+                                    if (el._x_dataStack && el._x_dataStack[0]) {
                                         alpineData = el._x_dataStack[0];
-                                        results.push('alpine_data_found_via_x_dataStack at depth=' + i);
+                                        results.push('found_via_x_dataStack depth=' + i);
                                         break;
                                     }
                                 } catch(e) {}
@@ -898,31 +894,59 @@ def run_single_server(sb, site_url: str, server_num: str, region: str,
                             return results.join(' | ');
                         }
 
-                        // 4. 列出 alpineData 的所有属性和方法 (诊断)
-                        var keys = [];
-                        var methods = [];
-                        for (var k in alpineData) {
+                        // 用 Object.keys 列出属性 (Proxy 对象 for...in 可能不完整)
+                        var allKeys = [];
+                        try {
+                            allKeys = Object.keys(alpineData);
+                        } catch(e) {
+                            results.push('Object.keys error: ' + e.message);
+                        }
+                        results.push('keys: ' + allKeys.join(',').substring(0, 300));
+
+                        // 直接访问已知状态属性 (从 HTML @click 推断)
+                        var knownState = ['adRewardReady', 'isPremium', 'isNativeApp', 'extendDisabled', 'adLoading'];
+                        var stateVals = [];
+                        for (var s = 0; s < knownState.length; s++) {
                             try {
-                                if (typeof alpineData[k] === 'function') {
-                                    methods.push(k);
-                                } else {
-                                    keys.push(k + '=' + JSON.stringify(alpineData[k]).substring(0, 30));
+                                stateVals.push(knownState[s] + '=' + alpineData[knownState[s]]);
+                            } catch(e) {}
+                        }
+                        results.push('state: ' + stateVals.join(', '));
+
+                        // 列出所有 function 类型的属性
+                        var methods = [];
+                        for (var k = 0; k < allKeys.length; k++) {
+                            try {
+                                if (typeof alpineData[allKeys[k]] === 'function') {
+                                    methods.push(allKeys[k]);
                                 }
                             } catch(e) {}
                         }
                         results.push('methods: ' + methods.join(','));
-                        results.push('state: ' + keys.join(', ').substring(0, 300));
 
-                        // 5. 尝试调用续期方法 (按优先级)
-                        var methodsToTry = ['watchWebAd', 'watchAd', 'showExtendCaptcha', 'extend', 'renew'];
+                        // 关键: 设置 adRewardReady=true, 让 watchWebAd 能走通
+                        try {
+                            if ('adRewardReady' in alpineData) {
+                                results.push('setting adRewardReady=true');
+                                alpineData.adRewardReady = true;
+                            }
+                        } catch(e) {
+                            results.push('set adRewardReady error: ' + e.message);
+                        }
+
+                        // 尝试调用方法, 用 .call(alpineData) 绑定 this
+                        var methodsToTry = ['watchWebAd', 'watchAd', 'showExtendCaptcha', 'extend', 'renew', 'claimAdReward'];
                         for (var m = 0; m < methodsToTry.length; m++) {
                             var methodName = methodsToTry[m];
                             try {
                                 if (typeof alpineData[methodName] === 'function') {
                                     results.push('calling ' + methodName + '...');
-                                    var r = alpineData[methodName]();
+                                    // 用 .call() 绑定 this 为 alpineData
+                                    var r = alpineData[methodName].call(alpineData);
                                     results.push(methodName + ' called: ' + JSON.stringify(r).substring(0, 100));
                                     return results.join(' | ');
+                                } else {
+                                    results.push(methodName + ' not a function (type: ' + typeof alpineData[methodName] + ')');
                                 }
                             } catch(e) {
                                 results.push(methodName + ' error: ' + e.message);
