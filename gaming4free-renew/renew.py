@@ -278,7 +278,7 @@ def bypass_turnstile(sb) -> bool:
         try:
             # 用 IIFE 包裹, 避免 'Illegal return statement' 错误
             cf_check = sb.execute_script("""
-                (function() {
+                return (function() {
                     try {
                         var els = document.querySelectorAll('div, section, [role=dialog]');
                         for (var i = 0; i < els.length; i++) {
@@ -351,7 +351,7 @@ def _check_cf_passed(sb) -> bool:
     """检测 CF 验证是否通过 (用 IIFE 包裹 JS 避免 return 错误)"""
     try:
         result = sb.execute_script("""
-            (function() {
+            return (function() {
                 try {
                     // 检测 1: cf-turnstile-response 有 token
                     var els = document.querySelectorAll('[name="cf-turnstile-response"], [name="g-recaptcha-response"]');
@@ -661,7 +661,7 @@ def run_single_server(sb, site_url: str, server_num: str, region: str,
     try:
         # 用 JS 找含 HH:MM:SS 的元素 (用 IIFE 包裹避免 return 错误)
         time_text = sb.execute_script("""
-            (function() {
+            return (function() {
                 try {
                     var known = document.querySelector('.rt-timer, #sd-timer, .sd-timer');
                     if (known) return known.innerText.trim();
@@ -729,7 +729,7 @@ def run_single_server(sb, site_url: str, server_num: str, region: str,
     # 关键诊断: 点击前检查 button.rt-btn-free 的属性
     try:
         btn_info = sb.execute_script("""
-            (function() {
+            return (function() {
                 try {
                     var btn = document.querySelector('button.rt-btn-free');
                     if (!btn) return JSON.stringify({found: false});
@@ -847,7 +847,7 @@ def run_single_server(sb, site_url: str, server_num: str, region: str,
             # 关键: 精准定位 renewal-timer 组件 (含 expiresTimestamp/adRewardsToday)
             # 尝试多种可能的方法名: extend / renew / watchAd / claimAdReward / addTime
             lw_result = sb.execute_script("""
-                (function() {
+                return (function() {
                     try {
                         var results = [];
                         // 1. 列出所有 Livewire 组件 (诊断用)
@@ -1197,7 +1197,7 @@ def run_single_server(sb, site_url: str, server_num: str, region: str,
     timestamp_after = "未知"
     try:
         time_text = sb.execute_script("""
-            (function() {
+            return (function() {
                 try {
                     var known = document.querySelector('.rt-timer, #sd-timer, .sd-timer');
                     if (known) return known.innerText.trim();
