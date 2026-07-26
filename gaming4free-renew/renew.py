@@ -843,52 +843,105 @@ def run_single_server(sb, site_url: str, server_num: str, region: str,
     # 这能绕过按钮 disabled 状态, 直接触发续期
     if clicked:
         try:
-            log.info("🔧 尝试用 JS 直接调用 Livewire extend() 方法 (绕过按钮状态)...")
+            log.info("🔧 尝试用 JS 直接调用 Livewire 续期方法 (绕过按钮状态)...")
+            # 关键: 精准定位 renewal-timer 组件 (含 expiresTimestamp/adRewardsToday)
+            # 尝试多种可能的方法名: extend / renew / watchAd / claimAdReward / addTime
             lw_result = sb.execute_script("""
                 (function() {
                     try {
-                        // Livewire v3: 找所有 wire 组件, 调用 extend
+                        var results = [];
+                        // 1. 列出所有 Livewire 组件 (诊断用)
                         var wireEls = document.querySelectorAll('[wire\\\\:id]');
+                        results.push('wire_elements: ' + wireEls.length);
+
+                        // 2. 找 renewal-timer 组件 (优先)
+                        var targetComponent = null;
+                        var targetWireId = null;
                         for (var i = 0; i < wireEls.length; i++) {
                             var wireId = wireEls[i].getAttribute('wire\\\\:id');
-                            if (wireId && window.Livewire) {
-                                try {
-                                    var component = window.Livewire.find(wireId);
-                                    if (component && component.$wire) {
-                                        // 尝试调用 extend 方法
-                                        try {
-                                            var r = component.$wire.call('extend');
-                                            return 'v3_call_extend:wireId=' + wireId + ' result=' + JSON.stringify(r).substring(0, 100);
-                                        } catch(e1) {
-                                            try {
-                                                component.$wire.extend();
-                                                return 'v3_direct_extend:wireId=' + wireId;
-                                            } catch(e2) {}
+                            if (!wireId || !window.Livewire) continue;
+                            try {
+                                var comp = window.Livewire.find(wireId);
+                                if (comp && comp.$wire) {
+                                    // 检查是否是 renewal-timer (含 serverId/expiresTimestamp)
+                                    var data = comp.$wire.__instance ? comp.$wire.__instance.data : null;
+                                    var dataStr = data ? JSON.stringify(data) : '';
+                                    if (dataStr.indexOf('expiresTimestamp') !== -1 || dataStr.indexOf('adRewardsToday') !== -1) {
+                                        targetComponent = comp;
+                                        targetWireId = wireId;
+                                        results.push('found renewal-timer: wireId=' + wireId);
+                                        results.push('data keys: ' + Object.keys(data || {}).join(','));
+                                        // 列出 $wire 上所有可调用的方法
+                                        var methods = [];
+                                        for (var k in comp.$wire) {
+                                            if (typeof comp.$wire[k] === 'function' && k !== 'constructor' && k.indexOf('$') !== 0) {
+                                                methods.push(k);
+                                            }
                                         }
+                                        results.push('methods: ' + methods.join(','));
+                                        break;
                                     }
-                                } catch(e) {}
+                                }
+                            } catch(e) {}
+                        }
+
+                        // 3. 如果没找到 renewal-timer, 用第一个组件
+                        if (!targetComponent && wireEls.length > 0) {
+                            for (var j = 0; j < wireEls.length; j++) {
+                                var wid = wireEls[j].getAttribute('wire\\\\:id');
+                                if (wid && window.Livewire) {
+                                    try {
+                                        var c = window.Livewire.find(wid);
+                                        if (c && c.$wire) {
+                                            targetComponent = c;
+                                            targetWireId = wid;
+                                            results.push('using first component: wireId=' + wid);
+                                            break;
+                                        }
+                                    } catch(e) {}
+                                }
                             }
                         }
-                        // Livewire v2: emit extend
+
+                        if (!targetComponent) {
+                            results.push('no_component_found');
+                            return results.join(' | ');
+                        }
+
+                        // 4. 尝试多种方法名
+                        var methodsToTry = ['extend', 'renew', 'watchAd', 'claimAdReward', 'addTime', 'add_time', 'vote', 'claim'];
+                        for (var m = 0; m < methodsToTry.length; m++) {
+                            var methodName = methodsToTry[m];
+                            try {
+                                // 先检查方法是否存在
+                                if (typeof targetComponent.$wire[methodName] === 'function') {
+                                    results.push('calling ' + methodName + '...');
+                                    var r = targetComponent.$wire.call(methodName);
+                                    results.push(methodName + ' called: ' + JSON.stringify(r).substring(0, 100));
+                                    return results.join(' | ');
+                                }
+                            } catch(e) {
+                                results.push(methodName + ' error: ' + e.message);
+                            }
+                        }
+
+                        // 5. v2 emit 兜底
                         if (window.livewire) {
                             try {
                                 window.livewire.emit('extend');
-                                return 'v2_emit_extend';
+                                results.push('v2_emit_extend');
+                                return results.join(' | ');
                             } catch(e) {}
                         }
-                        if (window.Livewire && window.Livewire.emit) {
-                            try {
-                                window.Livewire.emit('extend');
-                                return 'v2_emit_extend_alt';
-                            } catch(e) {}
-                        }
-                        return 'no_livewire_component_found';
+
+                        results.push('no_method_worked');
+                        return results.join(' | ');
                     } catch(e) { return 'error: ' + e.message; }
                 })();
             """)
-            log.info(f"Livewire extend() 结果: {lw_result}")
+            log.info(f"Livewire 调用结果: {lw_result}")
         except Exception as e:
-            log.warning(f"JS 调用 Livewire extend 失败: {e}")
+            log.warning(f"JS 调用 Livewire 失败: {e}")
 
     if not clicked:
         log.warning("所有方法都未找到续期按钮，尝试 Livewire extend...")
