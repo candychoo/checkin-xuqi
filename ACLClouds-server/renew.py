@@ -17,9 +17,7 @@ from datetime import datetime, timezone
 import requests
 
 # ==================== 配置 ====================
-# 关键: 直接访问主域 aclclouds.com, 不走 dash.aclclouds.com
-# 因为 dash.aclclouds.com 会 302 重定向到 aclclouds.com, 引起跨 host cookie 问题
-BASE_URL = "https://aclclouds.com"
+BASE_URL = "https://dash.aclclouds.com"
 RENEW_THRESHOLD_HOURS = int(os.environ.get("RENEW_THRESHOLD_HOURS", "48"))
 
 # Cookie: 完整的浏览器 Cookie 字符串, 必须包含 XSRF-TOKEN 和 aclclouds_session
@@ -97,75 +95,45 @@ def build_session(cookie_str):
         "Accept-Language": "en-US,en;q=0.9",
         "Origin": BASE_URL,
         "Referer": f"{BASE_URL}/projects",
+        "X-Requested-With": "XMLHttpRequest",
+        "Accept-Encoding": "gzip, deflate, br",
     })
-
-    # 解析 cookie 字符串成 dict
-    parsed = {}
+    # 解析 cookie 字符串 - 处理 __Host- 和 __Secure- 前缀
     for kv in cookie_str.split(";"):
         kv = kv.strip()
         if not kv or "=" not in kv:
             continue
         k, v = kv.split("=", 1)
-        parsed[k.strip()] = v.strip()
-
-    # 关键: 服务器现在用的是 __Host-aclclouds_session (带 __Host- 前缀)
-    # 但用户复制 cookie 时可能丢失前缀 (因为 __Host- 是浏览器内部前缀,
-    # document.cookie 不返回它, 只有 Application 面板才显示)
-    # 所以: 如果用户提供了 aclclouds_session, 自动改名为 __Host-aclclouds_session
-    if "aclclouds_session" in parsed and "__Host-aclclouds_session" not in parsed:
-        parsed["__Host-aclclouds_session"] = parsed.pop("aclclouds_session")
-        log("🔄 已将 aclclouds_session 重命名为 __Host-aclclouds_session (服务器要求)")
-
-    # 关键: __Host- 前缀的 cookie 有特殊限制 (无 domain, path=/, secure)
-    # requests 的 cookie jar 设置 domain 会破坏 __Host- 语义
-    # 最可靠的方式: 直接用 Cookie header 注入, 绕过 cookie jar
-    # 这样无论怎么重定向, header 都会原样发送 (除非被 requests 跨 host 安全策略拦截)
-    #
-    # 但 requests 跨 host 重定向会重新评估 cookie, 所以我们用两种方式:
-    # 1. 设置 Cookie header (用于首次请求)
-    # 2. 同时设置到 cookie jar 的多个域 (用于重定向后自动携带)
-
-    # 构建 Cookie header 字符串
-    cookie_header_parts = []
-    for k, v in parsed.items():
-        cookie_header_parts.append(f"{k}={v}")
-    cookie_header = "; ".join(cookie_header_parts)
-
-    # 设置到 cookie jar 的多个域 (用于跨 host 重定向后携带)
-    cookie_domains = ["aclclouds.com", ".aclclouds.com", "dash.aclclouds.com"]
-    for k, v in parsed.items():
-        # XSRF-TOKEN 是普通 cookie, 可以设 domain
-        # __Host- 前缀的 cookie 严格来说不能设 domain, 但 requests 不强制
-        # 为了跨 host 重定向能携带, 我们都设置 domain
-        for d in cookie_domains:
-            s.cookies.set(k, v, domain=d, path="/")
-
-    # 同时设置 Cookie header (双保险, 用于首次请求)
-    s.headers["Cookie"] = cookie_header
-
-    # 调试输出
-    log(f"🔍 共解析 {len(parsed)} 个 Cookie:")
-    for k, v in parsed.items():
-        log(f"   - {k} = {v[:30]}...")
-
+        k = k.strip()
+        v = v.strip()
+        # 移除 __Host- 和 __Secure- 前缀（requests 不支持这些前缀）
+        clean_k = k
+        if k.startswith("__Host-"):
+            clean_k = k[7:]  # 移除 "__Host-" (7个字符)
+        elif k.startswith("__Secure-"):
+            clean_k = k[9:]  # 移除 "__Secure-" (9个字符)
+        
+        # 设置 domain 为 dash.aclclouds.com
+        s.cookies.set(clean_k, v, domain="dash.aclclouds.com", path="/")
+    
+    # 调试: 打印设置的 Cookie
+    log(f"🔍 Session 中设置了 {len(s.cookies)} 个 Cookie:")
+    for cookie in s.cookies:
+        log(f"   - {cookie.name} = {cookie.value[:30]}...")
+    
     return s
 
 
 def get_xsrf(session):
-    """从 cookie 中提取并解码 XSRF-TOKEN (跨域查找)"""
-    # 依次尝试几个可能的域
-    for domain in ("aclclouds.com", ".aclclouds.com", "dash.aclclouds.com"):
-        token = session.cookies.get("XSRF-TOKEN", domain=domain)
-        if token:
-            return urllib.parse.unquote(token)
-    # 兜底: 不指定 domain
-    token = session.cookies.get("XSRF-TOKEN")
-    return urllib.parse.unquote(token) if token else None
+    """从 cookie 中提取并解码 XSRF-TOKEN"""
+    token = session.cookies.get("XSRF-TOKEN", domain="dash.aclclouds.com")
+    if not token:
+        return None
+    return urllib.parse.unquote(token)
 
 
 def api_get(session, path):
-    r = session.get(f"{BASE_URL}{path}", timeout=30, allow_redirects=True)
-    return r
+    return session.get(f"{BASE_URL}{path}", timeout=30)
 
 
 def api_post(session, path, payload=None):
@@ -173,24 +141,14 @@ def api_post(session, path, payload=None):
     token = get_xsrf(session)
     if token:
         headers["X-XSRF-TOKEN"] = token
-    return session.post(f"{BASE_URL}{path}", headers=headers, json=payload or {}, timeout=30, allow_redirects=True)
+    return session.post(f"{BASE_URL}{path}", headers=headers, json=payload or {}, timeout=30)
 
 
 def list_servers(session):
-    # ACLClouds: GET /api/client 列服务器
-    # 注意: dash.aclclouds.com/api/client 会 302 → aclclouds.com/api/client
-    # Cookie 必须跨域, 已在 build_session 中设置
+    # ACLClouds 用 GET /api/client (不是 /api/client/servers) 列服务器
+    # 响应: { data: [ { object: "server", attributes: {...} } ], meta: {...} }
     r = api_get(session, "/api/client")
-    if r.status_code != 200:
-        # 打印重定向链路 + 最终 URL 方便排查
-        log(f"🐛 GET /api/client HTTP {r.status_code}")
-        log(f"   最终 URL: {r.url}")
-        if r.history:
-            log(f"   重定向链路:")
-            for h in r.history:
-                log(f"     {h.status_code} {h.url}")
-        log(f"   响应: {r.text[:500]}")
-        r.raise_for_status()
+    r.raise_for_status()
     j = r.json()
     if isinstance(j, dict):
         return j.get("data", [])
@@ -232,49 +190,17 @@ def find_expire(attrs, detail=None):
 
 
 def renew_server(session, sid):
-    """调用续期 API, 返回 (response, captcha_required_bool)
-    尝试多个可能的续期 endpoint, 因为 ACLClouds 可能用不同路径
-    """
-    # 按优先级尝试多个续期 endpoint
-    renew_paths = [
-        f"/api/client/servers/{sid}/upgrade/renew",      # 原始路径
-        f"/api/client/servers/{sid}/renew",              # 简化路径
-        f"/api/client/servers/{sid}/extend",             # extend 路径
-        f"/api/client/servers/{sid}/renewal",            # renewal 路径
-    ]
-
-    last_r = None
-    for path in renew_paths:
-        r = api_post(session, path)
-        last_r = r
-        log(f"🔄 POST {path} → HTTP {r.status_code}")
-
-        # 成功就返回
-        if r.status_code in (200, 201, 202, 204):
-            return r, False
-
-        # 404 = endpoint 不存在, 试下一个
-        if r.status_code == 404:
-            continue
-
-        # 其他状态码: 打印完整响应供诊断, 但不再尝试其他 endpoint
-        captcha_required = False
-        if r.status_code == 403:
-            try:
-                j = r.json()
-                if isinstance(j, dict):
-                    # 多种可能的 captcha 字段
-                    code = j.get("code", "")
-                    if code == "captcha_required" or "captcha" in str(j).lower() or "turnstile" in str(j).lower():
-                        captcha_required = True
-            except Exception:
-                pass
-        # 打印完整响应 (调试用)
-        log(f"   响应 body: {r.text[:500]}")
-        return r, captcha_required
-
-    # 所有 endpoint 都 404
-    return last_r, False
+    """调用续期 API, 返回 (response, captcha_required_bool)"""
+    r = api_post(session, f"/api/client/servers/{sid}/upgrade/renew")
+    captcha_required = False
+    if r.status_code == 403:
+        try:
+            j = r.json()
+            if isinstance(j, dict) and j.get("code") == "captcha_required":
+                captcha_required = True
+        except Exception:
+            pass
+    return r, captcha_required
 
 
 # ==================== 单账号续期流程 ====================
@@ -333,17 +259,6 @@ def process_account(label, cookie_str):
             continue
 
         log(f"\n[{idx}/{len(servers)}] 🖥️ {name} (id={sid}, type={stype})")
-
-        # 打印续期相关字段 (诊断用)
-        can_renew = attrs.get("can_renew")
-        is_free = attrs.get("is_free")
-        free_used = attrs.get("free_renewals_used")
-        free_remaining = attrs.get("free_renewals_remaining")
-        free_max = attrs.get("free_renewals_max")
-        auto_renew = attrs.get("auto_renew")
-        log(f"📊 续期状态: can_renew={can_renew} is_free={is_free} "
-            f"free_renewals={free_used}/{free_max} (剩余 {free_remaining}) "
-            f"auto_renew={auto_renew}")
 
         # 取到期时间 - 列表可能没有, 调详情
         _, expire_str = find_expire(attrs)
