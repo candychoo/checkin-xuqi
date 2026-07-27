@@ -149,9 +149,7 @@ def fmt_remaining(seconds):
 # Cookie 注入
 # ---------------------------------------------------------------------------
 def inject_cookies(sb, cookie_str: str):
-    """先打开站点, 再注入 cookie, 再 reload
-    关键: __Host- 前缀的 cookie 用 CDP 设置 (不设 domain)
-    """
+    """先打开站点, 清除匿名 cookie, 注入用户 cookie, 重新访问页面"""
     if not cookie_str:
         log.warning("Cookie 为空")
         return False
@@ -171,15 +169,23 @@ def inject_cookies(sb, cookie_str: str):
 
     log.info(f"📋 待注入 {len(parsed)} 个 Cookie: {list(parsed.keys())}")
 
-    # 1. 先打开站点
+    # 1. 先打开站点 (获取页面上下文)
     try:
         sb.open(BASE_URL)
-        sb.sleep(3)
+        sb.sleep(2)
     except Exception as e:
         log.warning(f"打开站点失败: {e}")
         return False
 
-    # 2. 注入 cookie
+    # 2. 清除服务器返回的匿名 cookie (避免冲突)
+    try:
+        sb.driver.delete_all_cookies()
+        log.info("🧹 已清除所有匿名 cookie")
+        sb.sleep(1)
+    except Exception as e:
+        log.warning(f"清除 cookie 失败: {e}")
+
+    # 3. 注入用户 cookie
     n_ok, n_fail = 0, 0
     failed_cookies = []
     for k, v in parsed.items():
@@ -203,7 +209,6 @@ def inject_cookies(sb, cookie_str: str):
                 log.info(f"   ✅ {k}")
                 n_ok += 1
         except Exception as e1:
-            # 兜底: 用 driver.add_cookie
             try:
                 sb.driver.add_cookie({
                     "name": k, "value": v,
@@ -221,27 +226,29 @@ def inject_cookies(sb, cookie_str: str):
     if failed_cookies:
         log.warning(f"   失败的 Cookie: {failed_cookies}")
 
-    # 3. 验证 cookie 是否真的注入了
+    # 4. 验证 cookie
     try:
         actual_cookies = sb.driver.get_cookies()
         actual_names = [c.get("name") for c in actual_cookies]
         log.info(f"📋 浏览器实际 Cookie: {actual_names}")
-        # 检查关键 cookie
         has_session = any("aclclouds_session" in n for n in actual_names)
         has_xsrf = "XSRF-TOKEN" in actual_names
         if not has_session:
-            log.warning("⚠️ __Host-aclclouds_session 未注入成功! 登录态会丢失")
+            log.warning("⚠️ __Host-aclclouds_session 未注入成功!")
         if not has_xsrf:
-            log.warning("⚠️ XSRF-TOKEN 未注入成功! CSRF 验证会失败")
+            log.warning("⚠️ XSRF-TOKEN 未注入成功!")
     except Exception as e:
         log.warning(f"验证 cookie 失败: {e}")
 
-    # 4. reload
+    # 5. 重新访问 dashboard (用新 cookie 发请求, 而非 refresh)
+    # 关键: refresh 可能用缓存的匿名 session, open 会用新 cookie
     try:
-        sb.refresh()
-        sb.sleep(2)
-    except Exception:
-        pass
+        log.info(f"🔄 用新 cookie 重新访问 {BASE_URL}/dashboard")
+        sb.open(f"{BASE_URL}/dashboard")
+        sb.sleep(3)
+    except Exception as e:
+        log.warning(f"重新访问失败: {e}")
+
     return n_ok > 0
 
 
