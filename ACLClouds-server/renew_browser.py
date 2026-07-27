@@ -149,7 +149,9 @@ def fmt_remaining(seconds):
 # Cookie 注入
 # ---------------------------------------------------------------------------
 def inject_cookies(sb, cookie_str: str):
-    """先打开站点, 再注入 cookie, 再 reload"""
+    """先打开站点, 再注入 cookie, 再 reload
+    关键: __Host- 前缀的 cookie 用 CDP 设置 (不设 domain)
+    """
     if not cookie_str:
         log.warning("Cookie 为空")
         return False
@@ -165,7 +167,9 @@ def inject_cookies(sb, cookie_str: str):
 
     if "aclclouds_session" in parsed and "__Host-aclclouds_session" not in parsed:
         parsed["__Host-aclclouds_session"] = parsed.pop("aclclouds_session")
-        log("🔄 已将 aclclouds_session 重命名为 __Host-aclclouds_session")
+        log.info("🔄 已将 aclclouds_session 重命名为 __Host-aclclouds_session")
+
+    log.info(f"📋 待注入 {len(parsed)} 个 Cookie: {list(parsed.keys())}")
 
     # 1. 先打开站点
     try:
@@ -177,19 +181,62 @@ def inject_cookies(sb, cookie_str: str):
 
     # 2. 注入 cookie
     n_ok, n_fail = 0, 0
+    failed_cookies = []
     for k, v in parsed.items():
         try:
-            sb.set_cookie(k, v, domain="aclclouds.com")
-            n_ok += 1
-        except Exception:
-            try:
-                sb.driver.add_cookie({"name": k, "value": v, "domain": ".aclclouds.com", "path": "/"})
+            if k.startswith("__Host-"):
+                # __Host- cookie: 用 CDP 设置, 不能设 domain, 必须 path=/, secure
+                sb.driver.execute_cdp_cmd("Network.setCookie", {
+                    "name": k,
+                    "value": v,
+                    "url": BASE_URL,
+                    "path": "/",
+                    "secure": True,
+                    "httpOnly": True,
+                    "sameSite": "Lax",
+                })
+                log.info(f"   ✅ {k} (CDP, __Host- 前缀)")
                 n_ok += 1
-            except Exception:
+            else:
+                # 普通 cookie: 用 set_cookie
+                sb.set_cookie(k, v, domain="aclclouds.com")
+                log.info(f"   ✅ {k}")
+                n_ok += 1
+        except Exception as e1:
+            # 兜底: 用 driver.add_cookie
+            try:
+                sb.driver.add_cookie({
+                    "name": k, "value": v,
+                    "domain": ".aclclouds.com", "path": "/",
+                    "secure": True, "httpOnly": True,
+                })
+                log.info(f"   ✅ {k} (add_cookie 兜底)")
+                n_ok += 1
+            except Exception as e2:
                 n_fail += 1
-    log.info(f"Cookie 注入完成: ✅ {n_ok} 个, ❌ {n_fail} 个")
+                failed_cookies.append(k)
+                log.warning(f"   ❌ {k} 失败: set_cookie={e1}, add_cookie={e2}")
 
-    # 3. reload
+    log.info(f"Cookie 注入完成: ✅ {n_ok} 个, ❌ {n_fail} 个")
+    if failed_cookies:
+        log.warning(f"   失败的 Cookie: {failed_cookies}")
+
+    # 3. 验证 cookie 是否真的注入了
+    try:
+        actual_cookies = sb.driver.get_cookies()
+        actual_names = [c.get("name") for c in actual_cookies]
+        log.info(f"📋 浏览器实际 Cookie: {actual_names}")
+        # 检查关键 cookie
+        has_session = any("aclclouds_session" in n for n in actual_names)
+        has_xsrf = "XSRF-TOKEN" in actual_names
+        if not has_session:
+            log.warning("⚠️ __Host-aclclouds_session 未注入成功! 登录态会丢失")
+        if not has_xsrf:
+            log.warning("⚠️ XSRF-TOKEN 未注入成功! CSRF 验证会失败")
+    except Exception as e:
+        log.warning(f"验证 cookie 失败: {e}")
+
+    # 4. reload
     try:
         sb.refresh()
         sb.sleep(2)
