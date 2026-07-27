@@ -12,7 +12,7 @@
 | --- | --- | --- | --- |
 | [ACLClouds](https://dash.aclclouds.com/projects) | [`ACLClouds-server/`](ACLClouds-server/) | Cookie 注入 | 纯 API, 无浏览器 |
 | [Gaming4Free](https://control.gaming4free.net/) | [`gaming4free-renew/`](gaming4free-renew/) | Cookie 注入 | SeleniumBase UC + Turnstile |
-| [Host2Play](https://panel.host2play.net/) | [`host2play-renew/`](host2play-renew/) | Cookie 注入 | DrissionPage + WARP |
+| [Host2Play](https://panel.host2play.net/) | [`host2play-renew/`](host2play-renew/) | Cookie 注入 | SeleniumBase UC + Hysteria2 |
 
 ---
 
@@ -71,7 +71,7 @@
 │   └── host2play.yml         # Host2Play 续期 (每天 5 次)
 ├── ACLClouds-server/         # ACLClouds 续期脚本 (纯 API)
 ├── gaming4free-renew/        # Gaming4Free 续期脚本 (SeleniumBase UC)
-└── host2play-renew/          # Host2Play 续期脚本 (DrissionPage + WARP)
+└── host2play-renew/          # Host2Play 续期脚本 (SeleniumBase UC + Hysteria2)
 ```
 
 ---

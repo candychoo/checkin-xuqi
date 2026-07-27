@@ -191,6 +191,6 @@ def get_expire_info(page: SeleniumBase) -> tuple:
     
     for _ in range(5):
         try:
-            text =Network error: Stream decode error: error decoding response body
+                        page.driver.get(RENEW_URL)
 
-Please resend your message to try again.
+
