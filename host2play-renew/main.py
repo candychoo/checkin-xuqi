@@ -10,14 +10,18 @@ import json
 import time
 import re
 from datetime import datetime, timedelta, timezone
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, TYPE_CHECKING
 from pathlib import Path
 
-try:
-    from seleniumbase import ConfigGen, SeleniumBase
-    has_sb = True
-except ImportError:
-    has_sb = False
+if TYPE_CHECKING:
+    from seleniumbase import SeleniumBase  # Only for type checking
+else:
+    # Runtime import - may raise ImportError if not installed
+    try:
+        from seleniumbase import ConfigGen, SeleniumBase
+        has_sb = True
+    except ImportError:
+        has_sb = False
 
 try:
     import requests
@@ -41,7 +45,7 @@ OUTPUT_DIR = ROOT / "output" / "screenshots"
 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
 
-def tg_send(msg: str, title: str = "Host2Play"):
+def tg_send(msg: str, title: str = "Host2Play") -> None:
     """Send unified Telegram notification."""
     if not TG_TOKEN or not TG_CHAT_ID:
         return
@@ -78,7 +82,7 @@ def setup_hproxy(proxy_url: Optional[str]) -> Optional[str]:
     return None
 
 
-def create_uc_page(proxy_addr: Optional[str] = None):
+def create_uc_page(proxy_addr: Optional[str] = None) -> "SeleniumBase":
     """Create UC-mode SeleniumBase page."""
     if not has_sb:
         raise ImportError("Please install: pip install seleniumbase")
@@ -101,7 +105,7 @@ def create_uc_page(proxy_addr: Optional[str] = None):
     return page
 
 
-def handle_ad_video(page: SeleniumBase) -> bool:
+def handle_ad_video(page: "SeleniumBase") -> bool:
     """Handle video ad, return True if success/ad skipped."""
     print("Waiting for ad player to appear...")
     
@@ -137,7 +141,7 @@ def handle_ad_video(page: SeleniumBase) -> bool:
     return True
 
 
-def inject_cookies(page: SeleniumBase, cookie_str: str):
+def inject_cookies(page: "SeleniumBase", cookie_str: str) -> None:
     """Inject cookies."""
     if not cookie_str:
         return
@@ -152,7 +156,7 @@ def inject_cookies(page: SeleniumBase, cookie_str: str):
                 print(f"Cookie injection failed {k}: {e}")
 
 
-def get_expire_info(page: SeleniumBase) -> tuple:
+def get_expire_info(page: "SeleniumBase") -> tuple:
     """Return (server_id, expires_text, seconds_remaining)."""
     sid = "Unknown"
     exp_txt = "Unknown"
@@ -170,7 +174,7 @@ def get_expire_info(page: SeleniumBase) -> tuple:
     return "Unknown", "Unknown", -1
 
 
-def renew_server(page: SeleniumBase, account_name: str = "server") -> dict:
+def renew_server(page: "SeleniumBase", account_name: str = "server") -> dict:
     """Execute renewal for a single server, return result dict."""
     result = {
         "name": account_name,
@@ -198,7 +202,7 @@ def renew_server(page: SeleniumBase, account_name: str = "server") -> dict:
     return result
 
 
-def main():
+def main() -> None:
     """Main entry point."""
     print("Host2Play auto-renewal script starting")
     
