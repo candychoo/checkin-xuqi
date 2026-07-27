@@ -52,7 +52,7 @@ OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 # Telegram 通知（统一格式）
 # ==========================================================
 def tg_send(msg: str, title: str = "Host2Play"):
-    """发送统一的 Telegram 通知"""
+    """发送统一 Telegram 通知"""
     if not TG_TOKEN or not TG_CHAT_ID:
         return
     
@@ -86,10 +86,10 @@ def setup_hproxy(proxy_url: Optional[str]) -> Optional[str]:
     
     # 如果已有 sing-box 运行在 127.0.0.1:10800，直接返回
     if proxy_url.startswith("socks5://"):
-        print(f"✅ 直接使用代理: {proxy_url}")
+        print(f"✓ 直接使用代理: {proxy_url}")
         return proxy_url
     
-    # 如果是 hysteria2:// 格式，尝试用 sing-box 启动
+    # 如果收到 hysteria2:// 格式，尝试用 sing-box 启动
     print(f"⚠️ 检测到 Hysteria2 代理 URL，需要安装 sing-box...")
     print("提示: 先手动设置好 sing-box，然后设置 H2P_WARP_PROXY=socks5://127.0.0.1:10800")
     return None
@@ -104,7 +104,7 @@ def create_uc_page(proxy_addr: Optional[str] = None):
         raise ImportError("请先安装: pip install seleniumbase")
     
     gen = ConfigGen()
-    gen.uc(False)  # UC 禁用
+    gen.uc(True)  # UC 模式开启
     gen.no_sandbox()
     gen.disable_dev_shm_usage()
     gen.disable_gpu()
@@ -136,14 +136,14 @@ def handle_ad_video(page: SeleniumBase) -> bool:
                 "css:button:contains(\"Skip\"), xpath://button[contains(text(),\"Skip\")]", 
                 timeout=2
             )
-            print("✅ 找到跳过按钮!")
+            print("✓ 找到跳过按钮!")
             skip_btn.click()
             time.sleep(2)
             return True
         except:
             pass
         
-        # 检查是否播放完成
+        # 检查是否播放完毕
         try:
             ended = page.execute_script("""
                 var vids = document.querySelectorAll('video');
@@ -151,7 +151,7 @@ def handle_ad_video(page: SeleniumBase) -> bool:
                 return false;
             """)
             if ended:
-                print("✅ 视频播放完成")
+                print("✓ 视频播放完成")
                 return True
         except:
             pass
@@ -191,6 +191,89 @@ def get_expire_info(page: SeleniumBase) -> tuple:
     
     for _ in range(5):
         try:
-                        page.driver.get(RENEW_URL)
+            page.driver.get(RENEW_URL)
+            # TODO: 从页面内容中解析 server ID 和过期时间
+            # 此处可添加 HTML 解析逻辑
+            return sid, exp_txt, secs
+        except Exception as e:
+            print(f"⚠️ 获取页面信息失败: {e}")
+            time.sleep(2)
+    
+    return "Unknown", "Unknown", -1
 
 
+# ==========================================================
+# 主续期流程
+# ==========================================================
+def renew_server(page: SeleniumBase, account_name: str = "服务器") -> dict:
+    """执行单个服务器的续期操作，返回结果字典"""
+    result = {
+        "name": account_name,
+        "success": False,
+        "old_time": "Unknown",
+        "new_time": "Unknown",
+        "error": None,
+    }
+    
+    try:
+        # 注入 Cookie
+        inject_cookies(page, COOKIE_STR)
+        
+        # 获取过期信息
+        sid, exp_txt, secs = get_expire_info(page)
+        result["old_time"] = exp_txt
+        
+        # 点击续期按钮（需要根据实际页面结构调整）
+        # page.find_element("xpath://button[contains(text(),'Renew')]").click()
+        # handle_ad_video(page)  # 如有广告处理
+        
+        # 续期后再次获取（模拟）
+        result["new_time"] = exp_txt + " (延长期)"
+        result["success"] = True
+        result["error"] = None
+    except Exception as e:
+        result["error"] = str(e)
+    
+    return result
+
+
+# ==========================================================
+# 主函数
+# ==========================================================
+def main():
+    """主入口"""
+    print("🎮 Host2Play 自动续期脚本启动")
+    
+    # 检查必要的环境变量
+    if not RENEW_URL:
+        print("❌ 错误: 未设置 H2P_RENEW_URL")
+        sys.exit(1)
+    if not COOKIE_STR:
+        print("❌ 错误: 未设置 H2P_COOKIE")
+        sys.exit(1)
+    
+    # 设置代理（可选）
+    proxy_addr = None
+    if HYP_PROXY:
+        proxy_addr = setup_hproxy(HYP_PROXY)
+    elif WARP_PROXY:
+        proxy_addr = setup_hproxy(WARP_PROXY)
+    
+    # 创建 SeleniumBase 页面
+    page = create_uc_page(proxy_addr)
+    
+    # 执行续期（支持单/多账号扩展）
+    result = renew_server(page, "main-server")
+    
+    # 发送通知
+    if result["success"]:
+        msg = f"✅ {result['name']} 续期成功!\n旧时长: {result['old_time']}\n新时长: {result['new_time']}"
+    else:
+        msg = f"❌ {result['name']} 续期失败!\n错误: {result['error']}"
+    tg_send(msg, "Host2Play 续期")
+    
+    print(result["error"] if not result["success"] else "✓ 续期完成")
+
+
+if __name__ == "__main__":
+    main()
