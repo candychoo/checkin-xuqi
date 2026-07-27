@@ -1,4 +1,4 @@
-# Host2Play 自动续期（SeleniumBase UC + Hysteria2 代理版）https://panel.host2play.net/
+# Host2Play 自动续期（SeleniumBase UC + Hysteria2 代理版）https://panel.host2play.net/dashboard
 
 > 利用 GitHub Actions + SeleniumBase UC 模式 + Hysteria2 住宅代理自动续期 Host2Play 服务器。脚本支持 CF Turnstile 自动验证。
 
