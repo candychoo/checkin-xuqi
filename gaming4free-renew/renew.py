@@ -359,36 +359,27 @@ def bypass_turnstile(sb) -> bool:
                         continue
             except Exception as e:
                 log.warning(f"   iframe 点击失败: {e}")
+        else:
+            log.info("   未检测到 CF iframe, 尝试其他方法")
 
         # 方法 B: 用 JS 找 CF checkbox shadow DOM 并点击
         try:
             js_click_result = sb.execute_script("""
                 return (function() {
                     try {
-                        // 找所有 iframe, 看 shadow DOM 里是否有 checkbox
                         var iframes = document.querySelectorAll('iframe');
                         for (var i = 0; i < iframes.length; i++) {
                             var src = (iframes[i].src || '').toLowerCase();
                             if (src.indexOf('challenges.cloudflare') === -1 && src.indexOf('turnstile') === -1) continue;
-                            // 尝试访问 iframe 内部 (同源才行)
                             try {
                                 var doc = iframes[i].contentDocument || iframes[i].contentWindow.document;
                                 if (doc) {
                                     var cb = doc.querySelector('input[type=checkbox], [class*="checkbox"], [class*="cb"], #cf-stage');
-                                    if (cb) {
-                                        cb.click();
-                                        return 'clicked_checkbox_in_iframe';
-                                    }
-                                    // 点击 body
+                                    if (cb) { cb.click(); return 'clicked_checkbox_in_iframe'; }
                                     var body = doc.body;
-                                    if (body) {
-                                        body.click();
-                                        return 'clicked_body_in_iframe';
-                                    }
+                                    if (body) { body.click(); return 'clicked_body_in_iframe'; }
                                 }
-                            } catch(e) {
-                                // 跨域, 无法访问
-                            }
+                            } catch(e) {}
                         }
                         return 'no_clickable_element';
                     } catch(e) { return 'error: ' + e.message; }
@@ -398,28 +389,81 @@ def bypass_turnstile(sb) -> bool:
         except Exception as e:
             log.warning(f"   JS 点击失败: {e}")
 
-        # 方法 C: 用 CDP 命令点击 CF iframe 中心 (绕过 Selenium 限制)
+        # 方法 C: 用 CDP 点击 CF 验证框中心 (关键改进: 不依赖 cf_iframe)
+        # CF Turnstile widget 通常在屏幕中央, checkbox 在 widget 左侧
         try:
-            if cf_iframe:
-                rect = cf_iframe.rect
-                # 用 ActionChains 点击 iframe 中心偏左 (checkbox 位置)
-                center_x = rect['x'] + 30
-                center_y = rect['y'] + rect['height'] // 2
-                log.info(f"   尝试 CDP 点击 ({center_x}, {center_y})")
-                sb.driver.execute_cdp_cmd("Input.dispatchMouseEvent", {
-                    "type": "mousePressed",
-                    "x": center_x, "y": center_y,
-                    "button": "left", "clickCount": 1,
-                })
-                time.sleep(0.2)
-                sb.driver.execute_cdp_cmd("Input.dispatchMouseEvent", {
-                    "type": "mouseReleased",
-                    "x": center_x, "y": center_y,
-                    "button": "left", "clickCount": 1,
-                })
-                log.info("   CDP 点击完成")
+            # 获取窗口尺寸
+            win_size = sb.driver.get_window_size()
+            win_w = win_size.get("width", 1280)
+            win_h = win_size.get("height", 720)
+            log.info(f"   窗口尺寸: {win_w}x{win_h}")
+
+            # CF widget 通常在屏幕中央, checkbox 在 widget 左侧约 30px
+            # 尝试多个位置点击 (中心偏左, 不同高度)
+            click_positions = [
+                (win_w // 2 - 100, win_h // 2),      # 中心偏左
+                (win_w // 2 - 60, win_h // 2 - 50),   # 中心偏左上
+                (win_w // 2 - 60, win_h // 2 + 50),   # 中心偏左下
+                (win_w // 2, win_h // 2),              # 正中心
+            ]
+
+            for idx, (cx, cy) in enumerate(click_positions):
+                log.info(f"   CDP 点击位置 {idx+1}: ({cx}, {cy})")
+                try:
+                    sb.driver.execute_cdp_cmd("Input.dispatchMouseEvent", {
+                        "type": "mousePressed",
+                        "x": cx, "y": cy,
+                        "button": "left", "clickCount": 1,
+                    })
+                    time.sleep(0.2)
+                    sb.driver.execute_cdp_cmd("Input.dispatchMouseEvent", {
+                        "type": "mouseReleased",
+                        "x": cx, "y": cy,
+                        "button": "left", "clickCount": 1,
+                    })
+                    time.sleep(2)
+                    # 检测是否通过
+                    if _check_cf_passed(sb):
+                        log.info(f"   ✅ 点击位置 {idx+1} 后 CF 验证通过!")
+                        return True
+                except Exception as e:
+                    log.warning(f"   CDP 点击 {idx+1} 失败: {e}")
         except Exception as e:
             log.warning(f"   CDP 点击失败: {e}")
+
+        # 方法 D: 用 JS 找所有可能的 CF 元素并点击 (兜底)
+        try:
+            js_find_cf = sb.execute_script("""
+                return (function() {
+                    try {
+                        var results = [];
+                        // 找所有 iframe (不只看 src, 也看 id/class)
+                        var iframes = document.querySelectorAll('iframe');
+                        for (var i = 0; i < iframes.length; i++) {
+                            var f = iframes[i];
+                            var src = (f.src || '').toLowerCase();
+                            var id = (f.id || '').toLowerCase();
+                            var cls = (f.className || '').toLowerCase();
+                            var w = f.getBoundingClientRect().width;
+                            var h = f.getBoundingClientRect().height;
+                            // CF iframe 通常 300x65 或类似尺寸
+                            if (w > 50 && h > 30 && w < 500) {
+                                results.push({
+                                    src: src.substring(0, 80),
+                                    id: id, class: cls,
+                                    w: w, h: h,
+                                    x: f.getBoundingClientRect().x,
+                                    y: f.getBoundingClientRect().y
+                                });
+                            }
+                        }
+                        return JSON.stringify(results);
+                    } catch(e) { return 'error: ' + e.message; }
+                })();
+            """)
+            log.info(f"   所有小尺寸 iframe: {js_find_cf}")
+        except Exception as e:
+            log.warning(f"   iframe 扫描失败: {e}")
 
         # 阶段 3: 点击后等待 60 秒验证完成
         log.info("⏳ 阶段 3: 点击后等待 CF 验证完成 (最多 60 秒)...")
