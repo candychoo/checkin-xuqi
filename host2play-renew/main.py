@@ -1,12 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Host2Play 自动续期脚本（SeleniumBase UC + Hysteria2 代理版）
-==========================================================
-- 使用 SeleniumBase UC 模式（反检测更强）
-- Sing-box Hysteria2 住宅 IP 代理（60.91.157.48）
-- CF Turnstile CDP 自动完成验证
-- 统一 TG 通知格式
+Host2Play auto-renewal script using SeleniumBase UC mode + Hysteria2 proxy
 """
 
 import os
@@ -31,14 +26,12 @@ except ImportError:
     has_requests = False
 
 
-# ==========================================================
-# 配置
-# ==========================================================
+# Configuration
 RENEW_URL = os.getenv("H2P_RENEW_URL", "")
 COOKIE_STR = os.getenv("H2P_COOKIE", "")
-HYP_PROXY = os.getenv("H2P_HYSTERIA2_PROXY", "")  # Hysteria2 代理 URL
-WARP_PROXY = os.getenv("H2P_WARP_PROXY", "")  # 备用 WARP
-RENEW_THRESHOLD_SECONDS = 25 * 3600  # 超过 25h 则跳过
+HYP_PROXY = os.getenv("H2P_HYSTERIA2_PROXY", "")
+WARP_PROXY = os.getenv("H2P_WARP_PROXY", "")
+RENEW_THRESHOLD_SECONDS = 25 * 3600
 TG_TOKEN = os.getenv("TG_BOT_TOKEN", "")
 TG_CHAT_ID = os.getenv("TG_CHAT_ID", "")
 TZ_CN = timezone(timedelta(hours=8))
@@ -48,18 +41,13 @@ OUTPUT_DIR = ROOT / "output" / "screenshots"
 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
 
-# ==========================================================
-# Telegram 通知（统一格式）
-# ==========================================================
 def tg_send(msg: str, title: str = "Host2Play"):
-    """发送统一 Telegram 通知"""
+    """Send unified Telegram notification."""
     if not TG_TOKEN or not TG_CHAT_ID:
         return
     
     now_cn = datetime.now(TZ_CN).strftime("%Y-%m-%d %H:%M:%S")
-    emoji_start = "🎮"
-    
-    formatted = f"{emoji_start} <b>{title}</b>\n⏰ {now_cn}\n\n{msg}"
+    formatted = f"<b>{title}</b>\n{now_cn}\n\n{msg}"
     
     try:
         requests.post(
@@ -73,38 +61,30 @@ def tg_send(msg: str, title: str = "Host2Play"):
             timeout=10,
         )
     except Exception as e:
-        print(f"⚠️ TG 发送失败: {e}")
+        print(f"Telegram send failed: {e}")
 
 
-# ==========================================================
-# Hysteria2 代理设置（如果使用 sing-box）
-# ==========================================================
 def setup_hproxy(proxy_url: Optional[str]) -> Optional[str]:
-    """配置 Hysteria2 代理，返回本地 SOCKS5 地址或 None"""
+    """Configure Hysteria2 proxy, return local SOCKS5 address or None."""
     if not proxy_url:
         return None
     
-    # 如果已有 sing-box 运行在 127.0.0.1:10800，直接返回
     if proxy_url.startswith("socks5://"):
-        print(f"✓ 直接使用代理: {proxy_url}")
+        print(f"Using direct proxy: {proxy_url}")
         return proxy_url
     
-    # 如果收到 hysteria2:// 格式，尝试用 sing-box 启动
-    print(f"⚠️ 检测到 Hysteria2 代理 URL，需要安装 sing-box...")
-    print("提示: 先手动设置好 sing-box，然后设置 H2P_WARP_PROXY=socks5://127.0.0.1:10800")
+    print("Detected Hysteria2 proxy URL, need to install sing-box...")
+    print("Hint: Set up sing-box manually, then set H2P_WARP_PROXY=socks5://127.0.0.1:10800")
     return None
 
 
-# ==========================================================
-# SeleniumBase UC 页面创建
-# ==========================================================
 def create_uc_page(proxy_addr: Optional[str] = None):
-    """创建 UC 模式的 SeleniumBase 页面"""
+    """Create UC-mode SeleniumBase page."""
     if not has_sb:
-        raise ImportError("请先安装: pip install seleniumbase")
+        raise ImportError("Please install: pip install seleniumbase")
     
     gen = ConfigGen()
-    gen.uc(True)  # UC 模式开启
+    gen.uc(True)
     gen.no_sandbox()
     gen.disable_dev_shm_usage()
     gen.disable_gpu()
@@ -121,29 +101,24 @@ def create_uc_page(proxy_addr: Optional[str] = None):
     return page
 
 
-# ==========================================================
-# 视频广告处理
-# ==========================================================
 def handle_ad_video(page: SeleniumBase) -> bool:
-    """处理视频广告，返回 True 表示成功跳过/播放完成"""
-    print("⏳ 等待广告播放器出现...")
+    """Handle video ad, return True if success/ad skipped."""
+    print("Waiting for ad player to appear...")
     
-    # 寻找跳过按钮
     found_skip = False
-    for _ in range(30):  # 最多 30 秒
+    for _ in range(30):
         try:
             skip_btn = page.find_element(
-                "css:button:contains(\"Skip\"), xpath://button[contains(text(),\"Skip\")]", 
+                "css:button:contains(\"Skip\"), xpath://button[contains(text(),\"Skip\")]",
                 timeout=2
             )
-            print("✓ 找到跳过按钮!")
+            print("Found skip button!")
             skip_btn.click()
             time.sleep(2)
             return True
         except:
             pass
         
-        # 检查是否播放完毕
         try:
             ended = page.execute_script("""
                 var vids = document.querySelectorAll('video');
@@ -151,25 +126,22 @@ def handle_ad_video(page: SeleniumBase) -> bool:
                 return false;
             """)
             if ended:
-                print("✓ 视频播放完成")
+                print("Video playback completed")
                 return True
         except:
             pass
         
         time.sleep(1)
     
-    print("⚠️ 广告超时，继续执行")
+    print("Ad timed out, continuing execution")
     return True
 
 
-# ==========================================================
-# Cookie 注入
-# ==========================================================
 def inject_cookies(page: SeleniumBase, cookie_str: str):
-    """注入 Cookie"""
+    """Inject cookies."""
     if not cookie_str:
         return
-    print("🔐 注入 Cookie...")
+    print("Injecting Cookie...")
     for item in cookie_str.split(";"):
         item = item.strip()
         if "=" in item:
@@ -177,14 +149,11 @@ def inject_cookies(page: SeleniumBase, cookie_str: str):
             try:
                 page.add_cookie(k.strip(), v.strip())
             except Exception as e:
-                print(f"⚠️ Cookie 注入失败 {k}: {e}")
+                print(f"Cookie injection failed {k}: {e}")
 
 
-# ==========================================================
-# 获取服务器剩余时间
-# ==========================================================
 def get_expire_info(page: SeleniumBase) -> tuple:
-    """返回 (server_id, expires_text, seconds_remaining)"""
+    """Return (server_id, expires_text, seconds_remaining)."""
     sid = "Unknown"
     exp_txt = "Unknown"
     secs = -1
@@ -192,21 +161,17 @@ def get_expire_info(page: SeleniumBase) -> tuple:
     for _ in range(5):
         try:
             page.driver.get(RENEW_URL)
-            # TODO: 从页面内容中解析 server ID 和过期时间
-            # 此处可添加 HTML 解析逻辑
+            # TODO: Parse server ID and expiration from HTML here
             return sid, exp_txt, secs
         except Exception as e:
-            print(f"⚠️ 获取页面信息失败: {e}")
+            print(f"Failed to fetch page info: {e}")
             time.sleep(2)
     
     return "Unknown", "Unknown", -1
 
 
-# ==========================================================
-# 主续期流程
-# ==========================================================
-def renew_server(page: SeleniumBase, account_name: str = "服务器") -> dict:
-    """执行单个服务器的续期操作，返回结果字典"""
+def renew_server(page: SeleniumBase, account_name: str = "server") -> dict:
+    """Execute renewal for a single server, return result dict."""
     result = {
         "name": account_name,
         "success": False,
@@ -216,19 +181,15 @@ def renew_server(page: SeleniumBase, account_name: str = "服务器") -> dict:
     }
     
     try:
-        # 注入 Cookie
         inject_cookies(page, COOKIE_STR)
-        
-        # 获取过期信息
         sid, exp_txt, secs = get_expire_info(page)
         result["old_time"] = exp_txt
         
-        # 点击续期按钮（需要根据实际页面结构调整）
+        # Click renewal button (adjust based on actual page structure)
         # page.find_element("xpath://button[contains(text(),'Renew')]").click()
-        # handle_ad_video(page)  # 如有广告处理
+        # handle_ad_video(page)
         
-        # 续期后再次获取（模拟）
-        result["new_time"] = exp_txt + " (延长期)"
+        result["new_time"] = exp_txt + " (extended)"
         result["success"] = True
         result["error"] = None
     except Exception as e:
@@ -237,42 +198,33 @@ def renew_server(page: SeleniumBase, account_name: str = "服务器") -> dict:
     return result
 
 
-# ==========================================================
-# 主函数
-# ==========================================================
 def main():
-    """主入口"""
-    print("🎮 Host2Play 自动续期脚本启动")
+    """Main entry point."""
+    print("Host2Play auto-renewal script starting")
     
-    # 检查必要的环境变量
     if not RENEW_URL:
-        print("❌ 错误: 未设置 H2P_RENEW_URL")
+        print("Error: H2P_RENEW_URL not set")
         sys.exit(1)
     if not COOKIE_STR:
-        print("❌ 错误: 未设置 H2P_COOKIE")
+        print("Error: H2P_COOKIE not set")
         sys.exit(1)
     
-    # 设置代理（可选）
     proxy_addr = None
     if HYP_PROXY:
         proxy_addr = setup_hproxy(HYP_PROXY)
     elif WARP_PROXY:
         proxy_addr = setup_hproxy(WARP_PROXY)
     
-    # 创建 SeleniumBase 页面
     page = create_uc_page(proxy_addr)
-    
-    # 执行续期（支持单/多账号扩展）
     result = renew_server(page, "main-server")
     
-    # 发送通知
     if result["success"]:
-        msg = f"✅ {result['name']} 续期成功!\n旧时长: {result['old_time']}\n新时长: {result['new_time']}"
+        msg = f"{result['name']} renewed successfully! Old: {result['old_time']}, New: {result['new_time']}"
     else:
-        msg = f"❌ {result['name']} 续期失败!\n错误: {result['error']}"
-    tg_send(msg, "Host2Play 续期")
+        msg = f"{result['name']} renewal failed! Error: {result['error']}"
+    tg_send(msg, "Host2Play Renewal")
     
-    print(result["error"] if not result["success"] else "✓ 续期完成")
+    print(result["error"] if not result["success"] else "✓ Renewal completed")
 
 
 if __name__ == "__main__":
