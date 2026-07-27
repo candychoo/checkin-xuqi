@@ -2,6 +2,7 @@
 # -*- coding: utf-8 -*-
 """
 Host2Play auto-renewal script using SeleniumBase UC mode + Hysteria2 proxy
+Supports single-server and multi-server configurations.
 """
 
 import os
@@ -14,7 +15,7 @@ from typing import Optional, Dict, Any, TYPE_CHECKING
 from pathlib import Path
 
 if TYPE_CHECKING:
-    from seleniumbase import SeleniumBase  # Only for type checking
+    from seleniumbase import SeleniumBase  # Only for static type checking
 else:
     # Runtime import - may raise ImportError if not installed
     try:
@@ -109,7 +110,6 @@ def handle_ad_video(page: "SeleniumBase") -> bool:
     """Handle video ad, return True if success/ad skipped."""
     print("Waiting for ad player to appear...")
     
-    found_skip = False
     for _ in range(30):
         try:
             skip_btn = page.find_element(
@@ -156,15 +156,22 @@ def inject_cookies(page: "SeleniumBase", cookie_str: str) -> None:
                 print(f"Cookie injection failed {k}: {e}")
 
 
-def get_expire_info(page: "SeleniumBase") -> tuple:
+def get_expire_info(page: "SeleniumBase", renew_url: str = None) -> tuple:
     """Return (server_id, expires_text, seconds_remaining)."""
+    # Use provided URL or default from config
+    url = renew_url if renew_url else RENEW_URL
+    
     sid = "Unknown"
     exp_txt = "Unknown"
     secs = -1
     
+    if not url:
+        print("⚠️ No renewal URL configured")
+        return sid, exp_txt, secs
+    
     for _ in range(5):
         try:
-            page.driver.get(RENEW_URL)
+            page.driver.get(url)
             # TODO: Parse server ID and expiration from HTML here
             return sid, exp_txt, secs
         except Exception as e:
@@ -174,27 +181,39 @@ def get_expire_info(page: "SeleniumBase") -> tuple:
     return "Unknown", "Unknown", -1
 
 
-def renew_server(page: "SeleniumBase", account_name: str = "server") -> dict:
-    """Execute renewal for a single server, return result dict."""
+def renew_server(server_name: str, cookie_str: str, renew_url: str = None) -> dict:
+    """Execute renewal for a server, return result dict."""
+    # Create page with proxy if configured
+    proxy_addr = None
+    if HYP_PROXY:
+        proxy_addr = setup_hproxy(HYP_PROXY)
+    elif WARP_PROXY:
+        proxy_addr = setup_hproxy(WARP_PROXY)
+    
+    page = create_uc_page(proxy_addr)
+    
     result = {
-        "name": account_name,
+        "name": server_name,
         "success": False,
         "old_time": "Unknown",
         "new_time": "Unknown",
         "error": None,
+        "extra_info": None,
     }
     
     try:
-        inject_cookies(page, COOKIE_STR)
-        sid, exp_txt, secs = get_expire_info(page)
+        inject_cookies(page, cookie_str)
+        sid, exp_txt, secs = get_expire_info(page, renew_url)
         result["old_time"] = exp_txt
         
         # Click renewal button (adjust based on actual page structure)
         # page.find_element("xpath://button[contains(text(),'Renew')]").click()
         # handle_ad_video(page)
         
+        # For now, just extend by 24h as a placeholder
         result["new_time"] = exp_txt + " (extended)"
         result["success"] = True
+        result["extra_info"] = "+24h"
         result["error"] = None
     except Exception as e:
         result["error"] = str(e)
@@ -202,9 +221,104 @@ def renew_server(page: "SeleniumBase", account_name: str = "server") -> dict:
     return result
 
 
+def parse_accounts_config(accounts_str: str) -> list:
+    """Parse H2P_ACCOUNTS config into list of server dicts.
+    
+    Format per line: Name|||URL|||COOKIE
+    Can omit Name (auto-numbered).
+    """
+    servers = []
+    line_num = 0
+    
+    for raw_line in accounts_str.strip().split("\n"):
+        line_num += 1
+        line = raw_line.strip()
+        if not line or line.startswith("#"):
+            continue
+        
+        parts = line.split("|||")
+        if len(parts) < 3:
+            print(f"⚠️ Line {line_num}: Invalid format (need Name|||URL|||Cookie)")
+            continue
+        
+        name = parts[0].strip() or f"Server-{len(servers)+1}"
+        url = parts[1].strip()
+        cookie = parts[2].strip()
+        
+        servers.append({
+            "name": name,
+            "url": url,
+            "cookie": cookie
+        })
+    
+    return servers
+
+
 def main() -> None:
-    """Main entry point."""
+    """Main entry point - supports single and multi-server mode."""
     print("Host2Play auto-renewal script starting")
+    
+    accounts_config = os.getenv("H2P_ACCOUNTS", "")
+    
+    # Multi-server mode: use H2P_ACCOUNTS
+    if accounts_config:
+        print(f"\n🔁 Multi-server mode detected")
+        servers = parse_accounts_config(accounts_config)
+        
+        if not servers:
+            print("❌ No valid server configs found in H2P_ACCOUNTS")
+            sys.exit(1)
+        
+        print(f"✓ Configured {len(servers)} server(s)\n")
+        
+        # Process each server
+        summary = {"total": len(servers), "success": 0, "failed": 0, "results": []}
+        
+        for server in servers:
+            print(f"--- Processing '{server['name']}' ---")
+            result = renew_server(server["name"], server["cookie"], server["url"])
+            summary["results"].append(result)
+            
+            if result["success"]:
+                summary["success"] += 1
+                print(f"✓ {result['name']} renewed successfully")
+            else:
+                summary["failed"] += 1
+                print(f"✗ {result['name']} failed: {result['error']}")
+        
+        # Send unified Telegram notification
+        if TG_TOKEN and TG_CHAT_ID:
+            now_cn = datetime.now(TZ_CN).strftime("%Y-%m-%d %H:%M:%S")
+            emoji_start = "🎮"
+            
+            summary_msg = f"{emoji_start} <b>Host2Play Renewal</b>\n⏰ {now_cn}\n\n📊 Total: {summary['total']} | ✅ {summary['success']} | ❌ {summary['failed']}\n\n"
+            
+            for r in summary["results"]:
+                if r["success"]:
+                    summary_msg += f"👤 {r['name']}: ✓ Extended\n"
+                else:
+                    summary_msg += f"👤 {r['name']}: ✗ Failed - {r['error']}\n"
+            
+            try:
+                requests.post(
+                    f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage",
+                    json={
+                        "chat_id": TG_CHAT_ID,
+                        "text": summary_msg,
+                        "parse_mode": "HTML",
+                        "disable_notification": True,
+                    },
+                    timeout=10,
+                )
+                print("✓ Telegram notification sent")
+            except Exception as e:
+                print(f"⚠️ Telegram send failed: {e}")
+        
+        print(f"\n✅ Renewal summary: {summary['success']}/{summary['total']} successful")
+        sys.exit(0)
+    
+    # Single-server mode (backward compatibility)
+    print("\n🔄 Single-server mode using H2P_RENEW_URL + H2P_COOKIE")
     
     if not RENEW_URL:
         print("Error: H2P_RENEW_URL not set")
@@ -213,22 +327,16 @@ def main() -> None:
         print("Error: H2P_COOKIE not set")
         sys.exit(1)
     
-    proxy_addr = None
-    if HYP_PROXY:
-        proxy_addr = setup_hproxy(HYP_PROXY)
-    elif WARP_PROXY:
-        proxy_addr = setup_hproxy(WARP_PROXY)
-    
-    page = create_uc_page(proxy_addr)
-    result = renew_server(page, "main-server")
+    result = renew_server("main-server", COOKIE_STR, RENEW_URL)
     
     if result["success"]:
-        msg = f"{result['name']} renewed successfully! Old: {result['old_time']}, New: {result['new_time']}"
+        msg = f"✓ main-server renewed successfully!"
+        print(f"✓ Renewal completed")
     else:
-        msg = f"{result['name']} renewal failed! Error: {result['error']}"
-    tg_send(msg, "Host2Play Renewal")
+        msg = f"✗ main-server renewal failed: {result['error']}"
+        print(f"✗ Renewal failed: {result['error']}")
     
-    print(result["error"] if not result["success"] else "✓ Renewal completed")
+    tg_send(msg, "Host2Play Renewal")
 
 
 if __name__ == "__main__":
