@@ -1675,30 +1675,47 @@ def process_account(account: dict) -> dict:
                 if last_sec_after > 0:
                     h = last_sec_after // 3600
                     m = (last_sec_after % 3600) // 60
-                    summary = (
-                        f"🎮 [{server['region']}] 续期汇总\n"
-                        f"🖥️ 编号: {server['num']}\n"
-                        f"🔄 续期次数: {server_renewed}\n"
-                        f"🕒 当前剩余: {h}h {m}m\n"
-                        f"📊 {last_msg}"
-                    )
+                    if server_renewed > 0:
+                        summary = (
+                            f"🎮 Gaming4Free 续期通知\n\n"
+                            f"✅ 续期成功\n"
+                            f"👤 服务器: {server['region']} ({server['num']})\n"
+                            f"📅 当前剩余: {h}h {m}m\n"
+                            f"🔄 续期次数: {server_renewed} 次"
+                        )
+                    else:
+                        summary = (
+                            f"🎮 Gaming4Free 续期通知\n\n"
+                            f"ℹ️ 无需续期\n"
+                            f"👤 服务器: {server['region']} ({server['num']})\n"
+                            f"📅 当前剩余: {h}h {m}m"
+                        )
                 else:
-                    summary = (
-                        f"🎮 [{server['region']}] 续期汇总\n"
-                        f"🖥️ 编号: {server['num']}\n"
-                        f"🔄 续期次数: {server_renewed}\n"
-                        f"📊 {last_msg}"
-                    )
+                    if server_renewed > 0:
+                        summary = (
+                            f"🎮 Gaming4Free 续期通知\n\n"
+                            f"✅ 续期成功\n"
+                            f"👤 服务器: {server['region']} ({server['num']})\n"
+                            f"🔄 续期次数: {server_renewed} 次"
+                        )
+                    else:
+                        summary = (
+                            f"🎮 Gaming4Free 续期通知\n\n"
+                            f"ℹ️ {last_msg}"
+                        )
                 log.info(summary)
                 tg(summary)
 
-            msg = (
-                f"🎮 gaming4free 续期完成 [{name}]\n"
-                f"✅ 成功续期: {success_count} 次 | ❌ 失败: {fail_count}\n"
-                f"📊 总计: {len(servers_to_renew)} 个服务器"
-            )
-            log.info(msg)
-            tg(msg)
+            # 总汇总只在有失败时发, 避免刷屏
+            if fail_count > 0:
+                msg = (
+                    f"🎮 Gaming4Free 续期通知\n\n"
+                    f"⚠️ 部分失败\n"
+                    f"✅ 成功: {success_count} | ❌ 失败: {fail_count}\n"
+                    f"📊 总计: {len(servers_to_renew)} 个服务器"
+                )
+                log.info(msg)
+                tg(msg)
             return {
                 "name": name, "ok": True,
                 "total": len(servers_to_renew),
@@ -1799,11 +1816,21 @@ def process_account(account: dict) -> dict:
             # 收尾
             final_sec = get_remaining_seconds(sb)
             h, m = final_sec // 3600, (final_sec % 3600) // 60
-            msg = (
-                f"🎮 gaming4free 续期完成 [{name}]\n"
-                f"✅ 成功点击: {click_count} 次\n"
-                f"🕒 最终剩余: {h}h {m}m"
-            )
+            if click_count > 0:
+                msg = (
+                    f"🎮 Gaming4Free 续期通知\n\n"
+                    f"✅ 续期成功\n"
+                    f"👤 账号: {name}\n"
+                    f"📅 当前剩余: {h}h {m}m\n"
+                    f"🔄 续期次数: {click_count} 次"
+                )
+            else:
+                msg = (
+                    f"🎮 Gaming4Free 续期通知\n\n"
+                    f"ℹ️ 无需续期\n"
+                    f"👤 账号: {name}\n"
+                    f"📅 当前剩余: {h}h {m}m"
+                )
             log.info(msg)
             tg(msg)
             screenshot(sb, "final")
@@ -1839,19 +1866,20 @@ def main():
         except Exception as e:
             log.exception(f"账号 {acc['name']} 异常: {e}")
             res = {"name": acc["name"], "ok": False, "msg": f"异常: {e}"}
-            tg(f"❌ 账号 {acc['name']} 崩溃\n{e}")
+            tg(f"🎮 Gaming4Free 续期通知\n\n❌ 账号 {acc['name']} 崩溃\n{e}")
         all_results.append(res)
 
-    # 汇总
+    # 总汇总只在有失败时发 (成功时每个服务器已经发过了)
     total_renewed = sum(r.get("renewed", 0) for r in all_results if r.get("ok"))
     total_failed = sum(r.get("failed", 0) for r in all_results if r.get("ok"))
-    summary = (
-        f"🎮 gaming4free 续期汇总\n"
-        f"📊 账号数: {len(all_results)}\n"
-        f"✅ 总成功: {total_renewed} | ❌ 总失败: {total_failed}"
-    )
-    log.info(summary)
-    tg(summary)
+    if total_failed > 0:
+        summary = (
+            f"🎮 Gaming4Free 续期通知\n\n"
+            f"⚠️ 部分失败\n"
+            f"✅ 成功: {total_renewed} | ❌ 失败: {total_failed}"
+        )
+        log.info(summary)
+        tg(summary)
 
 
 if __name__ == "__main__":
@@ -1861,5 +1889,5 @@ if __name__ == "__main__":
         log.info("用户中断")
     except Exception as e:
         log.exception(f"未捕获异常: {e}")
-        tg(f"❌ gaming4free 续期崩溃\n{e}")
+        tg(f"🎮 Gaming4Free 续期通知\n\n❌ 脚本崩溃\n📊 {e}")
         sys.exit(1)

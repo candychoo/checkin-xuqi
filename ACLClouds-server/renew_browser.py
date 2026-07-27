@@ -811,7 +811,7 @@ def process_account(account: dict) -> dict:
             # 注入 Cookie
             log.info("🍪 注入 Cookie...")
             if not inject_cookies(sb, cookie):
-                tg(f"❌ [{name}] Cookie 注入失败")
+                tg(f"🎮 ACLClouds 续期通知\n\n❌ Cookie 注入失败\n👤 账号: {name}")
                 return {"name": name, "ok": False, "msg": "Cookie 注入失败"}
 
             # 用浏览器获取服务器列表
@@ -825,7 +825,7 @@ def process_account(account: dict) -> dict:
                     log.warning(f"❌ 浏览器未获取到服务器, 页面文本: {body_text}")
                 except Exception:
                     pass
-                tg(f"❌ [{name}] 未获取到服务器列表 (Cookie 可能失效)")
+                tg(f"🎮 ACLClouds 续期通知\n\n❌ 未获取到服务器列表\n👤 账号: {name}\n💡 Cookie 可能失效")
                 return {"name": name, "ok": False, "msg": "未获取到服务器列表"}
 
             # 筛选需要续期的服务器
@@ -857,7 +857,7 @@ def process_account(account: dict) -> dict:
 
             if not servers_to_renew:
                 log.info("✅ 没有需要续期的服务器")
-                tg(f"✅ [{name}] 无需续期 (所有服务器剩余 >= {RENEW_THRESHOLD_HOURS}h)")
+                tg(f"🎮 ACLClouds 续期通知\n\nℹ️ 无需续期\n👤 账号: {name}\n📅 所有服务器剩余 >= {RENEW_THRESHOLD_HOURS}h")
                 return {"name": name, "ok": True, "renewed": 0, "failed": 0}
 
             log.info(f"📋 需要续期 {len(servers_to_renew)} 台服务器")
@@ -872,30 +872,26 @@ def process_account(account: dict) -> dict:
                         if result.get("renewed"):
                             success_count += 1
                             log.info(f"✅ {srv['name']}: {result.get('msg')}")
+                            tg(f"🎮 ACLClouds 续期通知\n\n✅ 续期成功\n👤 服务器: {srv['name']} ({srv['sid']})\n📊 {result.get('msg')}")
                         else:
                             log.info(f"ℹ️ {srv['name']}: {result.get('msg')}")
                     else:
                         fail_count += 1
                         log.error(f"❌ {srv['name']}: {result.get('msg')}")
                         screenshot(sb, f"error_{srv['sid']}")
+                        tg(f"🎮 ACLClouds 续期通知\n\n❌ 续期失败\n👤 服务器: {srv['name']} ({srv['sid']})\n📊 {result.get('msg')}")
                 except Exception as e:
                     fail_count += 1
                     log.error(f"❌ {srv['name']} 异常: {e}")
                     screenshot(sb, f"error_{srv['sid']}")
+                    tg(f"🎮 ACLClouds 续期通知\n\n❌ 续期异常\n👤 服务器: {srv['name']}\n📊 {e}")
 
-            msg = (
-                f"🎮 ACLClouds 续期汇总 [{name}]\n"
-                f"✅ 成功: {success_count} | ❌ 失败: {fail_count}\n"
-                f"📊 总计: {len(servers_to_renew)} 台服务器"
-            )
-            log.info(msg)
-            tg(msg)
             return {"name": name, "ok": True, "renewed": success_count, "failed": fail_count}
 
     # 3. API 成功的情况: 启动浏览器续期
     if not servers_to_renew:
         log.info("✅ 没有需要续期的服务器")
-        tg(f"✅ [{name}] 无需续期 (所有服务器剩余 >= {RENEW_THRESHOLD_HOURS}h)")
+        tg(f"🎮 ACLClouds 续期通知\n\nℹ️ 无需续期\n👤 账号: {name}\n📅 所有服务器剩余 >= {RENEW_THRESHOLD_HOURS}h")
         return {"name": name, "ok": True, "renewed": 0, "failed": 0}
 
     log.info(f"📋 需要续期 {len(servers_to_renew)} 台服务器")
@@ -948,25 +944,20 @@ def process_account(account: dict) -> dict:
                     if result.get("renewed"):
                         success_count += 1
                         log.info(f"✅ {srv['name']}: {result.get('msg')}")
+                        tg(f"🎮 ACLClouds 续期通知\n\n✅ 续期成功\n👤 服务器: {srv['name']} ({srv['sid']})\n📊 {result.get('msg')}")
                     else:
                         log.info(f"ℹ️ {srv['name']}: {result.get('msg')}")
                 else:
                     fail_count += 1
                     log.error(f"❌ {srv['name']}: {result.get('msg')}")
                     screenshot(sb, f"error_{srv['sid']}")
+                    tg(f"🎮 ACLClouds 续期通知\n\n❌ 续期失败\n👤 服务器: {srv['name']} ({srv['sid']})\n📊 {result.get('msg')}")
             except Exception as e:
                 fail_count += 1
                 log.error(f"❌ {srv['name']} 异常: {e}")
                 screenshot(sb, f"error_{srv['sid']}")
+                tg(f"🎮 ACLClouds 续期通知\n\n❌ 续期异常\n👤 服务器: {srv['name']}\n📊 {e}")
 
-        # 汇总
-        msg = (
-            f"🎮 ACLClouds 续期汇总 [{name}]\n"
-            f"✅ 成功: {success_count} | ❌ 失败: {fail_count}\n"
-            f"📊 总计: {len(servers_to_renew)} 台服务器"
-        )
-        log.info(msg)
-        tg(msg)
         return {"name": name, "ok": True, "renewed": success_count, "failed": fail_count}
 
 
@@ -983,7 +974,7 @@ def main():
     log.info("=" * 60)
 
     if not ACCOUNTS:
-        msg = "❌ 未配置 ACL_COOKIES 或 ACL_ACCOUNTS"
+        msg = "🎮 ACLClouds 续期通知\n\n❌ 未配置 ACL_COOKIES 或 ACL_ACCOUNTS"
         log.error(msg)
         tg(msg)
         sys.exit(1)
@@ -995,18 +986,20 @@ def main():
         except Exception as e:
             log.exception(f"账号 {acc['name']} 异常: {e}")
             res = {"name": acc["name"], "ok": False, "msg": f"异常: {e}"}
-            tg(f"❌ 账号 {acc['name']} 崩溃\n{e}")
+            tg(f"🎮 ACLClouds 续期通知\n\n❌ 账号 {acc['name']} 崩溃\n📊 {e}")
         all_results.append(res)
 
+    # 总汇总只在有失败时发 (成功时每个服务器已经发过了)
     total_renewed = sum(r.get("renewed", 0) for r in all_results if r.get("ok"))
     total_failed = sum(r.get("failed", 0) for r in all_results if r.get("ok"))
-    summary = (
-        f"🎮 ACLClouds 续期汇总\n"
-        f"📊 账号数: {len(all_results)}\n"
-        f"✅ 总成功: {total_renewed} | ❌ 总失败: {total_failed}"
-    )
-    log.info(summary)
-    tg(summary)
+    if total_failed > 0:
+        summary = (
+            f"🎮 ACLClouds 续期通知\n\n"
+            f"⚠️ 部分失败\n"
+            f"✅ 成功: {total_renewed} | ❌ 失败: {total_failed}"
+        )
+        log.info(summary)
+        tg(summary)
 
 
 if __name__ == "__main__":
@@ -1016,5 +1009,5 @@ if __name__ == "__main__":
         log.info("用户中断")
     except Exception as e:
         log.exception(f"未捕获异常: {e}")
-        tg(f"❌ ACLClouds 续期崩溃\n{e}")
+        tg(f"🎮 ACLClouds 续期通知\n\n❌ 脚本崩溃\n📊 {e}")
         sys.exit(1)
