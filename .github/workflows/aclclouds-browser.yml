@@ -1,0 +1,183 @@
+name: ACLClouds-浏览器续期
+
+on:
+  workflow_dispatch:
+  schedule:
+    # 每 6 小时跑一次 (UTC 00,06,12,18 / 北京 08,14,20,02)
+    - cron: '0 0,6,12,18 * * *'
+
+jobs:
+  renew:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    permissions:
+      actions: write
+      contents: read
+
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+        with:
+          lfs: false
+
+      - name: 配置 Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.11'
+
+      - name: 安装系统依赖
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y xvfb xdotool wget \
+            libnss3 libatk1.0-0 libatk-bridge2.0-0 \
+            libcups2 libdrm2 libxkbcommon0 \
+            libxcomposite1 libxrandr2 libgbm1 \
+            libpango-1.0-0 libcairo2 fonts-liberation \
+            libasound2t64 libxss1 libxdamage1 libxfixes3
+
+      - name: 安装 Python 依赖
+        working-directory: ACLClouds-server
+        run: |
+          pip install --upgrade pip
+          pip install seleniumbase>=4.34.0 requests
+
+      - name: 配置代理 (sing-box - hysteria2)
+        continue-on-error: true
+        env:
+          NODE_LINK: ${{ secrets.PROXY_URL }}
+        run: |
+          if [ -z "$NODE_LINK" ]; then
+            echo "未配置 PROXY_URL, 直连"
+            exit 0
+          fi
+
+          echo "=== 用 Python 解析节点链接 ==="
+          PARSED=$(python3 << 'PYEOF'
+          import urllib.parse, json, os, sys
+
+          link = os.environ.get("NODE_LINK", "")
+          if not link:
+              sys.exit(1)
+
+          for prefix in ["hysteria2://", "hy2://", "tuic://", "vless://", "vmess://"]:
+              if link.startswith(prefix):
+                  link = link[len(prefix):]
+                  break
+          link = link.split("#", 1)[0]
+          if "?" in link:
+              main, query = link.split("?", 1)
+          else:
+              main, query = link, ""
+
+          if "@" not in main:
+              sys.exit(1)
+          password_raw, server_part = main.rsplit("@", 1)
+          password = urllib.parse.unquote(password_raw)
+          server, port_str = server_part.rsplit(":", 1)
+          port = int(port_str)
+
+          params = urllib.parse.parse_qs(query)
+          sni = params.get("sni", [""])[0]
+          insecure = False
+          for key in ["insecure", "allowInsecure"]:
+              if key in params and params[key][0] in ("1", "true"):
+                  insecure = True
+
+          # 检测协议
+          orig = os.environ.get("NODE_LINK", "")
+          proto = "hysteria2"
+          if orig.startswith("tuic://"):
+              proto = "tuic"
+          elif orig.startswith("vless://"):
+              proto = "vless"
+
+          config = {
+              "log": {"level": "info"},
+              "inbounds": [
+                  {"type": "socks", "tag": "socks-in", "listen": "127.0.0.1", "listen_port": 1080},
+                  {"type": "http", "tag": "http-in", "listen": "127.0.0.1", "listen_port": 20170}
+              ],
+              "outbounds": []
+          }
+
+          if proto == "hysteria2":
+              config["outbounds"].append({
+                  "type": "hysteria2", "tag": "proxy",
+                  "server": server, "server_port": port,
+                  "password": password,
+                  "tls": {"enabled": True, "server_name": sni, "insecure": insecure}
+              })
+          elif proto == "tuic":
+              config["outbounds"].append({
+                  "type": "tuic", "tag": "proxy",
+                  "server": server, "server_port": port,
+                  "uuid": password.split(":")[0] if ":" in password else password,
+                  "password": password.split(":")[1] if ":" in password else "",
+                  "tls": {"enabled": True, "server_name": sni, "insecure": insecure}
+              })
+          else:
+              # vless 等其他协议, 用 hysteria2 兜底
+              config["outbounds"].append({
+                  "type": "hysteria2", "tag": "proxy",
+                  "server": server, "server_port": port,
+                  "password": password,
+                  "tls": {"enabled": True, "server_name": sni, "insecure": insecure}
+              })
+
+          with open("/tmp/sing-box-config.json", "w") as f:
+              json.dump(config, f, indent=2)
+
+          print(f"SERVER={server}")
+          print(f"PORT={port}")
+          print(f"PROTO={proto}")
+          print(f"SNI={sni}")
+          print(f"INSECURE={insecure}")
+          PYEOF
+          )
+          echo "$PARSED"
+
+          echo "=== 下载 sing-box ==="
+          SB_VERSION="1.13.14"
+          wget -q "https://github.com/SagerNet/sing-box/releases/download/v${SB_VERSION}/sing-box-${SB_VERSION}-linux-amd64.tar.gz" -O /tmp/sb.tar.gz
+          tar -xzf /tmp/sb.tar.gz -C /tmp/
+          SB_BIN="/tmp/sing-box-${SB_VERSION}-linux-amd64/sing-box"
+          chmod +x "$SB_BIN"
+
+          "$SB_BIN" check -c /tmp/sing-box-config.json || { echo "❌ 配置无效"; exit 0; }
+
+          echo "=== 启动 sing-box ==="
+          nohup "$SB_BIN" run -c /tmp/sing-box-config.json > /tmp/sing-box.log 2>&1 &
+          sleep 5
+
+          echo "=== 测试代理 ==="
+          for i in 1 2 3; do
+            IP=$(curl -x "socks5://127.0.0.1:1080" --max-time 10 -s https://api.ipify.org 2>/dev/null)
+            if [ -n "$IP" ]; then
+              echo "✅ 代理连接成功! 出口 IP: $IP"
+              break
+            fi
+            sleep 3
+          done
+
+      - name: 运行浏览器续期脚本
+        env:
+          PYTHONIOENCODING: utf-8
+          ACL_COOKIES: ${{ secrets.ACL_COOKIES }}
+          ACL_ACCOUNTS: ${{ secrets.ACL_ACCOUNTS }}
+          RENEW_THRESHOLD_HOURS: ${{ vars.RENEW_THRESHOLD_HOURS || '48' }}
+          TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
+          TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
+          PROXY_URL: ${{ secrets.PROXY_URL }}
+          SB_SKIP_DRIVER_UPDATE: "true"
+        working-directory: ACLClouds-server
+        run: |
+          xvfb-run --auto-servernum --server-args="-screen 0 1920x1080x24" python renew_browser.py
+
+      - name: 上传调试截图
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: aclclouds-debug-screenshots
+          path: ACLClouds-server/debug_output/
+          if-no-files-found: warn
+          retention-days: 3
