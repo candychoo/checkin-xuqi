@@ -86,9 +86,10 @@ else:
     PROXY_URL = "socks5://127.0.0.1:1080"
 
 MAX_HOURS      = 48            # 续期上限 48 小时
+RENEW_THRESHOLD_HOURS = 45     # 剩余低于 45 小时自动触发续期
 ADD_MINUTES    = 90            # 每次点击 +90 分钟
-COOLDOWN_SEC   = 240           # 冷却 4 分钟
-MAX_CLICKS     = 30            # 单次运行最大点击次数
+COOLDOWN_SEC   = 300           # 冷却 5 分钟 (服务器返回 300 秒)
+MAX_RENEW_ROUNDS = 10          # 单次运行最大续期轮数 (防止无限循环)
 PAGE_TIMEOUT   = 60            # 单页操作超时
 TURNSTILE_WAIT = 90            # Turnstile 等待上限
 
@@ -784,8 +785,12 @@ def diagnose_page(sb):
 
 
 def run_single_server(sb, site_url: str, server_num: str, region: str,
-                      renew_url: str = None) -> bool:
-    """对一个服务器执行续期，返回是否成功"""
+                      renew_url: str = None) -> dict:
+    """对一个服务器执行续期，返回结果 dict
+    返回:
+      {"ok": True/False, "renewed": True/False, "sec_before": N, "sec_after": N, "msg": "..."}
+      renewed=False 表示未续期 (剩余时间 >= 阈值)
+    """
     # 优先用用户提供的完整 URL, 否则尝试多种路径格式
     if renew_url and "/server/" in renew_url:
         url_app = renew_url
@@ -874,6 +879,26 @@ def run_single_server(sb, site_url: str, server_num: str, region: str,
             sec_before = get_remaining_seconds(sb)
             timestamp_before = f"{sec_before//3600:02d}:{(sec_before%3600)//60:02d}:00" if sec_before > 0 else "未知"
     log.info(f"🕒 续期前剩余运行时间: {timestamp_before}")
+
+    # 关键: 检查是否需要续期
+    # 剩余 >= 45h (RENEW_THRESHOLD_HOURS) → 不续期
+    # 剩余 < 45h → 开始续期
+    sec_before_check = time_to_seconds(timestamp_before)
+    if sec_before_check > 0 and sec_before_check >= RENEW_THRESHOLD_HOURS * 3600:
+        h_before = sec_before_check // 3600
+        m_before = (sec_before_check % 3600) // 60
+        log.info(f"✅ 剩余 {h_before}h {m_before}m >= {RENEW_THRESHOLD_HOURS}h 阈值, 无需续期")
+        return {
+            "ok": True, "renewed": False,
+            "sec_before": sec_before_check, "sec_after": sec_before_check,
+            "msg": f"剩余 {h_before}h{m_before}m, 无需续期 (>= {RENEW_THRESHOLD_HOURS}h)"
+        }
+    elif sec_before_check > 0:
+        h_before = sec_before_check // 3600
+        m_before = (sec_before_check % 3600) // 60
+        log.info(f"⚠️ 剩余 {h_before}h {m_before}m < {RENEW_THRESHOLD_HOURS}h 阈值, 开始续期")
+    else:
+        log.info(f"⚠️ 无法确定剩余时间, 尝试续期")
 
     # 滚动到底部找按钮
     try:
@@ -1460,16 +1485,14 @@ def run_single_server(sb, site_url: str, server_num: str, region: str,
     if in_cooldown:
         log.info(f"✅ 续期成功 (冷却状态, 时间未增加但请求已生效)")
         log.info(f"   冷却剩余: {cooldown_seconds}s, 期间无法再次续期")
-        final_shot = screenshot(sb, f"cooldown_{server_num}")
-        msg = (
-            f"✅ [{region}] 续期成功 (冷却中)\n"
-            f"🖥️ 编号: {server_num}\n"
-            f"🕒 续期前: {timestamp_before}\n"
-            f"🕒 续期后: {timestamp_after}\n"
-            f"⏳ 冷却剩余: {cooldown_seconds}s"
-        )
-        tg(msg, photo_path=str(final_shot))
-        return True
+        screenshot(sb, f"cooldown_{server_num}")
+        # 冷却状态不发 TG (避免循环续期时刷屏), 由外层汇总通知
+        return {
+            "ok": True, "renewed": True,
+            "sec_before": sec_before, "sec_after": sec_after,
+            "cooldown": cooldown_seconds,
+            "msg": f"续期成功 (冷却 {cooldown_seconds}s): {timestamp_before} → {timestamp_after}"
+        }
 
     if sec_after <= sec_before + 60 and sec_before != 0:
         raise Exception(
@@ -1477,15 +1500,16 @@ def run_single_server(sb, site_url: str, server_num: str, region: str,
         )
 
     # 成功
-    final_shot = screenshot(sb, f"success_{server_num}")
-    msg = (
-        f"✅ [{region}] 续期成功\n"
-        f"🖥️ 编号: {server_num}\n"
-        f"🕒 续期前: {timestamp_before}\n"
-        f"🎉 续期后: {timestamp_after}"
-    )
-    tg(msg, photo_path=str(final_shot))
-    return True
+    screenshot(sb, f"success_{server_num}")
+    h_after = sec_after // 3600
+    m_after = (sec_after % 3600) // 60
+    log.info(f"🎉 续期成功: {timestamp_before} → {timestamp_after} (剩余 {h_after}h{m_after}m)")
+    # 不发 TG, 由外层循环汇总通知
+    return {
+        "ok": True, "renewed": True,
+        "sec_before": sec_before, "sec_after": sec_after,
+        "msg": f"续期成功: {timestamp_before} → {timestamp_after}"
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -1582,27 +1606,95 @@ def process_account(account: dict) -> dict:
             success_count = 0
             fail_count = 0
             for server in servers_to_renew:
-                try:
-                    # 把 renew_url 传给 run_single_server, 优先用用户提供的完整 URL
-                    if not SERVER_LIST and server_num_from_url:
-                        url_to_use = renew_url  # 用用户提供的完整 URL
-                    else:
-                        url_to_use = None  # 让函数自己拼
-                    if run_single_server(sb, site, server["num"], server["region"],
-                                          renew_url=url_to_use):
+                # 循环续期: 每次续期后检查是否达到 48h 上限
+                round_num = 0
+                server_renewed = 0
+                last_sec_after = 0
+                last_msg = ""
+
+                while round_num < MAX_RENEW_ROUNDS:
+                    round_num += 1
+                    log.info(f"\n{'='*60}")
+                    log.info(f"🔄 续期轮次 {round_num}/{MAX_RENEW_ROUNDS} [{server['region']}]")
+                    log.info(f"{'='*60}")
+
+                    try:
+                        if not SERVER_LIST and server_num_from_url:
+                            url_to_use = renew_url
+                        else:
+                            url_to_use = None
+                        result = run_single_server(sb, site, server["num"], server["region"],
+                                                    renew_url=url_to_use)
+
+                        if not result.get("ok"):
+                            fail_count += 1
+                            log.error(f"❌ 续期失败: {result.get('msg', '未知错误')}")
+                            break  # 失败就跳出循环
+
+                        if not result.get("renewed"):
+                            # 无需续期 (剩余 >= 45h)
+                            log.info(f"✅ {result.get('msg')}")
+                            last_msg = result.get("msg", "")
+                            break  # 不需要续期, 跳出循环
+
+                        # 续期成功
+                        server_renewed += 1
                         success_count += 1
-                    else:
+                        last_sec_after = result.get("sec_after", 0)
+                        last_msg = result.get("msg", "")
+                        h_after = last_sec_after // 3600
+                        m_after = (last_sec_after % 3600) // 60
+                        log.info(f"✅ 第 {round_num} 轮续期成功, 当前剩余 {h_after}h{m_after}m")
+
+                        # 检查是否达到 48h 上限
+                        if last_sec_after >= MAX_HOURS * 3600:
+                            log.info(f"🎉 已达到 {MAX_HOURS}h 上限, 停止续期")
+                            break
+
+                        # 检查是否在冷却期
+                        cooldown = result.get("cooldown", 0)
+                        if cooldown > 0:
+                            log.info(f"⏳ 服务器冷却中 ({cooldown}s), 等待后继续...")
+                            # 等待冷却 + 额外 10 秒缓冲
+                            wait_sec = cooldown + 10
+                            for i in range(wait_sec, 0, -30):
+                                log.info(f"   冷却剩余 {i}s...")
+                                time.sleep(min(30, i))
+                        else:
+                            # 没冷却, 等待 5 秒后继续
+                            log.info("⏳ 等待 5 秒后继续下一轮...")
+                            time.sleep(5)
+
+                    except Exception as e:
+                        log.error(f"❌ [{server['region']}] 第 {round_num} 轮续期失败: {e}")
+                        error_shot = screenshot(sb, f"error_{server['num']}_round{round_num}")
                         fail_count += 1
-                except Exception as e:
-                    log.error(f"❌ [{server['region']}] 续期失败: {e}")
-                    error_shot = screenshot(sb, f"error_{server['num']}")
-                    tg(f"❌ [{server['region']}] 执行失败: {e}\n🖥️ 编号: {server['num']}",
-                       photo_path=str(error_shot))
-                    fail_count += 1
+                        break  # 异常就跳出循环
+
+                # 汇总此服务器的续期结果
+                if last_sec_after > 0:
+                    h = last_sec_after // 3600
+                    m = (last_sec_after % 3600) // 60
+                    summary = (
+                        f"🎮 [{server['region']}] 续期汇总\n"
+                        f"🖥️ 编号: {server['num']}\n"
+                        f"🔄 续期次数: {server_renewed}\n"
+                        f"🕒 当前剩余: {h}h {m}m\n"
+                        f"📊 {last_msg}"
+                    )
+                else:
+                    summary = (
+                        f"🎮 [{server['region']}] 续期汇总\n"
+                        f"🖥️ 编号: {server['num']}\n"
+                        f"🔄 续期次数: {server_renewed}\n"
+                        f"📊 {last_msg}"
+                    )
+                log.info(summary)
+                tg(summary)
 
             msg = (
                 f"🎮 gaming4free 续期完成 [{name}]\n"
-                f"✅ 成功: {success_count} | ❌ 失败: {fail_count}\n"
+                f"✅ 成功续期: {success_count} 次 | ❌ 失败: {fail_count}\n"
                 f"📊 总计: {len(servers_to_renew)} 个服务器"
             )
             log.info(msg)

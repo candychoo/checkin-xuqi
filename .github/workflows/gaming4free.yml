@@ -2,11 +2,13 @@ name: Game4Free 自动续期
 on:
   workflow_dispatch:
   schedule:
-    - cron: '0 1 * * *'
+    # 每 6 小时跑一次 (UTC 00,06,12,18 → 北京时间 08,14,20,02)
+    # 剩余 < 45h 才续期, 所以 6 小时一次足够 (最多掉 6h, 不会低于 39h)
+    - cron: '0 0,6,12,18 * * *'
 jobs:
   renew:
     runs-on: ubuntu-latest
-    timeout-minutes: 180
+    timeout-minutes: 240
     permissions:
       actions: write
       contents: read
