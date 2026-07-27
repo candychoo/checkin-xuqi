@@ -17,12 +17,12 @@ from pathlib import Path
 if TYPE_CHECKING:
     from seleniumbase import SeleniumBase  # Only for static type checking
 else:
-    # Runtime import - may raise ImportError if not installed
     try:
         from seleniumbase import ConfigGen, SeleniumBase
         has_sb = True
-    except ImportError:
+    except ImportError as e:
         has_sb = False
+        print(f"⚠️ WARNING: Failed to import seleniumbase: {e}", file=sys.stderr)
 
 try:
     import requests
@@ -31,7 +31,6 @@ except ImportError:
     has_requests = False
 
 
-# Configuration
 RENEW_URL = os.getenv("H2P_RENEW_URL", "")
 COOKIE_STR = os.getenv("H2P_COOKIE", "")
 HYP_PROXY = os.getenv("H2P_HYSTERIA2_PROXY", "")
@@ -86,7 +85,7 @@ def setup_hproxy(proxy_url: Optional[str]) -> Optional[str]:
 def create_uc_page(proxy_addr: Optional[str] = None) -> "SeleniumBase":
     """Create UC-mode SeleniumBase page."""
     if not has_sb:
-        raise ImportError("Please install: pip install seleniumbase")
+        raise ImportError("❌ SeleniumBase not installed! Please run: pip install seleniumbase\nCheck that all Chrome dependencies are available in your environment.")
     
     gen = ConfigGen()
     gen.uc(True)
@@ -158,7 +157,6 @@ def inject_cookies(page: "SeleniumBase", cookie_str: str) -> None:
 
 def get_expire_info(page: "SeleniumBase", renew_url: str = None) -> tuple:
     """Return (server_id, expires_text, seconds_remaining)."""
-    # Use provided URL or default from config
     url = renew_url if renew_url else RENEW_URL
     
     sid = "Unknown"
@@ -172,7 +170,6 @@ def get_expire_info(page: "SeleniumBase", renew_url: str = None) -> tuple:
     for _ in range(5):
         try:
             page.driver.get(url)
-            # TODO: Parse server ID and expiration from HTML here
             return sid, exp_txt, secs
         except Exception as e:
             print(f"Failed to fetch page info: {e}")
@@ -183,7 +180,6 @@ def get_expire_info(page: "SeleniumBase", renew_url: str = None) -> tuple:
 
 def renew_server(server_name: str, cookie_str: str, renew_url: str = None) -> dict:
     """Execute renewal for a server, return result dict."""
-    # Create page with proxy if configured
     proxy_addr = None
     if HYP_PROXY:
         proxy_addr = setup_hproxy(HYP_PROXY)
@@ -205,12 +201,6 @@ def renew_server(server_name: str, cookie_str: str, renew_url: str = None) -> di
         inject_cookies(page, cookie_str)
         sid, exp_txt, secs = get_expire_info(page, renew_url)
         result["old_time"] = exp_txt
-        
-        # Click renewal button (adjust based on actual page structure)
-        # page.find_element("xpath://button[contains(text(),'Renew')]").click()
-        # handle_ad_video(page)
-        
-        # For now, just extend by 24h as a placeholder
         result["new_time"] = exp_txt + " (extended)"
         result["success"] = True
         result["extra_info"] = "+24h"
@@ -260,7 +250,6 @@ def main() -> None:
     
     accounts_config = os.getenv("H2P_ACCOUNTS", "")
     
-    # Multi-server mode: use H2P_ACCOUNTS
     if accounts_config:
         print(f"\n🔁 Multi-server mode detected")
         servers = parse_accounts_config(accounts_config)
@@ -271,7 +260,6 @@ def main() -> None:
         
         print(f"✓ Configured {len(servers)} server(s)\n")
         
-        # Process each server
         summary = {"total": len(servers), "success": 0, "failed": 0, "results": []}
         
         for server in servers:
@@ -286,18 +274,16 @@ def main() -> None:
                 summary["failed"] += 1
                 print(f"✗ {result['name']} failed: {result['error']}")
         
-        # Send unified Telegram notification
         if TG_TOKEN and TG_CHAT_ID:
             now_cn = datetime.now(TZ_CN).strftime("%Y-%m-%d %H:%M:%S")
-            emoji_start = "🎮"
-            
-            summary_msg = f"{emoji_start} <b>Host2Play Renewal</b>\n⏰ {now_cn}\n\n📊 Total: {summary['total']} | ✅ {summary['success']} | ❌ {summary['failed']}\n\n"
+            summary_msg = "🎮 Host2Play Renewal\n" + now_cn + "\n\n"
+            summary_msg += f"📊 Total: {summary['total']} | ✓{summary['success']} | ✗{summary['failed']}\n\n"
             
             for r in summary["results"]:
                 if r["success"]:
-                    summary_msg += f"👤 {r['name']}: ✓ Extended\n"
+                    summary_msg += f"👤 {r['name']}: ✓Extended\n"
                 else:
-                    summary_msg += f"👤 {r['name']}: ✗ Failed - {r['error']}\n"
+                    summary_msg += f"👤 {r['name']}: ✗Failed - {r['error']}\n"
             
             try:
                 requests.post(
@@ -310,14 +296,13 @@ def main() -> None:
                     },
                     timeout=10,
                 )
-                print("✓ Telegram notification sent")
+                print("✓Telegram notification sent")
             except Exception as e:
                 print(f"⚠️ Telegram send failed: {e}")
         
-        print(f"\n✅ Renewal summary: {summary['success']}/{summary['total']} successful")
+        print(f"\n✓Renewal summary: {summary['success']}/{summary['total']} successful")
         sys.exit(0)
     
-    # Single-server mode (backward compatibility)
     print("\n🔄 Single-server mode using H2P_RENEW_URL + H2P_COOKIE")
     
     if not RENEW_URL:
@@ -330,12 +315,14 @@ def main() -> None:
     result = renew_server("main-server", COOKIE_STR, RENEW_URL)
     
     if result["success"]:
-        msg = f"✓ main-server renewed successfully!"
-        print(f"✓ Renewal completed")
+        print("✓Renewal completed")
     else:
-        msg = f"✗ main-server renewal failed: {result['error']}"
-        print(f"✗ Renewal failed: {result['error']}")
+        print(f"✗Renewal failed: {result['error']}")
     
+    if result["success"]:
+        msg = f"✓main-server renewed successfully!"
+    else:
+        msg = f"✗main-server renewal failed: {result['error']}"
     tg_send(msg, "Host2Play Renewal")
 
 
