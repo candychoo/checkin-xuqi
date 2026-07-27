@@ -33,24 +33,145 @@ jobs:
         run: |
           pip install --upgrade pip
           pip install -r requirements.txt
-      - name: 配置代理 (sing-box)
+      - name: 配置代理 (sing-box - hysteria2)
         continue-on-error: true
         env:
           NODE_LINK: ${{ secrets.PROXY_URL }}
         run: |
-          if [ -n "$NODE_LINK" ]; then
-            bash <(wget -qO- https://main.ssss.nyc.mn/setup_proxy.sh)
-            sleep 5
-            # 测试 SOCKS5 和 HTTP 代理
-            if curl -x "socks5://127.0.0.1:1080" --max-time 5 -s https://api.ipify.org > /dev/null 2>&1; then
+          if [ -z "$NODE_LINK" ]; then
+            echo "未配置 PROXY_URL, 直连"
+            exit 0
+          fi
+
+          echo "=== 用 Python 解析 hysteria2 节点链接 ==="
+          # 用 Python 解析更可靠 (处理 URL encoding, @ 符号等)
+          PARSED=$(python3 << 'PYEOF'
+          import urllib.parse, json, os, sys
+
+          link = os.environ.get("NODE_LINK", "")
+          if not link:
+              print("ERROR: NODE_LINK empty", file=sys.stderr)
+              sys.exit(1)
+
+          # 去掉协议前缀
+          for prefix in ["hysteria2://", "hy2://"]:
+              if link.startswith(prefix):
+                  link = link[len(prefix):]
+                  break
+
+          # 去掉 # 别名
+          link = link.split("#", 1)[0]
+
+          # 分离 query
+          if "?" in link:
+              main, query = link.split("?", 1)
+          else:
+              main, query = link, ""
+
+          # 用 rsplit 从右边分离 password@host:port
+          # password 可能含 @, 所以从右边 split
+          if "@" not in main:
+              print("ERROR: no @ in link", file=sys.stderr)
+              sys.exit(1)
+          password_raw, server_part = main.rsplit("@", 1)
+          password = urllib.parse.unquote(password_raw)
+
+          # host:port
+          if ":" not in server_part:
+              print("ERROR: no port", file=sys.stderr)
+              sys.exit(1)
+          server, port_str = server_part.rsplit(":", 1)
+          port = int(port_str)
+
+          # 解析 query 参数
+          params = urllib.parse.parse_qs(query)
+          sni = params.get("sni", [""])[0]
+          insecure = False
+          for key in ["insecure", "allowInsecure"]:
+              if key in params and params[key][0] in ("1", "true"):
+                  insecure = True
+
+          # 生成 sing-box 配置
+          config = {
+              "log": {"level": "info"},
+              "inbounds": [
+                  {"type": "socks", "tag": "socks-in", "listen": "127.0.0.1", "listen_port": 1080},
+                  {"type": "http", "tag": "http-in", "listen": "127.0.0.1", "listen_port": 20170}
+              ],
+              "outbounds": [
+                  {
+                      "type": "hysteria2",
+                      "tag": "proxy",
+                      "server": server,
+                      "server_port": port,
+                      "password": password,
+                      "tls": {
+                          "enabled": True,
+                          "server_name": sni,
+                          "insecure": insecure
+                      }
+                  }
+              ]
+          }
+
+          # 输出到文件 + stdout
+          with open("/tmp/sing-box-config.json", "w") as f:
+              json.dump(config, f, indent=2)
+
+          # 输出摘要 (不泄露完整密码)
+          print(f"SERVER={server}")
+          print(f"PORT={port}")
+          print(f"SNI={sni}")
+          print(f"INSECURE={insecure}")
+          print(f"PASSWORD_LEN={len(password)}")
+          print(f"PASSWORD_PREFIX={password[:10]}...")
+          PYEOF
+          )
+          echo "$PARSED"
+
+          # 下载 sing-box
+          echo "=== 下载 sing-box ==="
+          SB_VERSION="1.13.14"
+          wget -q "https://github.com/SagerNet/sing-box/releases/download/v${SB_VERSION}/sing-box-${SB_VERSION}-linux-amd64.tar.gz" -O /tmp/sb.tar.gz
+          tar -xzf /tmp/sb.tar.gz -C /tmp/
+          SB_BIN="/tmp/sing-box-${SB_VERSION}-linux-amd64/sing-box"
+          chmod +x "$SB_BIN"
+
+          # 验证配置
+          echo "=== 验证 sing-box 配置 ==="
+          "$SB_BIN" check -c /tmp/sing-box-config.json || { echo "❌ 配置无效"; exit 1; }
+
+          echo "=== sing-box 配置内容 ==="
+          cat /tmp/sing-box-config.json
+
+          # 启动 sing-box
+          echo "=== 启动 sing-box ==="
+          nohup "$SB_BIN" run -c /tmp/sing-box-config.json > /tmp/sing-box.log 2>&1 &
+          SB_PID=$!
+          echo "sing-box PID: $SB_PID"
+          sleep 5
+
+          # 测试代理
+          echo "=== 测试代理连通性 ==="
+          PROXY_OK=false
+          for i in 1 2 3; do
+            IP=$(curl -x "socks5://127.0.0.1:1080" --max-time 10 -s https://api.ipify.org 2>/dev/null)
+            if [ -n "$IP" ]; then
+              echo "✅ 代理连接成功! 出口 IP: $IP"
               echo "IS_PROXY=true" >> $GITHUB_ENV
-              echo "代理连通性测试通过 (SOCKS5)"
-            elif curl -x "http://127.0.0.1:20170" --max-time 5 -s https://api.ipify.org > /dev/null 2>&1; then
-              echo "IS_PROXY=true" >> $GITHUB_ENV
-              echo "代理连通性测试通过 (HTTP)"
-            else
-              echo "代理连通性测试失败，将直连"
+              PROXY_OK=true
+              break
             fi
+            echo "⚠️ 尝试 $i/3 失败, 等待 3 秒..."
+            sleep 3
+          done
+
+          # 如果失败, 打印 sing-box 日志
+          if [ "$PROXY_OK" != "true" ]; then
+            echo "❌ 代理连接失败"
+            echo "---- sing-box 日志 ----"
+            cat /tmp/sing-box.log 2>/dev/null | tail -30
+            echo "----------------------"
           fi
       - name: 运行续期脚本
         env:
