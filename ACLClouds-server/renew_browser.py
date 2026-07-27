@@ -588,6 +588,92 @@ def renew_single_server(sb, sid: str, name: str, expires_at: str) -> dict:
     return {"ok": True, "renewed": True, "msg": "续期请求已发送 (结果未确认)"}
 
 
+def get_servers_via_browser(sb):
+    """用浏览器获取服务器列表 (API 失败时的兜底)
+    打开 /dashboard 或 /projects 页面, 解析服务器卡片
+    """
+    log.info("🌐 用浏览器获取服务器列表...")
+    servers = []
+    try:
+        # 打开 dashboard 页面
+        sb.uc_open_with_reconnect(f"{BASE_URL}/dashboard", reconnect_time=5)
+        human_wait(5, 8)
+
+        # 检查登录状态
+        current_url = sb.get_current_url().lower()
+        if "login" in current_url or "auth" in current_url:
+            log.warning("⚠️ 浏览器未登录 (Cookie 失效)")
+            return []
+
+        # 处理 CF 5 秒盾
+        for _ in range(10):
+            try:
+                if "just a moment" in sb.get_text("body").lower():
+                    time.sleep(1)
+                else:
+                    break
+            except Exception:
+                time.sleep(1)
+
+        # CF Turnstile
+        bypass_turnstile(sb)
+
+        # 用 JS 解析页面上的服务器链接
+        # ACLClouds/Pelican 的服务器链接通常是 /server/{identifier}
+        result = sb.execute_script("""
+            return (function() {
+                try {
+                    var servers = [];
+                    // 找所有 /server/{id} 链接
+                    var links = document.querySelectorAll('a[href*="/server/"]');
+                    var seen = {};
+                    for (var i = 0; i < links.length; i++) {
+                        var href = links[i].getAttribute('href') || '';
+                        var m = href.match(/\\/server\\/([a-f0-9]{8,})/i);
+                        if (m && !seen[m[1]]) {
+                            seen[m[1]] = true;
+                            // 尝试获取服务器名称 (通常是链接文字或附近元素)
+                            var name = (links[i].innerText || '').trim().substring(0, 50) || 'server-' + m[1].substring(0, 8);
+                            // 尝试找到期时间 (在父元素里找)
+                            var parent = links[i].closest('div, li, tr, article, section');
+                            var expiresAt = null;
+                            if (parent) {
+                                var text = parent.innerText || '';
+                                // 匹配各种日期格式
+                                var dateM = text.match(/(\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}[\\+\\-]\\d{2}:?\\d{2}|\\d{4}-\\d{2}-\\d{2}\\s\\d{2}:\\d{2}:\\d{2}|\\d{4}-\\d{2}-\\d{2})/);
+                                if (dateM) expiresAt = dateM[1];
+                                // 匹配 "X days" / "Xh" 等
+                                var remM = text.match(/(\\d+)\\s*(days?|hours?|h|d)\\s*(remaining|left|剩)/i);
+                                if (remM) expiresAt = 'relative:' + remM[1] + remM[2];
+                            }
+                            servers.push({id: m[1], name: name, expiresAt: expiresAt});
+                        }
+                    }
+                    return JSON.stringify(servers);
+                } catch(e) { return JSON.stringify({error: e.message}); }
+            })();
+        """)
+        import json as _json
+        data = _json.loads(result) if result else []
+        if isinstance(data, list):
+            for srv in data:
+                servers.append({
+                    "attributes": {
+                        "identifier": srv.get("id"),
+                        "name": srv.get("name", "unknown"),
+                        "expires_at": srv.get("expiresAt"),
+                        "can_renew": True,
+                    }
+                })
+            log.info(f"✅ 浏览器获取到 {len(servers)} 台服务器")
+        else:
+            log.warning(f"⚠️ 浏览器解析失败: {data}")
+    except Exception as e:
+        log.warning(f"⚠️ 浏览器获取服务器列表失败: {e}")
+
+    return servers
+
+
 # ---------------------------------------------------------------------------
 # 单账号续期
 # ---------------------------------------------------------------------------
@@ -602,10 +688,11 @@ def process_account(account: dict) -> dict:
     # 1. 先用 API 获取服务器列表 (快)
     log.info("📋 用 API 获取服务器列表...")
     servers = get_servers_via_api(cookie)
-    if not servers:
-        log.warning("⚠️ API 获取服务器列表失败或为空, 尝试用浏览器")
+    api_failed = not servers
+    if api_failed:
+        log.warning("⚠️ API 获取服务器列表失败 (可能 Cookie 过期或需浏览器登录)")
     else:
-        log.info(f"✅ 获取到 {len(servers)} 台服务器")
+        log.info(f"✅ API 获取到 {len(servers)} 台服务器")
 
     # 筛选需要续期的服务器
     servers_to_renew = []
@@ -631,6 +718,127 @@ def process_account(account: dict) -> dict:
         elif h_left and h_left >= RENEW_THRESHOLD_HOURS:
             log.info(f"    ✅ 剩余 {h_left:.1f}h >= {RENEW_THRESHOLD_HOURS}h, 跳过")
 
+    # 2. 如果 API 失败, 启动浏览器获取服务器列表
+    if api_failed:
+        log.info("🌐 API 失败, 启动浏览器获取服务器列表 + 续期...")
+
+        proxy_port = 1080
+        if PROXY_URL:
+            port_match = re.search(r":(\d+)$", PROXY_URL.rstrip("/"))
+            proxy_port = int(port_match.group(1)) if port_match else 1080
+
+        try:
+            s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            s.settimeout(3)
+            s.connect(("127.0.0.1", proxy_port))
+            s.close()
+            log.info(f"✅ 代理 SOCKS5 端口 {proxy_port} 可用")
+        except Exception:
+            log.warning(f"⚠️ 代理端口 {proxy_port} 不可达, 直连")
+
+        CHROMIUM_ARGS = (
+            f"--no-sandbox,--disable-dev-shm-usage,--disable-gpu,"
+            f"--window-size=1280,720,--disable-blink-features=AutomationControlled,"
+            f"--disable-infobars,--disable-popup-blocking,--proxy-server={PROXY_URL}"
+        )
+
+        from seleniumbase import SB
+        with SB(
+            browser="chrome",
+            uc=True,
+            test=True,
+            headed=True,
+            headless=False,
+            xvfb=True,
+            chromium_arg=CHROMIUM_ARGS,
+        ) as sb:
+            sb.set_window_size(1280, 720)
+
+            # 注入 Cookie
+            log.info("🍪 注入 Cookie...")
+            if not inject_cookies(sb, cookie):
+                tg(f"❌ [{name}] Cookie 注入失败")
+                return {"name": name, "ok": False, "msg": "Cookie 注入失败"}
+
+            # 用浏览器获取服务器列表
+            browser_servers = get_servers_via_browser(sb)
+            if not browser_servers:
+                # 截图诊断
+                screenshot(sb, "no_servers")
+                # 打印页面文本帮助排查
+                try:
+                    body_text = sb.get_text("body")[:800]
+                    log.warning(f"❌ 浏览器未获取到服务器, 页面文本: {body_text}")
+                except Exception:
+                    pass
+                tg(f"❌ [{name}] 未获取到服务器列表 (Cookie 可能失效)")
+                return {"name": name, "ok": False, "msg": "未获取到服务器列表"}
+
+            # 筛选需要续期的服务器
+            log.info(f"📋 浏览器获取到 {len(browser_servers)} 台服务器, 筛选需要续期的...")
+            for srv in browser_servers:
+                attrs = srv.get("attributes", srv)
+                sid = attrs.get("identifier")
+                sname = attrs.get("name", "unknown")
+                expires_at = attrs.get("expires_at")
+                can_renew = attrs.get("can_renew", True)
+
+                if not sid:
+                    continue
+
+                expire = parse_iso(expires_at)
+                remaining = (expire - now).total_seconds() if expire else None
+                h_left = remaining / 3600 if remaining else None
+
+                log.info(f"  - {sname} (id={sid}) 到期={expires_at} 剩余={fmt_remaining(remaining)} can_renew={can_renew}")
+
+                # 如果无法解析到期时间或剩余 < 48h, 加入续期列表
+                if h_left is None:
+                    log.info(f"    ⚠️ 无法解析到期时间, 加入续期列表")
+                    servers_to_renew.append({"sid": sid, "name": sname, "expires_at": expires_at})
+                elif h_left < RENEW_THRESHOLD_HOURS and can_renew:
+                    servers_to_renew.append({"sid": sid, "name": sname, "expires_at": expires_at})
+                elif h_left >= RENEW_THRESHOLD_HOURS:
+                    log.info(f"    ✅ 剩余 {h_left:.1f}h >= {RENEW_THRESHOLD_HOURS}h, 跳过")
+
+            if not servers_to_renew:
+                log.info("✅ 没有需要续期的服务器")
+                tg(f"✅ [{name}] 无需续期 (所有服务器剩余 >= {RENEW_THRESHOLD_HOURS}h)")
+                return {"name": name, "ok": True, "renewed": 0, "failed": 0}
+
+            log.info(f"📋 需要续期 {len(servers_to_renew)} 台服务器")
+
+            # 循环续期 (浏览器已经在 get_servers_via_browser 里打开了, 直接续期)
+            success_count = 0
+            fail_count = 0
+            for srv in servers_to_renew:
+                try:
+                    result = renew_single_server(sb, srv["sid"], srv["name"], srv.get("expires_at") or "")
+                    if result.get("ok"):
+                        if result.get("renewed"):
+                            success_count += 1
+                            log.info(f"✅ {srv['name']}: {result.get('msg')}")
+                        else:
+                            log.info(f"ℹ️ {srv['name']}: {result.get('msg')}")
+                    else:
+                        fail_count += 1
+                        log.error(f"❌ {srv['name']}: {result.get('msg')}")
+                        screenshot(sb, f"error_{srv['sid']}")
+                except Exception as e:
+                    fail_count += 1
+                    log.error(f"❌ {srv['name']} 异常: {e}")
+                    screenshot(sb, f"error_{srv['sid']}")
+
+            msg = (
+                f"🎮 ACLClouds 续期汇总 [{name}]\n"
+                f"✅ 成功: {success_count} | ❌ 失败: {fail_count}\n"
+                f"📊 总计: {len(servers_to_renew)} 台服务器"
+            )
+            log.info(msg)
+            tg(msg)
+            return {"name": name, "ok": True, "renewed": success_count, "failed": fail_count}
+
+    # 3. API 成功的情况: 启动浏览器续期
     if not servers_to_renew:
         log.info("✅ 没有需要续期的服务器")
         tg(f"✅ [{name}] 无需续期 (所有服务器剩余 >= {RENEW_THRESHOLD_HOURS}h)")
@@ -638,14 +846,12 @@ def process_account(account: dict) -> dict:
 
     log.info(f"📋 需要续期 {len(servers_to_renew)} 台服务器")
 
-    # 2. 启动浏览器续期
-    # 解析代理端口
+    # 启动浏览器续期
     proxy_port = 1080
     if PROXY_URL:
         port_match = re.search(r":(\d+)$", PROXY_URL.rstrip("/"))
         proxy_port = int(port_match.group(1)) if port_match else 1080
 
-    # 预检代理
     try:
         s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         s.settimeout(3)
