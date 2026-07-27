@@ -341,6 +341,45 @@ def bypass_turnstile(sb) -> bool:
         # 关键: 中风险 IP (60%) 需要点击 checkbox 才能验证
         log.info("🖱️ 阶段 2: CF 未自动通过, 尝试点击 checkbox...")
 
+        # 方法 0: 用 JS 精确找到 CF widget 元素并获取坐标 (最可靠)
+        # VLM 分析: CF widget 是 870x110 的 div, checkbox 在左侧约 (50, 55) 相对位置
+        cf_widget_info = None
+        try:
+            cf_widget_info = sb.execute_script("""
+                return (function() {
+                    try {
+                        // 找所有 div, 找含 'Verify' 'human' '正在验证' 的小尺寸元素 (真正的 CF widget)
+                        var els = document.querySelectorAll('div, section');
+                        var candidates = [];
+                        for (var i = 0; i < els.length; i++) {
+                            var el = els[i];
+                            var rect = el.getBoundingClientRect();
+                            // 真正的 CF widget: 宽 200-900, 高 50-200
+                            if (rect.width < 200 || rect.width > 900) continue;
+                            if (rect.height < 50 || rect.height > 200) continue;
+                            var t = (el.innerText || '').toLowerCase();
+                            if ((t.indexOf('verify') !== -1 && t.indexOf('human') !== -1) ||
+                                t.indexOf('正在验证') !== -1 ||
+                                t.indexOf('人机验证') !== -1) {
+                                candidates.push({
+                                    x: rect.x, y: rect.y,
+                                    w: rect.width, h: rect.height,
+                                    text: t.substring(0, 60)
+                                });
+                            }
+                        }
+                        // 选最接近 870x110 的 (VLM 分析的真实尺寸)
+                        if (candidates.length === 0) return JSON.stringify({found: false, count: 0});
+                        // 选面积最大的 (通常是真正的 widget)
+                        candidates.sort(function(a, b) { return (b.w * b.h) - (a.w * a.h); });
+                        return JSON.stringify({found: true, count: candidates.length, widget: candidates[0], all: candidates.slice(0, 3)});
+                    } catch(e) { return JSON.stringify({found: false, error: e.message}); }
+                })();
+            """)
+            log.info(f"   CF widget 检测: {cf_widget_info}")
+        except Exception as e:
+            log.warning(f"   CF widget 检测失败: {e}")
+
         # 方法 A: 找 CF iframe 并用 ActionChains 点击 checkbox 区域
         if cf_iframe:
             try:
@@ -348,7 +387,6 @@ def bypass_turnstile(sb) -> bool:
                 width = size.get("width", 0)
                 height = size.get("height", 0)
                 log.info(f"   CF iframe 尺寸: {width}x{height}")
-                # checkbox 通常在 iframe 左侧, 距左边约 25-35px
                 for offset_x in [25, 30, 35, -25, -30]:
                     try:
                         ac = ActionChains(sb.driver)
@@ -389,40 +427,55 @@ def bypass_turnstile(sb) -> bool:
         except Exception as e:
             log.warning(f"   JS 点击失败: {e}")
 
-        # 方法 C: 用 CDP 点击 CF 验证框中心 (关键改进: 不依赖 cf_iframe)
-        # CF Turnstile widget 通常在屏幕中央, checkbox 在 widget 左侧
+        # 方法 C: 用 CDP 点击 CF widget 的 checkbox 位置 (关键改进: 用 widget 坐标)
         try:
-            # 获取窗口尺寸
-            win_size = sb.driver.get_window_size()
-            win_w = win_size.get("width", 1280)
-            win_h = win_size.get("height", 720)
-            log.info(f"   窗口尺寸: {win_w}x{win_h}")
+            import json as _json2
+            widget_info = _json2.loads(cf_widget_info) if cf_widget_info else {}
+            click_positions = []
 
-            # CF widget 通常在屏幕中央, checkbox 在 widget 左侧约 30px
-            # 尝试多个位置点击 (中心偏左, 不同高度)
-            click_positions = [
-                (win_w // 2 - 100, win_h // 2),      # 中心偏左
-                (win_w // 2 - 60, win_h // 2 - 50),   # 中心偏左上
-                (win_w // 2 - 60, win_h // 2 + 50),   # 中心偏左下
-                (win_w // 2, win_h // 2),              # 正中心
-            ]
+            if widget_info.get("found") and widget_info.get("widget"):
+                w = widget_info["widget"]
+                log.info(f"   CF widget 位置: ({w['x']:.0f}, {w['y']:.0f}) 尺寸 {w['w']:.0f}x{w['h']:.0f}")
+                # checkbox 在 widget 左侧约 50px, 垂直居中
+                cb_x = w['x'] + 50
+                cb_y = w['y'] + w['h'] / 2
+                click_positions = [
+                    (cb_x, cb_y),                    # checkbox 中心
+                    (w['x'] + 30, cb_y),             # 更靠左
+                    (w['x'] + 70, cb_y),             # 更靠右
+                    (w['x'] + w['w'] / 2, cb_y),     # widget 中心
+                ]
+                log.info(f"   checkbox 目标位置: ({cb_x:.0f}, {cb_y:.0f})")
+            else:
+                # 兜底: 用屏幕中心多位置 (VLM 说 widget 在左侧偏上, 约 40,275)
+                win_size = sb.driver.get_window_size()
+                win_w = win_size.get("width", 1280)
+                win_h = win_size.get("height", 720)
+                log.info(f"   未找到 widget, 用预设位置 (窗口 {win_w}x{win_h})")
+                # 按比例: 40/1920, 330/1080
+                click_positions = [
+                    (win_w * 0.1, win_h * 0.46),     # 左侧偏上 (VLM 坐标按比例)
+                    (win_w * 0.15, win_h * 0.5),     # 左侧中间
+                    (win_w * 0.5, win_h * 0.46),     # 中心偏上
+                    (win_w * 0.5, win_h * 0.5),      # 正中心
+                ]
 
             for idx, (cx, cy) in enumerate(click_positions):
-                log.info(f"   CDP 点击位置 {idx+1}: ({cx}, {cy})")
+                cx_int, cy_int = int(cx), int(cy)
+                log.info(f"   CDP 点击位置 {idx+1}: ({cx_int}, {cy_int})")
                 try:
                     sb.driver.execute_cdp_cmd("Input.dispatchMouseEvent", {
                         "type": "mousePressed",
-                        "x": cx, "y": cy,
+                        "x": cx_int, "y": cy_int,
                         "button": "left", "clickCount": 1,
                     })
                     time.sleep(0.2)
                     sb.driver.execute_cdp_cmd("Input.dispatchMouseEvent", {
                         "type": "mouseReleased",
-                        "x": cx, "y": cy,
+                        "x": cx_int, "y": cy_int,
                         "button": "left", "clickCount": 1,
                     })
                     time.sleep(2)
-                    # 检测是否通过
                     if _check_cf_passed(sb):
                         log.info(f"   ✅ 点击位置 {idx+1} 后 CF 验证通过!")
                         return True
@@ -431,13 +484,12 @@ def bypass_turnstile(sb) -> bool:
         except Exception as e:
             log.warning(f"   CDP 点击失败: {e}")
 
-        # 方法 D: 用 JS 找所有可能的 CF 元素并点击 (兜底)
+        # 方法 D: 用 JS 扫描所有小尺寸 iframe (诊断用)
         try:
             js_find_cf = sb.execute_script("""
                 return (function() {
                     try {
                         var results = [];
-                        // 找所有 iframe (不只看 src, 也看 id/class)
                         var iframes = document.querySelectorAll('iframe');
                         for (var i = 0; i < iframes.length; i++) {
                             var f = iframes[i];
@@ -446,15 +498,8 @@ def bypass_turnstile(sb) -> bool:
                             var cls = (f.className || '').toLowerCase();
                             var w = f.getBoundingClientRect().width;
                             var h = f.getBoundingClientRect().height;
-                            // CF iframe 通常 300x65 或类似尺寸
                             if (w > 50 && h > 30 && w < 500) {
-                                results.push({
-                                    src: src.substring(0, 80),
-                                    id: id, class: cls,
-                                    w: w, h: h,
-                                    x: f.getBoundingClientRect().x,
-                                    y: f.getBoundingClientRect().y
-                                });
+                                results.push({src: src.substring(0, 80), id: id, class: cls, w: w, h: h, x: f.getBoundingClientRect().x, y: f.getBoundingClientRect().y});
                             }
                         }
                         return JSON.stringify(results);
