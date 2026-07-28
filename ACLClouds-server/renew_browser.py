@@ -185,14 +185,16 @@ def inject_cookies(sb, cookie_str: str):
     except Exception as e:
         log.warning(f"清除 cookie 失败: {e}")
 
-    # 3. 注入用户 cookie
+    # 3. 注入用户 cookie (统一用 CDP, 绕过 seleniumbase API 变更)
+    # seleniumbase 4.51+ 移除了 set_cookie(), 改用 CDP Network.setCookie
+    # CDP 方式不要求当前页面已访问目标域名, 也不会有 invalid cookie domain 问题
     n_ok, n_fail = 0, 0
     failed_cookies = []
     for k, v in parsed.items():
         try:
             if k.startswith("__Host-"):
-                # __Host- cookie: 用 CDP 设置, 不能设 domain, 必须 path=/, secure
-                sb.driver.execute_cdp_cmd("Network.setCookie", {
+                # __Host- cookie: 不能设 domain, 必须 path=/, secure
+                cdp_params = {
                     "name": k,
                     "value": v,
                     "url": BASE_URL,
@@ -200,27 +202,26 @@ def inject_cookies(sb, cookie_str: str):
                     "secure": True,
                     "httpOnly": True,
                     "sameSite": "Lax",
-                })
-                log.info(f"   ✅ {k} (CDP, __Host- 前缀)")
-                n_ok += 1
+                }
             else:
-                # 普通 cookie: 用 set_cookie
-                sb.set_cookie(k, v, domain="aclclouds.com")
-                log.info(f"   ✅ {k}")
-                n_ok += 1
-        except Exception as e1:
-            try:
-                sb.driver.add_cookie({
-                    "name": k, "value": v,
-                    "domain": ".aclclouds.com", "path": "/",
-                    "secure": True, "httpOnly": True,
-                })
-                log.info(f"   ✅ {k} (add_cookie 兜底)")
-                n_ok += 1
-            except Exception as e2:
-                n_fail += 1
-                failed_cookies.append(k)
-                log.warning(f"   ❌ {k} 失败: set_cookie={e1}, add_cookie={e2}")
+                # 普通 cookie: 设 domain
+                cdp_params = {
+                    "name": k,
+                    "value": v,
+                    "domain": ".aclclouds.com",
+                    "url": BASE_URL,
+                    "path": "/",
+                    "secure": True,
+                    "httpOnly": True,
+                    "sameSite": "Lax",
+                }
+            sb.driver.execute_cdp_cmd("Network.setCookie", cdp_params)
+            log.info(f"   ✅ {k} (CDP)")
+            n_ok += 1
+        except Exception as e:
+            n_fail += 1
+            failed_cookies.append(k)
+            log.warning(f"   ❌ {k} 失败: {e}")
 
     log.info(f"Cookie 注入完成: ✅ {n_ok} 个, ❌ {n_fail} 个")
     if failed_cookies:
