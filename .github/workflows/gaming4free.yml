@@ -38,7 +38,7 @@ jobs:
           cat requirements.txt
           pip install -r requirements.txt --no-cache-dir
           echo "[VERIFY] Checking seleniumbase..."
-          python -c "from seleniumbase import SeleniumBase; print('✓ seleniumbase ok')"
+          python -c "from seleniumbase import SB; print('✓ seleniumbase ok')"
 
       - name: 配置代理 (sing-box - hysteria2)
         env:

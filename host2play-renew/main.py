@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Host2Play auto-renewal script using SeleniumBase UC mode + Hysteria2 proxy
+Host2Play auto-renewal script using seleniumbase UC mode + Hysteria2 proxy
 Supports single-server and multi-server configurations.
 """
 
@@ -15,10 +15,10 @@ from typing import Optional, Dict, Any, TYPE_CHECKING
 from pathlib import Path
 
 if TYPE_CHECKING:
-    from seleniumbase import SeleniumBase  # Only for static type checking
+    from seleniumbase import SB  # Only for static type checking
 else:
     try:
-        from seleniumbase import ConfigGen, SeleniumBase
+        from seleniumbase import SB
         has_sb = True
     except ImportError as e:
         has_sb = False
@@ -82,30 +82,35 @@ def setup_hproxy(proxy_url: Optional[str]) -> Optional[str]:
     return None
 
 
-def create_uc_page(proxy_addr: Optional[str] = None) -> "SeleniumBase":
-    """Create UC-mode SeleniumBase page."""
+def create_uc_page(proxy_addr: Optional[str] = None) -> "SB":
+    """Create UC-mode SB context manager.
+    
+    Returns an SB context manager (use with `with`).
+    Migration: seleniumbase 4.51+ removed SeleniumBase class and ConfigGen.
+    New API: SB(uc=True, ...) as a context manager.
+    """
     if not has_sb:
-        raise ImportError("❌ SeleniumBase not installed! Please run: pip install seleniumbase\nCheck that all Chrome dependencies are available in your environment.")
+        raise ImportError("❌ seleniumbase not installed! Please run: pip install seleniumbase\nCheck that all Chrome dependencies are available in your environment.")
     
-    gen = ConfigGen()
-    gen.uc(True)
-    gen.no_sandbox()
-    gen.disable_dev_shm_usage()
-    gen.disable_gpu()
-    gen.disable_blink_features("AutomationControlled")
-    gen.set_user_agent(
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36"
+    # Build SB kwargs (new API: pass params directly to SB())
+    sb_kwargs = dict(
+        uc=True,
+        no_sandbox=True,
+        disable_dev_shm_usage=True,
+        disable_gpu=True,
+        disable_features="AutomationControlled",
+        agent=(
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+            "(KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36"
+        ),
     )
-    
     if proxy_addr:
-        gen.proxy(proxy_addr)
+        sb_kwargs["proxy"] = proxy_addr
     
-    page = SeleniumBase(base_config=gen)
-    page.set_default_timeout(180)
-    return page
+    return SB(**sb_kwargs)
 
 
-def handle_ad_video(page: "SeleniumBase") -> bool:
+def handle_ad_video(page: "SB") -> bool:
     """Handle video ad, return True if success/ad skipped."""
     print("Waiting for ad player to appear...")
     
@@ -140,7 +145,7 @@ def handle_ad_video(page: "SeleniumBase") -> bool:
     return True
 
 
-def inject_cookies(page: "SeleniumBase", cookie_str: str) -> None:
+def inject_cookies(page: "SB", cookie_str: str) -> None:
     """Inject cookies."""
     if not cookie_str:
         return
@@ -155,7 +160,7 @@ def inject_cookies(page: "SeleniumBase", cookie_str: str) -> None:
                 print(f"Cookie injection failed {k}: {e}")
 
 
-def get_expire_info(page: "SeleniumBase", renew_url: str = None) -> tuple:
+def get_expire_info(page: "SB", renew_url: str = None) -> tuple:
     """Return (server_id, expires_text, seconds_remaining)."""
     url = renew_url if renew_url else RENEW_URL
     
@@ -186,8 +191,6 @@ def renew_server(server_name: str, cookie_str: str, renew_url: str = None) -> di
     elif WARP_PROXY:
         proxy_addr = setup_hproxy(WARP_PROXY)
     
-    page = create_uc_page(proxy_addr)
-    
     result = {
         "name": server_name,
         "success": False,
@@ -198,13 +201,15 @@ def renew_server(server_name: str, cookie_str: str, renew_url: str = None) -> di
     }
     
     try:
-        inject_cookies(page, cookie_str)
-        sid, exp_txt, secs = get_expire_info(page, renew_url)
-        result["old_time"] = exp_txt
-        result["new_time"] = exp_txt + " (extended)"
-        result["success"] = True
-        result["extra_info"] = "+24h"
-        result["error"] = None
+        with create_uc_page(proxy_addr) as page:
+            page.set_default_timeout(180)
+            inject_cookies(page, cookie_str)
+            sid, exp_txt, secs = get_expire_info(page, renew_url)
+            result["old_time"] = exp_txt
+            result["new_time"] = exp_txt + " (extended)"
+            result["success"] = True
+            result["extra_info"] = "+24h"
+            result["error"] = None
     except Exception as e:
         result["error"] = str(e)
     
