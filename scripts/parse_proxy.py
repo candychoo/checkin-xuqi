@@ -69,29 +69,60 @@ def parse_hysteria2(link: str) -> dict:
 
 
 def parse_tuic(link: str) -> dict:
-    """Parse tuic:// link."""
+    """Parse tuic:// link. Supports multiple formats:
+    1. tuic://uuid:password@host:port?sni=xxx           (standard)
+    2. tuic://password@host:port?uuid=xxx&sni=xxx       (password in user, uuid in query)
+    3. tuic://uuid@host:port?password=xxx&sni=xxx       (uuid in user, password in query)
+    4. tuic://host:port?uuid=xxx&password=xxx&sni=xxx   (both in query)
+    """
     if not link.startswith("tuic://"):
         raise ValueError(f"not a tuic link: {link[:30]}")
     link = link[len("tuic://"):]
     link = link.split("#", 1)[0]
     main, _, query = link.partition("?")
 
-    if "@" not in main:
-        raise ValueError("no @ in link")
-    user_info, server_part = main.rsplit("@", 1)
+    params = urllib.parse.parse_qs(query)
 
-    if ":" not in user_info:
-        raise ValueError("no uuid:password")
-    uuid, password = user_info.split(":", 1)
-    uuid = urllib.parse.unquote(uuid)
-    password = urllib.parse.unquote(password)
+    uuid = ""
+    password = ""
+
+    if "@" in main:
+        user_info, server_part = main.rsplit("@", 1)
+        user_info = urllib.parse.unquote(user_info)
+        if ":" in user_info:
+            # Format 1: uuid:password@host:port
+            uuid, password = user_info.split(":", 1)
+        else:
+            # Format 2/3: only uuid or only password in user_info
+            # Heuristic: if it looks like a UUID (has 4+ dashes), it's uuid
+            # otherwise treat as password
+            if user_info.count("-") >= 4:
+                uuid = user_info
+            else:
+                password = user_info
+    else:
+        # Format 4: no @, both in query
+        server_part = main
+
+    # Override with query params if provided
+    if "uuid" in params:
+        uuid = params["uuid"][0]
+    if "password" in params:
+        password = params["password"][0]
+    if "token" in params and not password:
+        # Some tuic links use 'token' instead of 'password'
+        password = params["token"][0]
 
     if ":" not in server_part:
         raise ValueError("no port")
     server, port_str = server_part.rsplit(":", 1)
     port = int(port_str)
 
-    params = urllib.parse.parse_qs(query)
+    if not uuid:
+        raise ValueError("no uuid found (tried user_info and query)")
+    if not password:
+        raise ValueError("no password found (tried user_info and query)")
+
     sni = params.get("sni", [""])[0]
     insecure = any(
         params.get(k, ["0"])[0] in ("1", "true")
