@@ -40,7 +40,7 @@ jobs:
           echo "[VERIFY] Checking seleniumbase..."
           python -c "from seleniumbase import SB; print('✓ seleniumbase ok')"
 
-      - name: 配置代理 (sing-box - hysteria2)
+      - name: 配置代理 (sing-box - multi-protocol)
         env:
           NODE_LINK: ${{ secrets.PROXY_URL }}
         run: |
@@ -49,80 +49,11 @@ jobs:
             exit 0
           fi
 
-          echo "=== 用 Python 解析 hysteria2 节点链接 ==="
-          PARSED=$(python3 << 'PYEOF'
-          import urllib.parse, json, os, sys
-
-          link = os.environ.get("NODE_LINK", "")
-          if not link:
-              print("ERROR: NODE_LINK empty", file=sys.stderr)
-              sys.exit(1)
-
-          for prefix in ["hysteria2://", "hy2://"]:
-              if link.startswith(prefix):
-                  link = link[len(prefix):]
-                  break
-
-          link = link.split("#", 1)[0]
-
-          if "?" in link:
-              main, query = link.split("?", 1)
-          else:
-              main, query = link, ""
-
-          if "@" not in main:
-              print("ERROR: no @ in link", file=sys.stderr)
-              sys.exit(1)
-          password_raw, server_part = main.rsplit("@", 1)
-          password = urllib.parse.unquote(password_raw)
-
-          if ":" not in server_part:
-              print("ERROR: no port", file=sys.stderr)
-              sys.exit(1)
-          server, port_str = server_part.rsplit(":", 1)
-          port = int(port_str)
-
-          params = urllib.parse.parse_qs(query)
-          sni = params.get("sni", [""])[0]
-          insecure = False
-          for key in ["insecure", "allowInsecure"]:
-              if key in params and params[key][0] in ("1", "true"):
-                  insecure = True
-
-          config = {
-              "log": {"level": "info"},
-              "inbounds": [
-                  {"type": "socks", "tag": "socks-in", "listen": "127.0.0.1", "listen_port": 1080},
-                  {"type": "http", "tag": "http-in", "listen": "127.0.0.1", "listen_port": 20170}
-              ],
-              "outbounds": [
-                  {
-                      "type": "hysteria2",
-                      "tag": "proxy",
-                      "server": server,
-                      "server_port": port,
-                      "password": password,
-                      "tls": {
-                          "enabled": True,
-                          "server_name": sni,
-                          "insecure": insecure
-                      }
-                  }
-              ]
-          }
-
-          with open("/tmp/sing-box-config.json", "w") as f:
-              json.dump(config, f, indent=2)
-
-          print(f"SERVER={server}")
-          print(f"PORT={port}")
-          print(f"SNI={sni}")
-          print(f"INSECURE={insecure}")
-          print(f"PASSWORD_LEN={len(password)}")
-          print(f"PASSWORD_PREFIX={password[:10]}...")
-          PYEOF
-          )
-          echo "$PARSED"
+          echo "=== 解析代理链接（多协议支持）==="
+          echo "支持: hysteria2/hy2, tuic, vless, vmess, trojan, ss, socks5/4"
+          python3 scripts/parse_proxy.py
+          echo ""
+          echo "解析完成，配置已写入 /tmp/sing-box-config.json"
 
           echo "=== 下载 sing-box ==="
           SB_VERSION="1.13.14"
