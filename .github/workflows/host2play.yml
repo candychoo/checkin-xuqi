@@ -23,7 +23,7 @@ jobs:
       - name: 配置 Python 环境
         uses: actions/setup-python@v5
         with:
-          python-version: '3.10'
+          python-version: '3.11'
 
       - name: 安装系统依赖
         run: |
@@ -43,8 +43,8 @@ jobs:
           echo "[INFO] Installing dependencies with --no-cache-dir..."
           pip install -r requirements.txt --no-cache-dir --timeout 180
           echo "[INFO] Verifying seleniumbase installation..."
-          python -c "from seleniumbase import SB; print('✓ seleniumbase installed successfully')" 2>&1 || echo "[WARN] Basic import check failed"
-          pip list | grep -i seleniumbase || echo "[WARN] seleniumbase not in pip list"
+          python -c "from seleniumbase import SB; print('✓ seleniumbase SB class available')" || { echo "❌ seleniumbase SB import failed"; exit 1; }
+          pip list | grep -i seleniumbase
           echo "[INFO] All installed packages:"
           pip freeze | head -20
 
@@ -72,7 +72,7 @@ jobs:
           echo "[INFO] Files in directory:"
           ls -la
           echo "[INFO] Checking seleniumbase availability..."
-          python -c "from seleniumbase import SB; print('SeleniumBase available')" 2>&1 || echo "⚠️ SeleniumBase NOT available!"
+          python -c "from seleniumbase import SB; print('SeleniumBase SB available')" || echo "⚠️ SeleniumBase NOT available (will retry in script)"
           echo "[INFO] Creating output directory..."
           mkdir -p output/screenshots
           echo "[INFO] Running main.py..."
