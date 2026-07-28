@@ -89,7 +89,7 @@ MAX_HOURS      = 48            # 续期上限 48 小时
 RENEW_THRESHOLD_HOURS = 45     # 剩余低于 45 小时自动触发续期
 ADD_MINUTES    = 90            # 每次点击 +90 分钟
 COOLDOWN_SEC   = 300           # 冷却 5 分钟 (服务器返回 300 秒)
-MAX_RENEW_ROUNDS = 10          # 单次运行最大续期轮数 (防止无限循环)
+MAX_RENEW_ROUNDS = 30          # 单次运行最大续期轮数 (防止无限循环)
 PAGE_TIMEOUT   = 60            # 单页操作超时
 TURNSTILE_WAIT = 90            # Turnstile 等待上限
 
@@ -980,6 +980,35 @@ def run_single_server(sb, site_url: str, server_num: str, region: str,
                 log.warning(f"⚠️ 按钮 opacity={info.get('opacity')} (半透明, 可能禁用)")
             if info.get("cursor") == "not-allowed":
                 log.warning("⚠️ 按钮 cursor=not-allowed (禁用状态)")
+
+            # 关键改进: 按钮 disabled 时, 从文字提取冷却时间并等待
+            btn_text = info.get("text", "") or ""
+            import re as _re_cool
+            # 匹配 "03:56 cd", "3:56 cd", "03:56 cd." 等
+            m_cool = _re_cool.search(r'(\d{1,2}):(\d{2})\s*cd', btn_text, _re_cool.IGNORECASE)
+            if m_cool and (info.get("disabled") or info.get("cursor") == "not-allowed"):
+                cd_min = int(m_cool.group(1))
+                cd_sec = int(m_cool.group(2))
+                cooldown_total = cd_min * 60 + cd_sec
+                log.info(f"⏳ 按钮显示冷却时间: {cd_min:02d}:{cd_sec:02d} (共 {cooldown_total}s)")
+                # 返回冷却状态, 让外层循环等待
+                return {
+                    "ok": True, "renewed": True,
+                    "sec_before": 0, "sec_after": 0,
+                    "cooldown": cooldown_total,
+                    "msg": f"按钮冷却中 ({cd_min:02d}:{cd_sec:02d}), 等待后重试"
+                }
+            # 也尝试从文字提取纯秒数 (如 "300s cd")
+            m_sec = _re_cool.search(r'(\d+)\s*s?\s*cd', btn_text, _re_cool.IGNORECASE)
+            if m_sec and (info.get("disabled") or info.get("cursor") == "not-allowed"):
+                cooldown_total = int(m_sec.group(1))
+                log.info(f"⏳ 按钮显示冷却时间: {cooldown_total}s")
+                return {
+                    "ok": True, "renewed": True,
+                    "sec_before": 0, "sec_after": 0,
+                    "cooldown": cooldown_total,
+                    "msg": f"按钮冷却中 ({cooldown_total}s), 等待后重试"
+                }
         else:
             log.warning("⚠️ 未找到 button.rt-btn-free")
     except Exception as e:
