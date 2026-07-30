@@ -796,6 +796,7 @@ def process_account(account: dict) -> dict:
 
     # 筛选需要续期的服务器
     servers_to_renew = []
+    all_servers_info = []  # 收集所有服务器信息用于 TG 通知
     now = datetime.now(timezone.utc)
     for srv in servers:
         attrs = srv.get("attributes", srv) if isinstance(srv, dict) else {}
@@ -812,6 +813,11 @@ def process_account(account: dict) -> dict:
         h_left = remaining / 3600 if remaining else None
 
         log.info(f"  - {sname} (id={sid}) 到期={expires_at} 剩余={fmt_remaining(remaining)} can_renew={can_renew}")
+
+        # 收集服务器信息 (用于 TG 通知显示剩余时间)
+        all_servers_info.append({
+            "sid": sid, "name": sname, "expires_at": expires_at or ""
+        })
 
         if h_left and h_left < RENEW_THRESHOLD_HOURS and can_renew:
             servers_to_renew.append({"sid": sid, "name": sname, "expires_at": expires_at})
@@ -903,7 +909,36 @@ def process_account(account: dict) -> dict:
 
             if not servers_to_renew:
                 log.info("✅ 没有需要续期的服务器")
-                tg(f"🎮 ACLClouds 续期通知\n\nℹ️ 无需续期\n👤 账号: {name}\n📅 所有服务器剩余 >= {RENEW_THRESHOLD_HOURS}h")
+                # 构建带每个服务器剩余时间的通知
+                from datetime import datetime as _dt, timezone as _tz
+                now_utc = _dt.now(_tz.utc)
+                details = []
+                for srv in all_servers_info:
+                    sname = srv.get('name', '?')
+                    sid = srv.get('sid', '?')
+                    expires_at = srv.get('expires_at', '')
+                    try:
+                        expire_dt = parse_iso(expires_at)
+                        if expire_dt:
+                            delta = expire_dt - now_utc
+                            total_sec = int(delta.total_seconds())
+                            if total_sec > 0:
+                                days = total_sec // 86400
+                                hours = (total_sec % 86400) // 3600
+                                mins = (total_sec % 3600) // 60
+                                if days > 0:
+                                    rem = f"{days}d {hours}h"
+                                else:
+                                    rem = f"{hours}h {mins}m"
+                            else:
+                                rem = "已过期"
+                        else:
+                            rem = "未知"
+                    except Exception:
+                        rem = "解析失败"
+                    details.append(f"👤 {sname} ({sid}): {rem}")
+                details_str = "\n".join(details) if details else "(无服务器)"
+                tg(f"🎮 ACLClouds 续期通知\n\nℹ️ 无需续期\n👤 账号: {name}\n📅 所有服务器剩余 >= {RENEW_THRESHOLD_HOURS}h\n\n{details_str}")
                 return {"name": name, "ok": True, "renewed": 0, "failed": 0}
 
             log.info(f"📋 需要续期 {len(servers_to_renew)} 台服务器")
@@ -937,7 +972,36 @@ def process_account(account: dict) -> dict:
     # 3. API 成功的情况: 启动浏览器续期
     if not servers_to_renew:
         log.info("✅ 没有需要续期的服务器")
-        tg(f"🎮 ACLClouds 续期通知\n\nℹ️ 无需续期\n👤 账号: {name}\n📅 所有服务器剩余 >= {RENEW_THRESHOLD_HOURS}h")
+        # 构建带每个服务器剩余时间的通知
+        from datetime import datetime as _dt, timezone as _tz
+        now_utc = _dt.now(_tz.utc)
+        details = []
+        for srv in all_servers_info:
+            sname = srv.get('name', '?')
+            sid = srv.get('sid', '?')
+            expires_at = srv.get('expires_at', '')
+            try:
+                expire_dt = parse_iso(expires_at)
+                if expire_dt:
+                    delta = expire_dt - now_utc
+                    total_sec = int(delta.total_seconds())
+                    if total_sec > 0:
+                        days = total_sec // 86400
+                        hours = (total_sec % 86400) // 3600
+                        mins = (total_sec % 3600) // 60
+                        if days > 0:
+                            rem = f"{days}d {hours}h"
+                        else:
+                            rem = f"{hours}h {mins}m"
+                    else:
+                        rem = "已过期"
+                else:
+                    rem = "未知"
+            except Exception:
+                rem = "解析失败"
+            details.append(f"👤 {sname} ({sid}): {rem}")
+        details_str = "\n".join(details) if details else "(无服务器)"
+        tg(f"🎮 ACLClouds 续期通知\n\nℹ️ 无需续期\n👤 账号: {name}\n📅 所有服务器剩余 >= {RENEW_THRESHOLD_HOURS}h\n\n{details_str}")
         return {"name": name, "ok": True, "renewed": 0, "failed": 0}
 
     log.info(f"📋 需要续期 {len(servers_to_renew)} 台服务器")

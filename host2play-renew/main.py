@@ -222,19 +222,35 @@ def inject_cookies(page: "SB", cookie_str: str) -> bool:
 
 def parse_server_real_name(page: "SB") -> str:
     """Extract the real server name from the renew modal.
-    Page shows: 'Renew server: bof5032'
+    Page shows multiple possible formats:
+      - 'Renew server: bof5032'
+      - '<h2>Renew server: mcf7008</h2>'
+      - 'Renew server: <strong>bof5032</strong>'
     Returns the name (e.g. 'bof5032') or empty string if not found.
     """
     import re
-    # Pattern: "Renew server: <name>" (name is alphanumeric, 4-20 chars typically)
-    name_re = re.compile(r"Renew\s+server\s*[:：]\s*([A-Za-z0-9_\-]{3,30})", re.IGNORECASE)
     try:
         html = page.page_source or ""
     except Exception:
         return ""
-    m = name_re.search(html)
-    if m:
-        return m.group(1)
+    # Try multiple patterns, most specific first
+    patterns = [
+        # HTML tag wrapped: <h2>Renew server: <strong>bof5032</strong></h2>
+        r"Renew\s+server\s*[:：]\s*<[^>]+>\s*([A-Za-z0-9_\-]{3,30})",
+        # Plain text: Renew server: bof5032
+        r"Renew\s+server\s*[:：]\s*([A-Za-z0-9_\-]{3,30})",
+        # Renew server: followed by tag then text
+        r"Renew\s+server\s*[:：]?\s*<[^>]+>\s*([A-Za-z0-9_\-]{3,30})",
+        # Fallback: any "Renew server: XXX" where XXX is alphanumeric
+        r"Renew\s+server[^A-Za-z0-9]{1,5}([A-Za-z0-9_\-]{3,30})",
+    ]
+    for pat in patterns:
+        m = re.search(pat, html, re.IGNORECASE)
+        if m:
+            name = m.group(1)
+            # Filter out obvious false positives
+            if name.lower() not in ("server", "renew", "button", "modal"):
+                return name
     return ""
 
 
@@ -1092,7 +1108,9 @@ def renew_server(server_name: str, cookie_str: str, renew_url: str = None) -> di
                     if delta_hours == 0:
                         result["error"] = None
                         result["success"] = True  # don't count as failure
-                        result["extra_info"] = "cooldown (server rejected, likely too soon after last renewal)"
+                        result["extra_info"] = "cooldown"
+                        # 冷却时用 pre_date_str 作为 new_time (没变化)
+                        result["new_time"] = pre_date_str or "cooldown"
                         print(f"  ⏳ Likely in cooldown - server did not advance time")
                         print(f"     (renew() was called successfully, but server rejected)")
                         return result
@@ -1232,16 +1250,49 @@ def main() -> None:
             summary_msg = "🎮 Host2Play Renewal\n" + now_cn + "\n\n"
             summary_msg += f"📊 Total: {summary['total']} | ✓{summary['success']} | ✗{summary['failed']}\n\n"
             
+            from datetime import datetime as _dt
+            now_utc = _dt.now(_dt.utcnow().astimezone().tzinfo) if False else _dt.now()
             for r in summary["results"]:
-                # 显示格式: "👤 备注名 (真实名): ✓ 时间"
-                # 如果没有真实名, 只显示备注名
+                # 显示格式: "👤 备注名 (真实名): ✓ 到期时间 (剩余 Xh Ym)"
                 display_name = r['name']
                 real_name = r.get('real_name', '')
                 if real_name and real_name != display_name:
                     display_name = f"{r['name']} ({real_name})"
                 if r["success"]:
                     new_t = r.get("new_time") or "extended"
-                    summary_msg += f"👤 {display_name}: ✓ {new_t}\n"
+                    # 计算剩余时间
+                    remaining_str = ""
+                    try:
+                        # 解析 new_t (格式: 2026/08/06 05:49:08)
+                        from datetime import datetime as _dt2
+                        for fmt in ("%Y/%m/%d %H:%M:%S", "%Y-%m-%d %H:%M:%S"):
+                            try:
+                                exp_dt = _dt2.strptime(new_t, fmt)
+                                break
+                            except ValueError:
+                                continue
+                        else:
+                            exp_dt = None
+                        if exp_dt:
+                            delta = exp_dt - now_utc
+                            total_sec = int(delta.total_seconds())
+                            if total_sec > 0:
+                                days = total_sec // 86400
+                                hours = (total_sec % 86400) // 3600
+                                mins = (total_sec % 3600) // 60
+                                if days > 0:
+                                    remaining_str = f" (剩 {days}d {hours}h)"
+                                elif hours > 0:
+                                    remaining_str = f" (剩 {hours}h {mins}m)"
+                                else:
+                                    remaining_str = f" (剩 {mins}m)"
+                            else:
+                                remaining_str = " (已过期)"
+                    except Exception:
+                        pass
+                    extra = r.get('extra_info', '')
+                    extra_str = f" [{extra}]" if extra and extra != "cooldown" else (" [冷却中]" if extra == "cooldown" else "")
+                    summary_msg += f"👤 {display_name}: ✓ {new_t}{remaining_str}{extra_str}\n"
                 else:
                     summary_msg += f"👤 {display_name}: ✗ {r.get('error') or 'Failed'}\n"
             
