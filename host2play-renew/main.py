@@ -1129,35 +1129,76 @@ def renew_server(server_name: str, cookie_str: str, renew_url: str = None) -> di
                         'return {left: r.left, top: r.top, width: r.width, height: r.height};'
                     )
                     if iframe_rect:
-                        # checkbox 在 iframe 内左上角约 (25, 25) 位置
-                        click_x = int(iframe_rect['left'] + 25)
-                        click_y = int(iframe_rect['top'] + 25)
-                        print(f"  reCAPTCHA iframe at ({iframe_rect['left']:.0f},{iframe_rect['top']:.0f}), clicking ({click_x},{click_y})")
-                        # CDP 点击
-                        page.driver.execute_cdp_cmd("Input.dispatchMouseEvent", {
-                            "type": "mouseMoved", "x": click_x, "y": click_y
-                        })
-                        page.driver.execute_cdp_cmd("Input.dispatchMouseEvent", {
-                            "type": "mousePressed", "x": click_x, "y": click_y,
-                            "button": "left", "clickCount": 1
-                        })
-                        page.driver.execute_cdp_cmd("Input.dispatchMouseEvent", {
-                            "type": "mouseReleased", "x": click_x, "y": click_y,
-                            "button": "left", "clickCount": 1
-                        })
-                        print("  CDP click sent to reCAPTCHA checkbox")
-                        time.sleep(5)  # 等待验证
+                        # checkbox 在 iframe 内, 位置约在 left+25, top+25
+                        # 但可能在不同位置, 尝试多个点
+                        base_x = int(iframe_rect['left'])
+                        base_y = int(iframe_rect['top'])
+                        print(f"  reCAPTCHA iframe at ({base_x},{base_y}), size {iframe_rect['width']:.0f}x{iframe_rect['height']:.0f}")
 
-                        # 检查是否拿到了 token
-                        token = page.execute_script(
-                            "try { return document.getElementById('g-recaptcha-response').value; }"
-                            "catch(e) { return ''; }"
-                        )
-                        if token:
-                            print(f"  reCAPTCHA token: {token[:40]}...")
-                            page.execute_script(f"window.__captchaToken = '{token}';")
-                        else:
-                            print("  No reCAPTCHA token after click")
+                        # 尝试多个点击位置 (checkbox 可能在不同位置)
+                        click_positions = [
+                            (base_x + 25, base_y + 25),    # 左上
+                            (base_x + 30, base_y + 30),    # 稍偏
+                            (base_x + 20, base_y + 20),    # 更左上
+                            (base_x + 35, base_y + 35),    # 更右下
+                        ]
+
+                        token = ""
+                        for cx, cy in click_positions:
+                            print(f"  Trying click at ({cx},{cy})...")
+                            # CDP 点击: move + press + release
+                            page.driver.execute_cdp_cmd("Input.dispatchMouseEvent", {
+                                "type": "mouseMoved", "x": cx, "y": cy
+                            })
+                            time.sleep(0.3)
+                            page.driver.execute_cdp_cmd("Input.dispatchMouseEvent", {
+                                "type": "mousePressed", "x": cx, "y": cy,
+                                "button": "left", "clickCount": 1
+                            })
+                            page.driver.execute_cdp_cmd("Input.dispatchMouseEvent", {
+                                "type": "mouseReleased", "x": cx, "y": cy,
+                                "button": "left", "clickCount": 1
+                            })
+
+                            # 等待验证 (递增等待时间)
+                            for wait in [3, 5, 8]:
+                                time.sleep(wait)
+                                # 检查多个可能的 token 位置
+                                token = page.execute_script(
+                                    "var t = '';"
+                                    "try { t = document.getElementById('g-recaptcha-response').value; } catch(e) {}"
+                                    "if (!t) { try { t = document.querySelector('textarea[name=g-recaptcha-response]').value; } catch(e) {} }"
+                                    "if (!t) { try { var d = document.querySelector('div.g-recaptcha'); if (d) t = d.getAttribute('data-response') || ''; } catch(e) {} }"
+                                    "return t || '';"
+                                )
+                                if token:
+                                    print(f"  reCAPTCHA token: {token[:40]}...")
+                                    page.execute_script(f"window.__captchaToken = '{token}';")
+                                    break
+                                # 检查是否有错误提示或挑战
+                                challenge = page.execute_script(
+                                    "var iframe = document.querySelector('iframe[src*=recaptcha/api2/bframe]');"
+                                    "if (!iframe) return '';"
+                                    "try {"
+                                    "  var doc = iframe.contentDocument || iframe.contentWindow.document;"
+                                    "  return doc.body.innerText.substring(0, 200);"
+                                    "} catch(e) { return 'cross-origin'; }"
+                                )
+                                if challenge and challenge != 'cross-origin':
+                                    print(f"  reCAPTCHA challenge: {challenge[:100]}")
+                            if token:
+                                break
+
+                        if not token:
+                            print("  No reCAPTCHA token after all attempts")
+                            # 截图保存, 方便诊断
+                            try:
+                                import os
+                                os.makedirs("output/screenshots", exist_ok=True)
+                                page.driver.save_screenshot("output/screenshots/recaptcha_failed.png")
+                                print("  Screenshot saved: output/screenshots/recaptcha_failed.png")
+                            except Exception:
+                                pass
                     else:
                         print("  No reCAPTCHA iframe found")
                 except Exception as e:
