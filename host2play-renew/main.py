@@ -896,20 +896,33 @@ def renew_server(server_name: str, cookie_str: str, renew_url: str = None) -> di
                         # Also handle the case where the function isn't on window
                         # but is in scope (try eval as fallback).
                         try:
-                            # First try: window.fnName(args)
-                            invoke_js = (
-                                f"if (typeof window.{fn_name} === 'function') {{"
-                                f"  const r = window.{fn_name}({fn_args_raw});"
-                                f"  return 'invoked, returned: ' + String(r).substring(0, 100);"
-                                f"}}"
-                                f"return 'function not found on window';"
+                            # renew() returns a Promise (AJAX), use execute_async_script
+                            # to await it and capture any rejection error
+                            page.set_script_timeout(45)
+                            async_js = (
+                                "var callback = arguments[arguments.length - 1];"
+                                "(async function() {"
+                                "  if (typeof window." + fn_name + " !== 'function') {"
+                                "    callback('function not found on window');"
+                                "    return;"
+                                "  }"
+                                "  try {"
+                                "    const r = window." + fn_name + "(" + fn_args_raw + ");"
+                                "    if (r && typeof r.then === 'function') {"
+                                "      const val = await r;"
+                                "      callback('async OK, resolved: ' + String(val).substring(0, 200));"
+                                "    } else {"
+                                "      callback('sync OK, returned: ' + String(r).substring(0, 200));"
+                                "    }"
+                                "  } catch(e) {"
+                                "    callback('threw: ' + e.message + ' | stack: ' + String(e.stack||'').substring(0, 200));"
+                                "  }"
+                                "})();"
                             )
-                            inv_res = page.execute_script(invoke_js)
+                            inv_res = page.execute_async_script(async_js)
                             print(f"  Direct window.{fn_name}() result: {inv_res}")
-                            # If not on window, try eval (function may be in closure scope)
+                            # If not on window, try button.click() which triggers full onclick
                             if "not found on window" in str(inv_res):
-                                # 用 CDP 直接调用按钮的 click() 方法 (最可靠)
-                                # 这会触发完整的 onclick 处理流程
                                 click_js = (
                                     "try {{"
                                     "  const btns = Array.from(document.querySelectorAll('button'));"
@@ -950,6 +963,16 @@ def renew_server(server_name: str, cookie_str: str, renew_url: str = None) -> di
 
             # Step 6: Wait for the renewal to take effect. The renewal may be
             # an async XHR. Poll for up to 30s checking if 'Deletes on' advances.
+            # 同时检查页面上的提示信息 (success/error toast) 辅助诊断
+            try:
+                page_tip = page.execute_script(
+                    "var t = document.body.innerText || '';"
+                    "var lines = t.split('\\n').filter(function(l){return l.trim();});"
+                    "return lines.slice(0, 30).join(' | ').substring(0, 500);"
+                )
+                print(f"  [page text after click]: {page_tip[:300]}")
+            except Exception:
+                pass
             print("  Waiting for renewal to take effect (polling for up to 30s)...")
             pre_date_str_for_poll = pre_date_str
             advanced = False
