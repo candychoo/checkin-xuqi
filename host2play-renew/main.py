@@ -1112,9 +1112,56 @@ def renew_server(server_name: str, cookie_str: str, renew_url: str = None) -> di
             except Exception as e:
                 print(f"  Performance entries read failed: {e}")
 
-            # 如果 renew() 没发续期 API 请求, 直接调用续期 API
+            # 如果 renew() 没发续期 API 请求, 尝试自动完成 reCAPTCHA
             if not renew_api_found:
-                print("  renew() did not make renewal API call, calling API directly...")
+                print("  renew() did not make renewal API call, trying reCAPTCHA...")
+
+                # 尝试方法 1: 用 CDP 点击 reCAPTCHA checkbox
+                # reCAPTCHA v2 通常在 iframe 里, checkbox 位置约在 iframe 左上角
+                try:
+                    # 找到 recaptcha iframe 的位置
+                    iframe_rect = page.execute_script(
+                        "var f = document.querySelector('iframe[src*=recaptcha/api2/anchor]');"
+                        "if (!f) return null;"
+                        "var r = f.getBoundingClientRect();"
+                        "return {left: r.left, top: r.top, width: r.width, height: r.height};"
+                    )
+                    if iframe_rect:
+                        # checkbox 在 iframe 内左上角约 (25, 25) 位置
+                        click_x = int(iframe_rect['left'] + 25)
+                        click_y = int(iframe_rect['top'] + 25)
+                        print(f"  reCAPTCHA iframe at ({iframe_rect['left']:.0f},{iframe_rect['top']:.0f}), clicking ({click_x},{click_y})")
+                        # CDP 点击
+                        page.driver.execute_cdp_cmd("Input.dispatchMouseEvent", {
+                            "type": "mouseMoved", "x": click_x, "y": click_y
+                        })
+                        page.driver.execute_cdp_cmd("Input.dispatchMouseEvent", {
+                            "type": "mousePressed", "x": click_x, "y": click_y,
+                            "button": "left", "clickCount": 1
+                        })
+                        page.driver.execute_cdp_cmd("Input.dispatchMouseEvent", {
+                            "type": "mouseReleased", "x": click_x, "y": click_y,
+                            "button": "left", "clickCount": 1
+                        })
+                        print("  CDP click sent to reCAPTCHA checkbox")
+                        time.sleep(5)  # 等待验证
+
+                        # 检查是否拿到了 token
+                        token = page.execute_script(
+                            "try { return document.getElementById('g-recaptcha-response').value; }"
+                            "catch(e) { return ''; }"
+                        )
+                        if token:
+                            print(f"  reCAPTCHA token: {token[:40]}...")
+                            page.execute_script(f"window.__captchaToken = '{token}';")
+                        else:
+                            print("  No reCAPTCHA token after click")
+                    else:
+                        print("  No reCAPTCHA iframe found")
+                except Exception as e:
+                    print(f"  reCAPTCHA click failed: {e}")
+
+                print("  Calling renewal API directly...")
                 # 从 URL 提取 server id
                 import re as _re_sid
                 sid_match = _re_sid.search(r'[?&]i=([a-f0-9-]+)', renew_url or '')
@@ -1171,6 +1218,10 @@ def renew_server(server_name: str, cookie_str: str, renew_url: str = None) -> di
                                 "  }"
                                 "  var body = 'i=' + encodeURIComponent(serverUuid);"
                                 "  if (csrfToken) body += '&_csrf=' + encodeURIComponent(csrfToken);"
+                                "  if (window.__captchaToken) {"
+                                "    body += '&captcha=' + encodeURIComponent(window.__captchaToken);"
+                                "    body += '&g-recaptcha-response=' + encodeURIComponent(window.__captchaToken);"
+                                "  }"
                                 "  xhr.send(body);"
                                 "} else {"
                                 "  if (csrfToken) {"
