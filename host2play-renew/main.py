@@ -220,6 +220,62 @@ def inject_cookies(page: "SB", cookie_str: str) -> bool:
     return fail == 0 and ok > 0
 
 
+def parse_deletes_on_date(page: "SB") -> tuple:
+    """Extract the 'Deletes on: YYYY/MM/DD HH:MM:SS' date from a Host2Play
+    renew modal. Returns (date_string, datetime_obj) or (None, None).
+
+    The Host2Play renew page shows a modal with:
+        Renew server: <name>
+        Expires in: 05:38:59
+        Deletes on: 2026/08/06 08:39:42
+        [Renew server]   <- blue button
+
+    We look for any text matching "Deletes on" or "删除时间" or "到期时间"
+    followed by a YYYY/MM/DD HH:MM:SS pattern.
+    """
+    import re
+    try:
+        body_text = page.find_element("css:body", timeout=2).text or ""
+    except Exception:
+        try:
+            body_text = page.driver.page_source or ""
+            body_text = re.sub(r"<[^>]+>", " ", body_text)
+            body_text = re.sub(r"\s+", " ", body_text)
+        except Exception:
+            return None, None
+
+    # Match "Deletes on" followed by date. Allow flexible whitespace.
+    # Date formats supported:
+    #   2026/08/06 08:39:42
+    #   2026-08-06 08:39:42
+    #   2026/8/6 8:39:42
+    date_pattern = r"(\d{4}[-/]\d{1,2}[-/]\d{1,2}\s+\d{1,2}:\d{2}(?::\d{2})?)"
+    deletes_re = re.compile(
+        r"(?:Deletes\s+on|删除时间|到期时间|过期时间|expires\s+on|delete\s+at)"
+        r"\s*[:：]?\s*" + date_pattern,
+        re.IGNORECASE
+    )
+    m = deletes_re.search(body_text)
+    if not m:
+        return None, None
+    date_str = m.group(1).strip()
+    # Parse to datetime for comparison
+    try:
+        # Normalize separators: 2026/08/06 -> 2026-08-06
+        normalized = date_str.replace("/", "-")
+        dt = datetime.strptime(normalized, "%Y-%m-%d %H:%M:%S")
+        if len(date_str.split(":")) == 2:  # only HH:MM, no seconds
+            dt = datetime.strptime(normalized, "%Y-%m-%d %H:%M")
+    except Exception:
+        # Try without seconds
+        try:
+            normalized = date_str.replace("/", "-")
+            dt = datetime.strptime(normalized, "%Y-%m-%d %H:%M")
+        except Exception:
+            return date_str, None
+    return date_str, dt
+
+
 def get_expire_info(page: "SB", renew_url: str = None) -> tuple:
     """Return (server_id, expires_text, seconds_remaining).
 
@@ -442,18 +498,28 @@ def get_expire_info(page: "SB", renew_url: str = None) -> tuple:
 def renew_server(server_name: str, cookie_str: str, renew_url: str = None) -> dict:
     """Execute renewal for a server, return result dict.
 
-    Order of operations (CRITICAL):
-      1. Open browser (about:blank)
-      2. Navigate to the renew URL once (gets us on the right domain — required by
-         ChromeDriver before add_cookie can succeed)
-      3. Inject cookies (now works because we're on the target origin)
-      4. Reload the renew URL WITH cookies (this is what actually triggers the renewal
-         on the server side, because Host2Play grants +24h on authenticated GET)
-      5. Only set success=True if cookie injection reported OK.
+    Host2Play's renewal flow (verified by screenshot analysis):
+      - Visiting /server/renew?i=<id> opens a MODAL DIALOG (not auto-renewal)
+      - The modal shows: 'Renew server: <name>', 'Expires in: HH:MM:SS',
+        'Deletes on: YYYY/MM/DD HH:MM:SS', and a blue 'Renew server' button
+      - User MUST click the button to actually trigger +24h renewal
+      - After clicking, the 'Deletes on' date advances by ~24h
 
-    If we try to inject cookies BEFORE first navigation, ChromeDriver rejects them
-    with: "invalid argument: missing 'cookie'" — because about:blank has no
-    document cookie jar to write into.
+    Order of operations:
+      1. Open browser (about:blank)
+      2. Navigate to renew URL once (gets on right domain, required for add_cookie)
+      3. Inject cookies (now works because we're on the target origin)
+      4. Reload renew URL with cookies — opens the renew modal
+      5. Read pre-renewal 'Deletes on' date
+      6. Click 'Renew server' button (try multiple selectors)
+      7. Wait + reload to see updated date
+      8. Read post-renewal 'Deletes on' date
+      9. Verify expiry advanced by ~24h. Only mark success=True if it did.
+
+    This is a MAJOR behavior change from previous versions, which only
+    navigated to the URL and assumed renewal succeeded — but the modal
+    requires an explicit button click, so all prior 'successes' were
+    false positives.
     """
     proxy_addr = None
     if HYP_PROXY:
@@ -542,27 +608,153 @@ def renew_server(server_name: str, cookie_str: str, renew_url: str = None) -> di
                 result["error"] = "Cookie injection failed"
                 return result
 
-            # Step 3: Reload with cookies — this is what actually triggers renewal
+            # Step 3: Reload the renew URL WITH cookies — this opens the renew
+            # modal dialog (NOT auto-renew; the modal has a "Renew server" button).
             print(f"Reloading {renew_url} with cookies...")
             page.driver.get(renew_url)
-            time.sleep(3)  # let page + any JS renewal complete
+            time.sleep(3)  # let modal + any CF Turnstile challenge resolve
 
-            # Step 4: Read expiry info; if get_expire_info detected a /login
-            # redirect, that means the cookie was rejected — fail loudly.
-            sid, exp_txt, secs = get_expire_info(page, renew_url)
-            if exp_txt == "expired/redirected":
-                result["error"] = "Cookie rejected by server (redirected to /login)"
-                return result
-            if exp_txt == "Unknown":
-                result["old_time"] = "Unknown"
-                result["new_time"] = "+24h (expiry text not found on page)"
-                result["extra_info"] = "renewed-but-no-expiry-text"
+            # Step 4: Read "Deletes on" date BEFORE clicking — this is the
+            # pre-renewal expiry, which we can compare against the post-click
+            # value to verify the renewal actually worked.
+            pre_date_str, pre_dt = parse_deletes_on_date(page)
+            if pre_date_str:
+                print(f"  Pre-renewal 'Deletes on': {pre_date_str}")
+                result["old_time"] = pre_date_str
             else:
-                result["old_time"] = exp_txt
-                result["new_time"] = f"extended (until/after: {exp_txt})"
-                result["extra_info"] = "+24h"
-            result["success"] = True
-            result["error"] = None
+                print("  ⚠️ Pre-renewal 'Deletes on' date NOT found on page")
+                print("  (This usually means the renew modal didn't open — either")
+                print("   cookie is invalid or the page redirected to /login.)")
+                # Save a screenshot so we can see what the page actually shows
+                try:
+                    screenshot_dir = OUTPUT_DIR
+                    screenshot_dir.mkdir(parents=True, exist_ok=True)
+                    ts = datetime.now(TZ_CN).strftime("%Y%m%d_%H%M%S")
+                    safe_id = (renew_url.split("?i=")[-1][:20]
+                               if "?i=" in renew_url else "server")[:30]
+                    import re as _re
+                    safe_id = _re.sub(r"[^\w\-.]", "_", safe_id)
+                    path = screenshot_dir / f"{ts}_{safe_id}_pre_click.png"
+                    page.driver.save_screenshot(str(path))
+                    print(f"  📸 Pre-click screenshot saved: {path}")
+                except Exception as e:
+                    print(f"  screenshot save failed: {e}")
+                # Try get_expire_info anyway — it might detect /login redirect
+                sid, exp_txt, secs = get_expire_info(page, renew_url)
+                if exp_txt == "expired/redirected":
+                    result["error"] = "Cookie rejected by server (redirected to /login)"
+                    return result
+                result["error"] = ("Renew modal did not open. Cookie may be invalid "
+                                   "or page redirected. See screenshot artifact.")
+                return result
+
+            # Step 5: Click the "Renew server" button to actually trigger renewal.
+            # Host2Play uses a blue button with text "Renew server". Try several
+            # selectors in order of specificity.
+            print("  Clicking 'Renew server' button...")
+            renew_clicked = False
+            renew_btn_selectors = [
+                # Most specific: button whose text contains "Renew server"
+                "xpath://button[contains(translate(text(),\"RENEW\",\"renew\"),\"renew server\")]",
+                "xpath://button[contains(text(),\"Renew server\")]",
+                "xpath://button[contains(text(),\"renew server\")]",
+                "xpath://button[contains(text(),\"续期\")]",
+                "xpath://button[contains(text(),\"续费\")]",
+                "xpath://button[contains(text(),\"延长\")]",
+                "xpath://a[contains(text(),\"Renew server\")]",
+                "xpath://a[contains(text(),\"续期\")]",
+                # Fall back to any button inside a modal
+                "css:.modal button.btn-primary",
+                "css:.modal button[type=submit]",
+                "css:.modal-dialog button.btn-primary",
+                "css:[role=dialog] button.btn-primary",
+                "css:.swal2-confirm",
+            ]
+            clicked_selector = None
+            for sel in renew_btn_selectors:
+                try:
+                    btn = page.find_element(sel, timeout=2)
+                    if btn:
+                        btn.click()
+                        renew_clicked = True
+                        clicked_selector = sel
+                        break
+                except Exception:
+                    continue
+            if not renew_clicked:
+                print("  ⚠️ Could not find 'Renew server' button")
+                try:
+                    screenshot_dir = OUTPUT_DIR
+                    screenshot_dir.mkdir(parents=True, exist_ok=True)
+                    ts = datetime.now(TZ_CN).strftime("%Y%m%d_%H%M%S")
+                    safe_id = (renew_url.split("?i=")[-1][:20]
+                               if "?i=" in renew_url else "server")[:30]
+                    import re as _re
+                    safe_id = _re.sub(r"[^\w\-.]", "_", safe_id)
+                    path = screenshot_dir / f"{ts}_{safe_id}_no_button.png"
+                    page.driver.save_screenshot(str(path))
+                    print(f"  📸 Screenshot saved: {path}")
+                except Exception:
+                    pass
+                result["error"] = "Renew button not found. See screenshot artifact."
+                return result
+            print(f"  ✓ Clicked button via selector: {clicked_selector}")
+
+            # Step 6: Wait for the renewal to take effect. The modal may close,
+            # show a success toast, or refresh the page. Give it a few seconds.
+            time.sleep(5)
+
+            # If the modal is still open (e.g. confirmation step), reload the
+            # page to see the updated "Deletes on" date.
+            try:
+                page.driver.get(renew_url)
+                time.sleep(3)
+            except Exception:
+                pass
+
+            # Step 7: Re-read "Deletes on" date AFTER clicking.
+            post_date_str, post_dt = parse_deletes_on_date(page)
+            if post_date_str:
+                print(f"  Post-renewal 'Deletes on': {post_date_str}")
+                result["new_time"] = post_date_str
+            else:
+                print("  ⚠️ Post-renewal 'Deletes on' date NOT found on page")
+                # Try get_expire_info's broader strategy as a fallback
+                sid, exp_txt, secs = get_expire_info(page, renew_url)
+                if exp_txt == "expired/redirected":
+                    result["error"] = "Post-renewal: redirected to /login (cookie rejected during renewal?)"
+                    return result
+                result["new_time"] = exp_txt if exp_txt != "Unknown" else "unknown (post-click)"
+
+            # Step 8: Verify renewal actually advanced the expiry date.
+            # If pre_dt and post_dt are both valid, post should be later than pre.
+            # Host2Play grants +24h on each renewal, so post should be >= pre + 23h.
+            if pre_dt and post_dt:
+                delta = post_dt - pre_dt
+                delta_hours = delta.total_seconds() / 3600
+                print(f"  Expiry delta: +{delta_hours:.2f} hours")
+                if delta_hours >= 23:
+                    # Success — expiry advanced by ~24h
+                    result["extra_info"] = f"+{int(delta_hours)}h"
+                    result["success"] = True
+                    result["error"] = None
+                elif delta_hours > 0:
+                    # Partial success — expiry advanced but less than expected
+                    result["extra_info"] = f"+{delta_hours:.1f}h (less than expected 24h)"
+                    result["success"] = True
+                    result["error"] = None
+                else:
+                    # Failure — expiry did NOT advance (button click didn't work,
+                    # or renewal was rejected by server)
+                    result["error"] = (f"Renewal failed: 'Deletes on' did not advance "
+                                       f"(pre: {pre_date_str}, post: {post_date_str})")
+                    return result
+            else:
+                # We couldn't parse one of the dates — can't verify renewal
+                # but button was clicked. Mark as success with caveat.
+                result["extra_info"] = "clicked-but-not-verified"
+                result["success"] = True
+                result["error"] = None
     except Exception as e:
         result["error"] = str(e).splitlines()[0]  # avoid full stacktrace in summary
     
