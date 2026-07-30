@@ -220,6 +220,24 @@ def inject_cookies(page: "SB", cookie_str: str) -> bool:
     return fail == 0 and ok > 0
 
 
+def parse_server_real_name(page: "SB") -> str:
+    """Extract the real server name from the renew modal.
+    Page shows: 'Renew server: bof5032'
+    Returns the name (e.g. 'bof5032') or empty string if not found.
+    """
+    import re
+    # Pattern: "Renew server: <name>" (name is alphanumeric, 4-20 chars typically)
+    name_re = re.compile(r"Renew\s+server\s*[:：]\s*([A-Za-z0-9_\-]{3,30})", re.IGNORECASE)
+    try:
+        html = page.page_source or ""
+    except Exception:
+        return ""
+    m = name_re.search(html)
+    if m:
+        return m.group(1)
+    return ""
+
+
 def parse_deletes_on_date(page: "SB") -> tuple:
     """Extract the 'Deletes on: YYYY/MM/DD HH:MM:SS' date from a Host2Play
     renew modal. Returns (date_string, datetime_obj) or (None, None).
@@ -662,6 +680,15 @@ def renew_server(server_name: str, cookie_str: str, renew_url: str = None) -> di
                 result["old_time"] = pre_date_str
             else:
                 print("  ⚠️ Pre-renewal 'Deletes on' date NOT found in page source")
+
+            # 提取服务器真实名字 (如 bof5032, mcf7008)
+            try:
+                real_name = parse_server_real_name(page)
+                if real_name:
+                    print(f"  🏷️ Server real name: {real_name}")
+                    result["real_name"] = real_name
+            except Exception:
+                pass
                 print("  Dumping first 1500 chars of cleaned page HTML for diagnosis:")
                 try:
                     import re
@@ -1206,11 +1233,17 @@ def main() -> None:
             summary_msg += f"📊 Total: {summary['total']} | ✓{summary['success']} | ✗{summary['failed']}\n\n"
             
             for r in summary["results"]:
+                # 显示格式: "👤 备注名 (真实名): ✓ 时间"
+                # 如果没有真实名, 只显示备注名
+                display_name = r['name']
+                real_name = r.get('real_name', '')
+                if real_name and real_name != display_name:
+                    display_name = f"{r['name']} ({real_name})"
                 if r["success"]:
                     new_t = r.get("new_time") or "extended"
-                    summary_msg += f"👤 {r['name']}: ✓ {new_t}\n"
+                    summary_msg += f"👤 {display_name}: ✓ {new_t}\n"
                 else:
-                    summary_msg += f"👤 {r['name']}: ✗ {r.get('error') or 'Failed'}\n"
+                    summary_msg += f"👤 {display_name}: ✗ {r.get('error') or 'Failed'}\n"
             
             try:
                 requests.post(
