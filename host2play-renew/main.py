@@ -224,8 +224,18 @@ def get_expire_info(page: "SB", renew_url: str = None) -> tuple:
     """Return (server_id, expires_text, seconds_remaining).
 
     Best-effort: reads the current page to verify auth (not redirected to login)
-    and to grab an expiry date string if present. Returns ("Unknown", "Unknown", -1)
-    on any failure.
+    and to grab an expiry date string if present.
+
+    Strategy (tries each in turn, returns the first hit):
+      1. Check current_url for /login or /signin redirect
+      2. Try a wide list of CSS / XPath selectors that often hold expiry info
+      3. Regex-scan page body text for human-readable date patterns near
+         keywords like "expire", "expiry", "until", "到期", "过期", "剩余", "续期至"
+      4. As a last resort, dump a snippet of page HTML to stdout so the user
+         can paste it back and we can refine the selectors
+
+    Returns ("Unknown", "Unknown", -1) on failure (no /login detected).
+    Returns (sid, "expired/redirected", -1) on auth failure.
     """
     url = renew_url if renew_url else RENEW_URL
 
@@ -238,42 +248,128 @@ def get_expire_info(page: "SB", renew_url: str = None) -> tuple:
         return sid, exp_txt, secs
 
     try:
-        final_url = page.driver.current_url
-        # Host2Play redirects unauthenticated users to /login. If we ended up there,
-        # the cookie is invalid/expired — surface this clearly.
+        final_url = page.driver.current_url or ""
+        # Auth-failure detection
         if "/login" in final_url or "/signin" in final_url:
             print(f"⚠️ Redirected to login page ({final_url}) — cookie is invalid or expired")
             return sid, "expired/redirected", secs
 
-        # Best-effort: look for an expiry string anywhere on the page.
-        # Host2Play panel uses various formats; try a few common selectors.
+        # ---- Strategy 2: wide selector sweep ----
+        # Covers common Tailwind / Bootstrap / custom class conventions plus
+        # localized (zh-CN) panel structures.
         expiry_selectors = [
-            "css:.expires", "css:.expiry", "css:[data-expires]",
-            "css:span:contains(\"expire\")", "css:div:contains(\"expire\")",
-            "xpath://*[@id=\"expiry\"]",
-            "xpath://*[@class=\"expiry\"]",
+            # English class/id conventions
+            "css:.expires", "css:.expiry", "css:.expire-at", "css:.expire-date",
+            "css:[data-expires]", "css:[data-expiry]", "css:[data-expire]",
+            "css:#expires", "css:#expiry", "css:#expireDate", "css:#expiration",
+            "css:.expiration", "css:#expiration", "css:.validity",
+            "css:.server-expires", "css:.server-expiry",
+            "css:.renewal-date", "css:.next-renewal",
+            # Common text-bearing tags containing the word "expire"
+            "css:span:contains(\"expire\")",
+            "css:span:contains(\"Expire\")",
+            "css:span:contains(\"Expiry\")",
+            "css:div:contains(\"expire\")",
+            "css:div:contains(\"Expiry\")",
+            "css:p:contains(\"expire\")",
+            "css:small:contains(\"expire\")",
+            "css:td:contains(\"expire\")",
+            # Localized (zh-CN)
+            "css:span:contains(\"到期\")",
+            "css:span:contains(\"过期\")",
+            "css:span:contains(\"剩余\")",
+            "css:span:contains(\"续期至\")",
+            "css:span:contains(\"有效至\")",
+            "css:div:contains(\"到期\")",
+            "css:div:contains(\"过期\")",
+            "css:div:contains(\"剩余\")",
+            "css:div:contains(\"续期\")",
+            "css:p:contains(\"到期\")",
+            "css:p:contains(\"过期\")",
+            "css:p:contains(\"剩余\")",
+            # XPath fallbacks (sometimes needed when :contains() is unsupported)
+            "xpath://*[contains(text(), \"expire\")]",
+            "xpath://*[contains(text(), \"Expire\")]",
+            "xpath://*[contains(text(), \"Expiry\")]",
+            "xpath://*[contains(text(), \"到期\")]",
+            "xpath://*[contains(text(), \"过期\")]",
+            "xpath://*[contains(text(), \"剩余\")]",
+            "xpath://*[contains(text(), \"续期\")]",
         ]
         for sel in expiry_selectors:
             try:
                 el = page.find_element(sel, timeout=1)
                 if el:
-                    txt = el.text.strip()
-                    if txt and len(txt) < 100:
+                    txt = (el.text or "").strip()
+                    if txt and 0 < len(txt) < 200:
                         exp_txt = txt
+                        print(f"  [selector hit: {sel}] -> {txt[:80]}")
                         break
             except Exception:
                 continue
 
+        # ---- Strategy 3: regex scan page body ----
         if exp_txt == "Unknown":
-            # Fall back to full body text search for the word "expire"
             try:
-                body = page.find_element("css:body", timeout=1).text
+                body = page.find_element("css:body", timeout=1).text or ""
+                # Date regex — matches 2026-07-30, 2026/07/30, 30/07/2026,
+                # 2026-07-30 10:47:36, etc.
+                import re
+                date_re = re.compile(
+                    r"(\d{4}[-/]\d{1,2}[-/]\d{1,2}"
+                    r"(?:\s+\d{1,2}:\d{2}(?::\d{2})?)?"
+                    r"|\d{1,2}[-/]\d{1,2}[-/]\d{2,4})"
+                )
+                # Keywords (case-insensitive)
+                keyword_re = re.compile(
+                    r"(expire|expiry|expires|until|valid|"
+                    r"到期|过期|剩余|续期|有效|时长)",
+                    re.IGNORECASE
+                )
+                # Look line by line first (typical case)
                 for line in body.splitlines():
-                    if "expire" in line.lower() and len(line) < 200:
-                        exp_txt = line.strip()
-                        break
-            except Exception:
-                pass
+                    line_s = line.strip()
+                    if not line_s or len(line_s) > 200:
+                        continue
+                    if keyword_re.search(line_s):
+                        m = date_re.search(line_s)
+                        if m:
+                            exp_txt = line_s
+                            print(f"  [regex hit: line has keyword + date] -> {line_s[:80]}")
+                            break
+                # If still not found, try the whole body as one string
+                if exp_txt == "Unknown":
+                    for m in date_re.finditer(body):
+                        start = max(0, m.start() - 40)
+                        end = min(len(body), m.end() + 40)
+                        window = body[start:end].replace("\n", " ").strip()
+                        if keyword_re.search(window):
+                            exp_txt = window
+                            print(f"  [regex hit: window] -> {window[:80]}")
+                            break
+            except Exception as e:
+                print(f"  body scan warning: {str(e).splitlines()[0]}")
+
+        # ---- Strategy 4: dump a snippet for debugging ----
+        if exp_txt == "Unknown":
+            print("  ⚠️ Could not find expiry info on the page.")
+            print("  Page title:", page.driver.title or "(empty)")
+            try:
+                body_html = page.driver.page_source or ""
+                # Strip script/style noise, take just the visible text skeleton
+                import re
+                clean = re.sub(r"<script[^>]*>.*?</script>", "", body_html, flags=re.DOTALL)
+                clean = re.sub(r"<style[^>]*>.*?</style>", "", clean, flags=re.DOTALL)
+                clean = re.sub(r"<!--.*?-->", "", clean, flags=re.DOTALL)
+                # Collapse tags
+                clean = re.sub(r"<[^>]+>", " ", clean)
+                clean = re.sub(r"\s+", " ", clean).strip()
+                snippet = clean[:500] + ("..." if len(clean) > 500 else "")
+                print("  Page text snippet (first 500 chars):")
+                for line in [snippet[i:i+80] for i in range(0, min(len(snippet), 480), 80)]:
+                    print(f"    {line}")
+            except Exception as e:
+                print(f"  page_source dump failed: {e}")
     except Exception as e:
         print(f"  get_expire_info warning: {str(e).splitlines()[0]}")
 
@@ -394,9 +490,14 @@ def renew_server(server_name: str, cookie_str: str, renew_url: str = None) -> di
             if exp_txt == "expired/redirected":
                 result["error"] = "Cookie rejected by server (redirected to /login)"
                 return result
-            result["old_time"] = exp_txt if exp_txt != "Unknown" else "page-loaded (no expiry text found)"
-            result["new_time"] = "extended (+24h)"
-            result["extra_info"] = "+24h"
+            if exp_txt == "Unknown":
+                result["old_time"] = "Unknown"
+                result["new_time"] = "+24h (expiry text not found on page)"
+                result["extra_info"] = "renewed-but-no-expiry-text"
+            else:
+                result["old_time"] = exp_txt
+                result["new_time"] = f"extended (until/after: {exp_txt})"
+                result["extra_info"] = "+24h"
             result["success"] = True
             result["error"] = None
     except Exception as e:
@@ -509,9 +610,10 @@ def main() -> None:
             
             for r in summary["results"]:
                 if r["success"]:
-                    summary_msg += f"👤 {r['name']}: ✓Extended\n"
+                    new_t = r.get("new_time") or "extended"
+                    summary_msg += f"👤 {r['name']}: ✓ {new_t}\n"
                 else:
-                    summary_msg += f"👤 {r['name']}: ✗Failed - {r['error']}\n"
+                    summary_msg += f"👤 {r['name']}: ✗ {r.get('error') or 'Failed'}\n"
             
             try:
                 requests.post(
@@ -548,9 +650,10 @@ def main() -> None:
         print(f"✗Renewal failed: {result['error']}")
     
     if result["success"]:
-        msg = f"✓main-server renewed successfully!"
+        new_t = result.get("new_time") or "extended (+24h)"
+        msg = f"✓ main-server renewed! {new_t}"
     else:
-        msg = f"✗main-server renewal failed: {result['error']}"
+        msg = f"✗ main-server renewal failed: {result.get('error') or 'unknown error'}"
     tg_send(msg, "Host2Play Renewal")
 
 
