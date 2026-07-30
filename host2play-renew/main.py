@@ -1091,6 +1091,7 @@ def renew_server(server_name: str, cookie_str: str, renew_url: str = None) -> di
                 pass
 
             # 用 JS 读取 performance entries, 看 renew() 发了哪些请求
+            renew_api_found = False
             try:
                 entries = page.execute_script(
                     "return performance.getEntriesByType('resource')"
@@ -1102,10 +1103,51 @@ def renew_server(server_name: str, cookie_str: str, renew_url: str = None) -> di
                     print(f"  Performance entries during renew() ({len(entries)}):")
                     for i, e in enumerate(entries[:5]):
                         print(f"    [{i+1}] {e.get('method','?')} {e.get('url','?')[:120]} ({e.get('duration',0)}ms)")
+                        # 检查是否有续期 API 请求
+                        url = e.get('url', '')
+                        if 'renew' in url.lower() or 'extend' in url.lower():
+                            renew_api_found = True
                 else:
                     print("  No host2play/renew/api requests in performance log!")
             except Exception as e:
                 print(f"  Performance entries read failed: {e}")
+
+            # 如果 renew() 没发续期 API 请求, 直接调用续期 API
+            if not renew_api_found:
+                print("  renew() did not make renewal API call, calling API directly...")
+                # 从 URL 提取 server id
+                import re as _re_sid
+                sid_match = _re_sid.search(r'[?&]i=([a-f0-9-]+)', renew_url or '')
+                if sid_match:
+                    server_uuid = sid_match.group(1)
+                    # 尝试多个可能的续期 API 端点
+                    for api_path in [
+                        f"/publicapis/renew?i={server_uuid}",
+                        f"/api/renew?i={server_uuid}",
+                        f"/publicapis/extend?i={server_uuid}",
+                        f"/server/renew?i={server_uuid}&confirm=1",
+                    ]:
+                        try:
+                            print(f"  Trying: GET https://host2play.gratis{api_path}")
+                            # 用 XMLHttpRequest 同步调用 (execute_script 拿不到 Promise)
+                            api_result = page.execute_script(
+                                "var url = arguments[0];"
+                                "var xhr = new XMLHttpRequest();"
+                                "xhr.open('GET', url, false);"
+                                "xhr.withCredentials = true;"
+                                "xhr.send();"
+                                "return {status: xhr.status, body: (xhr.responseText||'').substring(0, 300)};",
+                                f"https://host2play.gratis{api_path}"
+                            )
+                            print(f"    -> status={api_result.get('status')} body={api_result.get('body','')[:150]}")
+                            if api_result.get('status') == 200:
+                                print(f"    Renewal API call succeeded!")
+                                renew_api_found = True
+                                break
+                        except Exception as e:
+                            print(f"    API call failed: {e}")
+                else:
+                    print(f"  Could not extract server UUID from URL: {renew_url}")
 
             # Step 6: Wait for the renewal to take effect. The renewal may be
             # an async XHR. Poll for up to 30s checking if 'Deletes on' advances.
