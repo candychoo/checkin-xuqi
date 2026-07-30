@@ -1121,29 +1121,59 @@ def renew_server(server_name: str, cookie_str: str, renew_url: str = None) -> di
                 if sid_match:
                     server_uuid = sid_match.group(1)
                     # 尝试多个可能的续期 API 端点
-                    for api_path in [
-                        f"/publicapis/renew?i={server_uuid}",
-                        f"/api/renew?i={server_uuid}",
-                        f"/publicapis/extend?i={server_uuid}",
-                        f"/server/renew?i={server_uuid}&confirm=1",
-                    ]:
+                    # 尝试多种可能的续期 API, 优先 GET, 然后 POST
+                    api_attempts = [
+                        ("GET", f"/publicapis/renewServer?i={server_uuid}"),
+                        ("GET", f"/publicapis/renew?i={server_uuid}"),
+                        ("GET", f"/publicapis/extendServer?i={server_uuid}"),
+                        ("GET", f"/api/server/{server_uuid}/renew"),
+                        ("GET", f"/api/renew?i={server_uuid}"),
+                        ("POST", f"/publicapis/renewServer"),
+                        ("POST", f"/publicapis/renew"),
+                        ("POST", f"/api/server/{server_uuid}/renew"),
+                    ]
+                    for method, api_path in api_attempts:
                         try:
-                            print(f"  Trying: GET https://host2play.gratis{api_path}")
-                            # 用 XMLHttpRequest 同步调用 (execute_script 拿不到 Promise)
+                            print(f"  Trying: {method} https://host2play.gratis{api_path}")
+                            # 用 XMLHttpRequest 同步调用
+                            # POST 请求需要带 CSRF token (从 cookie 读取)
                             api_result = page.execute_script(
-                                "var url = arguments[0];"
+                                "var method = arguments[0];"
+                                "var url = arguments[1];"
                                 "var xhr = new XMLHttpRequest();"
-                                "xhr.open('GET', url, false);"
+                                "xhr.open(method, url, false);"
                                 "xhr.withCredentials = true;"
-                                "xhr.send();"
+                                "if (method === 'POST') {"
+                                "  xhr.setRequestHeader('Content-Type', 'application/x-www-form-urlencoded');"
+                                "  var csrf = '';"
+                                "  var cookies = document.cookie.split(';');"
+                                "  for (var i=0; i<cookies.length; i++) {"
+                                "    var c = cookies[i].trim();"
+                                "    if (c.indexOf('_csrf=') === 0) csrf = c.substring(6);"
+                                "  }"
+                                "  xhr.send('i=' + url.split('i=')[1] + '&_csrf=' + csrf);"
+                                "} else {"
+                                "  xhr.send();"
+                                "}"
                                 "return {status: xhr.status, body: (xhr.responseText||'').substring(0, 300)};",
-                                f"https://host2play.gratis{api_path}"
+                                method,
+                                f"https://host2play.gratis{api_path}" + (f"?i={server_uuid}" if method == "POST" else "")
                             )
-                            print(f"    -> status={api_result.get('status')} body={api_result.get('body','')[:150]}")
-                            if api_result.get('status') == 200:
+                            body = api_result.get('body', '')
+                            status = api_result.get('status', 0)
+                            print(f"    -> status={status} body={body[:150]}")
+                            # 200 但返回 HTML 页面 = 不是 API, 是路由
+                            is_html = body.strip().startswith('<!DOCTYPE') or body.strip().startswith('<html')
+                            is_api_success = status == 200 and not is_html
+                            # 也接受 JSON 响应 (无论 status)
+                            if body.strip().startswith('{') or body.strip().startswith('['):
+                                is_api_success = True
+                            if is_api_success:
                                 print(f"    Renewal API call succeeded!")
                                 renew_api_found = True
                                 break
+                            elif status == 200 and is_html:
+                                print(f"    (200 but HTML page, not API - continuing)")
                         except Exception as e:
                             print(f"    API call failed: {e}")
                 else:
