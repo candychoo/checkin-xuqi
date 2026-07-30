@@ -742,21 +742,41 @@ def renew_server(server_name: str, cookie_str: str, renew_url: str = None) -> di
                 pass
 
             # 提取 Expires in (剩余时间, 如 "20:34:46")
+            # 用和 parse_server_real_name 一样的多方法策略
             try:
+                # 方法 1: JS 读 modal 元素文本
                 expires_in = page.execute_script(
                     "var modal = document.querySelector('.modal') ||"
                     "            document.querySelector('[class*=\"modal\"]') ||"
                     "            document.querySelector('[role=\"dialog\"]');"
-                    "if (!modal) return '';"
-                    "var t = modal.innerText || modal.textContent || '';"
+                    "var t = '';"
+                    "if (modal) t = modal.innerText || modal.textContent || '';"
+                    "if (!t) {"
+                    "  var all = document.querySelectorAll('h1,h2,h3,h4,h5,p,div,span');"
+                    "  for (var el of all) {"
+                    "    var tt = el.innerText || el.textContent || '';"
+                    "    if (tt.indexOf('Expires') >= 0 || tt.indexOf('剩') >= 0) { t = tt; break; }"
+                    "  }"
+                    "}"
                     "var m = t.match(/Expires\\s*in[:：]?\\s*(\\d{1,2}:\\d{2}:\\d{2})/i);"
+                    "if (m) return m[1];"
+                    "m = t.match(/(\\d{1,2}:\\d{2}:\\d{2})/);"
                     "return m ? m[1] : '';"
                 )
                 if expires_in:
                     print(f"  ⏰ Expires in: {expires_in}")
                     result["expires_in"] = expires_in
-            except Exception:
-                pass
+                else:
+                    # 方法 2: 从 page_source 找
+                    import re as _re_exp
+                    html = page.page_source or ""
+                    m = _re_exp.search(r"Expires\s*in[^\d]{0,5}(\d{1,2}:\d{2}:\d{2})", html, _re_exp.IGNORECASE)
+                    if m:
+                        expires_in = m.group(1)
+                        print(f"  ⏰ Expires in (from source): {expires_in}")
+                        result["expires_in"] = expires_in
+            except Exception as e:
+                print(f"  ⚠️ Expires in extraction failed: {e}")
                 print("  Dumping first 1500 chars of cleaned page HTML for diagnosis:")
                 try:
                     import re
