@@ -318,14 +318,64 @@ def renew_server(server_name: str, cookie_str: str, renew_url: str = None) -> di
     try:
         with create_uc_page(proxy_addr) as page:
             page.set_default_timeout(180)
-            # Step 1: Navigate to renew URL once (without cookies, just to land on domain)
+            # Step 1: Navigate to renew URL once (without cookies, just to land on domain).
+            # This is REQUIRED before add_cookie can succeed (Chrome needs an
+            # origin to attach cookies to). It also doubles as a connectivity
+            # check: if DNS fails or the host is unreachable, abort EARLY with
+            # a clear message rather than cascading into "invalid cookie domain"
+            # errors 30 seconds later.
             print(f"Navigating to {renew_url} (pre-cookie)...")
+            nav_error = None
             try:
                 page.driver.get(renew_url)
                 time.sleep(2)  # let CF Turnstile challenge resolve if present
             except Exception as e:
-                # UC mode may raise on first nav; ignore — we just need domain context
-                print(f"  initial nav warning (ignored): {str(e).splitlines()[0]}")
+                nav_error = str(e)
+
+            # Inspect navigation error: hard DNS/connectivity failures should
+            # abort; transient UC-mode warnings (e.g. "tab closed") should not.
+            if nav_error:
+                msg_first = nav_error.splitlines()[0]
+                # Hard-failure markers — abort with a clear message
+                hard_failures = [
+                    "ERR_NAME_NOT_RESOLVED",   # DNS NXDOMAIN
+                    "ERR_NAME_RESOLUTION_FAILED",
+                    "ERR_CONNECTION_REFUSED",
+                    "ERR_CONNECTION_RESET",
+                    "ERR_CONNECTION_TIMED_OUT",
+                    "ERR_INTERNET_DISCONNECTED",
+                    "ERR_ADDRESS_UNREACHABLE",
+                ]
+                if any(m in nav_error for m in hard_failures):
+                    # Extract host for a helpful error message
+                    try:
+                        from urllib.parse import urlparse
+                        host = urlparse(renew_url).hostname or "?"
+                    except Exception:
+                        host = "?"
+                    result["error"] = (
+                        f"Renewal URL unreachable: {msg_first} "
+                        f"(host: {host}). Check the URL is correct and the "
+                        f"domain exists in DNS."
+                    )
+                    return result
+                # Otherwise: treat as soft UC-mode warning, continue.
+                print(f"  initial nav warning (ignored): {msg_first}")
+
+            # Sanity check: did the browser actually end up on the target host?
+            # If we're still on about:blank or a different origin, cookie
+            # injection will fail with "invalid cookie domain" — better to
+            # surface this now than 6 failed cookies later.
+            try:
+                final_url = page.driver.current_url
+                if not final_url or final_url.startswith("about:blank") or final_url == "data,":
+                    result["error"] = (
+                        f"Failed to navigate to renew URL (still on {final_url}). "
+                        f"Cookie injection would also fail. Check the URL."
+                    )
+                    return result
+            except Exception:
+                pass  # don't fail on this sanity check
 
             # Step 2: Inject cookies now that we're on the target origin
             cookie_ok = inject_cookies(page, cookie_str)
