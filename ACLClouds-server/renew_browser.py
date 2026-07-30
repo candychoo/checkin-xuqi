@@ -401,6 +401,32 @@ def _check_cf_passed(sb) -> bool:
 def get_servers_via_api(cookie_str: str):
     """用 API 获取服务器列表 (复用纯 API 方式, 比浏览器快)"""
     import requests as req
+
+    # 清理 cookie_str:
+    # - 去除多账号备注前缀 (如 "账号1-----")
+    # - 去除 BOM / 零宽空格等不可见字符
+    # - 去除任何非 latin-1 字符 (HTTP header 限制)
+    if "-----" in cookie_str:
+        # 多账号格式: "备注-----cookie值"
+        parts = cookie_str.split("-----", 1)
+        if len(parts) == 2:
+            cookie_str = parts[1]
+            log.info(f"📋 检测到备注前缀, 已剥离, 使用纯 Cookie")
+    # 移除 BOM 和零宽字符
+    cookie_str = cookie_str.replace("\ufeff", "").replace("\u200b", "")
+    cookie_str = cookie_str.replace("\u200c", "").replace("\u200d", "")
+    # 移除所有非 latin-1 字符 (HTTP header 只支持 0-255)
+    cleaned_chars = []
+    removed_count = 0
+    for ch in cookie_str:
+        if ord(ch) <= 255:
+            cleaned_chars.append(ch)
+        else:
+            removed_count += 1
+    if removed_count > 0:
+        log.warning(f"⚠️ Cookie 中含 {removed_count} 个非 latin-1 字符, 已移除")
+        cookie_str = "".join(cleaned_chars)
+
     s = req.Session()
     s.headers.update({
         "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
@@ -420,12 +446,23 @@ def get_servers_via_api(cookie_str: str):
     if "aclclouds_session" in parsed and "__Host-aclclouds_session" not in parsed:
         parsed["__Host-aclclouds_session"] = parsed.pop("aclclouds_session")
 
+    if not parsed:
+        log.warning("⚠️ Cookie 解析后为空, 跳过 API 调用")
+        return []
+
     # Cookie header + cookie jar
     cookie_header = "; ".join(f"{k}={v}" for k, v in parsed.items())
-    s.headers["Cookie"] = cookie_header
+    try:
+        s.headers["Cookie"] = cookie_header
+    except UnicodeEncodeError as e:
+        log.warning(f"⚠️ Cookie header 编码失败: {e}, 跳过 API 调用")
+        return []
     for d in ["aclclouds.com", ".aclclouds.com"]:
         for k, v in parsed.items():
-            s.cookies.set(k, v, domain=d, path="/")
+            try:
+                s.cookies.set(k, v, domain=d, path="/")
+            except Exception:
+                pass
 
     import urllib.parse
     token = None
@@ -439,11 +476,19 @@ def get_servers_via_api(cookie_str: str):
         if token:
             token = urllib.parse.unquote(token)
 
-    r = s.get(f"{BASE_URL}/api/client", timeout=30)
+    try:
+        r = s.get(f"{BASE_URL}/api/client", timeout=30)
+    except Exception as e:
+        log.warning(f"API 请求异常: {e}")
+        return []
     if r.status_code != 200:
         log.warning(f"API 获取服务器列表失败: HTTP {r.status_code}")
         return []
-    j = r.json()
+    try:
+        j = r.json()
+    except Exception:
+        log.warning("API 返回非 JSON, 跳过")
+        return []
     return j.get("data", []) if isinstance(j, dict) else (j if isinstance(j, list) else [])
 
 
@@ -751,6 +796,7 @@ def process_account(account: dict) -> dict:
 
     # 筛选需要续期的服务器
     servers_to_renew = []
+    all_servers_info = []  # 收集所有服务器信息用于 TG 通知
     now = datetime.now(timezone.utc)
     for srv in servers:
         attrs = srv.get("attributes", srv) if isinstance(srv, dict) else {}
@@ -767,6 +813,11 @@ def process_account(account: dict) -> dict:
         h_left = remaining / 3600 if remaining else None
 
         log.info(f"  - {sname} (id={sid}) 到期={expires_at} 剩余={fmt_remaining(remaining)} can_renew={can_renew}")
+
+        # 收集服务器信息 (用于 TG 通知显示剩余时间)
+        all_servers_info.append({
+            "sid": sid, "name": sname, "expires_at": expires_at or ""
+        })
 
         if h_left and h_left < RENEW_THRESHOLD_HOURS and can_renew:
             servers_to_renew.append({"sid": sid, "name": sname, "expires_at": expires_at})
@@ -858,7 +909,36 @@ def process_account(account: dict) -> dict:
 
             if not servers_to_renew:
                 log.info("✅ 没有需要续期的服务器")
-                tg(f"🎮 ACLClouds 续期通知\n\nℹ️ 无需续期\n👤 账号: {name}\n📅 所有服务器剩余 >= {RENEW_THRESHOLD_HOURS}h")
+                # 构建带每个服务器剩余时间的通知
+                from datetime import datetime as _dt, timezone as _tz
+                now_utc = _dt.now(_tz.utc)
+                details = []
+                for srv in all_servers_info:
+                    sname = srv.get('name', '?')
+                    sid = srv.get('sid', '?')
+                    expires_at = srv.get('expires_at', '')
+                    try:
+                        expire_dt = parse_iso(expires_at)
+                        if expire_dt:
+                            delta = expire_dt - now_utc
+                            total_sec = int(delta.total_seconds())
+                            if total_sec > 0:
+                                days = total_sec // 86400
+                                hours = (total_sec % 86400) // 3600
+                                mins = (total_sec % 3600) // 60
+                                if days > 0:
+                                    rem = f"{days}d {hours}h"
+                                else:
+                                    rem = f"{hours}h {mins}m"
+                            else:
+                                rem = "已过期"
+                        else:
+                            rem = "未知"
+                    except Exception:
+                        rem = "解析失败"
+                    details.append(f"👤 {sname} ({sid}): {rem}")
+                details_str = "\n".join(details) if details else "(无服务器)"
+                tg(f"🎮 ACLClouds 续期通知\n\nℹ️ 无需续期\n👤 账号: {name}\n📅 所有服务器剩余 >= {RENEW_THRESHOLD_HOURS}h\n\n{details_str}")
                 return {"name": name, "ok": True, "renewed": 0, "failed": 0}
 
             log.info(f"📋 需要续期 {len(servers_to_renew)} 台服务器")
@@ -892,7 +972,36 @@ def process_account(account: dict) -> dict:
     # 3. API 成功的情况: 启动浏览器续期
     if not servers_to_renew:
         log.info("✅ 没有需要续期的服务器")
-        tg(f"🎮 ACLClouds 续期通知\n\nℹ️ 无需续期\n👤 账号: {name}\n📅 所有服务器剩余 >= {RENEW_THRESHOLD_HOURS}h")
+        # 构建带每个服务器剩余时间的通知
+        from datetime import datetime as _dt, timezone as _tz
+        now_utc = _dt.now(_tz.utc)
+        details = []
+        for srv in all_servers_info:
+            sname = srv.get('name', '?')
+            sid = srv.get('sid', '?')
+            expires_at = srv.get('expires_at', '')
+            try:
+                expire_dt = parse_iso(expires_at)
+                if expire_dt:
+                    delta = expire_dt - now_utc
+                    total_sec = int(delta.total_seconds())
+                    if total_sec > 0:
+                        days = total_sec // 86400
+                        hours = (total_sec % 86400) // 3600
+                        mins = (total_sec % 3600) // 60
+                        if days > 0:
+                            rem = f"{days}d {hours}h"
+                        else:
+                            rem = f"{hours}h {mins}m"
+                    else:
+                        rem = "已过期"
+                else:
+                    rem = "未知"
+            except Exception:
+                rem = "解析失败"
+            details.append(f"👤 {sname} ({sid}): {rem}")
+        details_str = "\n".join(details) if details else "(无服务器)"
+        tg(f"🎮 ACLClouds 续期通知\n\nℹ️ 无需续期\n👤 账号: {name}\n📅 所有服务器剩余 >= {RENEW_THRESHOLD_HOURS}h\n\n{details_str}")
         return {"name": name, "ok": True, "renewed": 0, "failed": 0}
 
     log.info(f"📋 需要续期 {len(servers_to_renew)} 台服务器")

@@ -1704,12 +1704,20 @@ def process_account(account: dict) -> dict:
                 if last_sec_after > 0:
                     h = last_sec_after // 3600
                     m = (last_sec_after % 3600) // 60
+                    # 格式化剩余时间 (超过24h显示天数)
+                    days_rem = last_sec_after // 86400
+                    hours_rem = (last_sec_after % 86400) // 3600
+                    mins_rem = (last_sec_after % 3600) // 60
+                    if days_rem > 0:
+                        time_str = f"{days_rem}d {hours_rem}h {mins_rem}m"
+                    else:
+                        time_str = f"{hours_rem}h {mins_rem}m"
                     if server_renewed > 0:
                         summary = (
                             f"🎮 Gaming4Free 续期通知\n\n"
                             f"✅ 续期成功\n"
                             f"👤 服务器: {server['region']} ({server['num']})\n"
-                            f"📅 当前剩余: {h}h {m}m\n"
+                            f"📅 当前剩余: {time_str}\n"
                             f"🔄 续期次数: {server_renewed} 次"
                         )
                     else:
@@ -1717,7 +1725,7 @@ def process_account(account: dict) -> dict:
                             f"🎮 Gaming4Free 续期通知\n\n"
                             f"ℹ️ 无需续期\n"
                             f"👤 服务器: {server['region']} ({server['num']})\n"
-                            f"📅 当前剩余: {h}h {m}m"
+                            f"📅 当前剩余: {time_str}"
                         )
                 else:
                     if server_renewed > 0:
