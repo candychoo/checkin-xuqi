@@ -59,7 +59,7 @@ if _raw_accounts:
 # 单账号兜底: 用 SITE_URL + COOKIE_STR
 if not ACCOUNTS and (COOKIE_STR or _raw_renew_url):
     ACCOUNTS.append({
-        "name": "main",
+        "name": "appmy",
         "site": SITE_URL,
         "renew_url": _raw_renew_url or f"{SITE_URL}/server",
         "cookie": COOKIE_STR,
