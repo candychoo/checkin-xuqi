@@ -898,7 +898,14 @@ def renew_server(server_name: str, cookie_str: str, renew_url: str = None) -> di
                         try:
                             # renew() returns a Promise (AJAX), use execute_async_script
                             # to await it and capture any rejection error
-                            page.set_script_timeout(45)
+                            # 设置 script timeout (execute_async_script 的超时)
+                            try:
+                                page.driver.set_script_timeout(45)
+                            except Exception:
+                                try:
+                                    page.set_default_timeout(45)
+                                except Exception:
+                                    pass
                             async_js = (
                                 "var callback = arguments[arguments.length - 1];"
                                 "(async function() {"
