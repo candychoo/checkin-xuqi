@@ -967,6 +967,13 @@ def renew_server(server_name: str, cookie_str: str, renew_url: str = None) -> di
             except Exception:
                 pass
 
+            # (a.5) 用 CDP 开启网络请求监听, 捕获 renew() 发出的请求
+            try:
+                page.driver.execute_cdp_cmd("Network.enable", {})
+                print("  CDP Network monitoring enabled")
+            except Exception as e:
+                print(f"  CDP Network enable failed: {e}")
+
             try:
                 # (b) Read the button's onclick attribute, log it for debugging
                 onclick_js = (
@@ -1082,6 +1089,23 @@ def renew_server(server_name: str, cookie_str: str, renew_url: str = None) -> di
                 )
             except Exception:
                 pass
+
+            # 用 JS 读取 performance entries, 看 renew() 发了哪些请求
+            try:
+                entries = page.execute_script(
+                    "return performance.getEntriesByType('resource')"
+                    ".filter(function(e){return e.name.indexOf('host2play')>=0 || e.name.indexOf('renew')>=0 || e.name.indexOf('api')>=0 || e.name.indexOf('server')>=0;})"
+                    ".slice(-10)"
+                    ".map(function(e){return {url: e.name.substring(0,150), method: e.initiatorType, duration: Math.round(e.duration)};});"
+                )
+                if entries:
+                    print(f"  Performance entries during renew() ({len(entries)}):")
+                    for i, e in enumerate(entries[:5]):
+                        print(f"    [{i+1}] {e.get('method','?')} {e.get('url','?')[:120]} ({e.get('duration',0)}ms)")
+                else:
+                    print("  No host2play/renew/api requests in performance log!")
+            except Exception as e:
+                print(f"  Performance entries read failed: {e}")
 
             # Step 6: Wait for the renewal to take effect. The renewal may be
             # an async XHR. Poll for up to 30s checking if 'Deletes on' advances.
