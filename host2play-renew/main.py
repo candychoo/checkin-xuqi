@@ -828,20 +828,133 @@ def renew_server(server_name: str, cookie_str: str, renew_url: str = None) -> di
                 return result
             print(f"  ✓ Clicked button via: {clicked_via}")
 
-            # Step 6: Wait for the renewal to take effect. The modal may close,
-            # show a success toast, or refresh the page. Give it a few seconds.
-            time.sleep(5)
+            # Step 5.5: Bypass Cloudflare Rocket Loader if present.
+            #
+            # The button's onclick was wrapped by CF Rocket Loader:
+            #   onclick="if (!window.__cfRLUnblockHandlers) return false; ..."
+            #
+            # JS .click() may short-circuit if __cfRLUnblockHandlers isn't set
+            # (CF RL loads async and may not have unblocked handlers yet). Two
+            # workarounds:
+            #   (a) Set the flag manually so the wrapped onclick proceeds
+            #   (b) Read the onclick attr, extract the real function call,
+            #       invoke it directly via window[fnName](...)
+            # We try both. Also: trigger a proper mouse event so any other
+            # listeners (not just onclick) fire.
 
-            # If the modal is still open (e.g. confirmation step), reload the
-            # page to see the updated "Deletes on" date.
             try:
-                page.driver.get(renew_url)
-                time.sleep(3)
+                # (a) Manually unblock CF RL handlers
+                page.execute_script(
+                    "window.__cfRLUnblockHandlers = true;"
+                    "window.__cfRLUnblockHandlersLoaded = true;"
+                )
+                print("  Set window.__cfRLUnblockHandlers = true")
             except Exception:
                 pass
 
-            # Step 7: Re-read "Deletes on" date AFTER clicking.
-            post_date_str, post_dt = parse_deletes_on_date(page)
+            try:
+                # (b) Read the button's onclick attribute, log it for debugging
+                onclick_js = (
+                    "const btns = Array.from(document.querySelectorAll('button'));"
+                    "const r = btns.find(b => (b.textContent||'').toLowerCase().includes('renew'));"
+                    "return r ? r.getAttribute('onclick') : null;"
+                )
+                onclick_attr = page.execute_script(onclick_js)
+                if onclick_attr:
+                    print(f"  Button onclick attr: {onclick_attr[:200]}")
+                    # Try to extract a function call like renewServer('xxx') and invoke it
+                    import re as _re2
+                    # Look for patterns like: funcName('arg') or funcName("arg")
+                    fn_match = _re2.search(
+                        r"([a-zA-Z_$][\\w$]*)\\s*\\(\\s*(['\\\"][^'\\\"]*['\\\"]|\\d+)\\s*\\)",
+                        onclick_attr
+                    )
+                    if fn_match:
+                        fn_name = fn_match.group(1)
+                        fn_arg = fn_match.group(2)
+                        print(f"  Found function call: {fn_name}({fn_arg})")
+                        # Try direct invocation
+                        try:
+                            invoke_js = (
+                                f"if (typeof window.{fn_name} === 'function') {{"
+                                f"  window.{fn_name}({fn_arg});"
+                                f"  return 'invoked';"
+                                f"}}"
+                                f"return 'function not found';"
+                            )
+                            inv_res = page.execute_script(invoke_js)
+                            print(f"  Direct invocation result: {inv_res}")
+                        except Exception as e:
+                            print(f"  Direct invocation failed: {str(e).splitlines()[0]}")
+            except Exception as e:
+                print(f"  onclick extraction failed: {str(e).splitlines()[0]}")
+
+            # (c) Dispatch a real mouse 'click' event in case the button uses
+            # addEventListener instead of onclick. JS .click() should already
+            # trigger this, but doing it explicitly via MouseEvent ensures
+            # bubbling and capture-phase listeners fire too.
+            try:
+                page.execute_script(
+                    "const btns = Array.from(document.querySelectorAll('button'));"
+                    "const r = btns.find(b => (b.textContent||'').toLowerCase().includes('renew'));"
+                    "if (r) {"
+                    "  r.dispatchEvent(new MouseEvent('click', {"
+                    "    bubbles: true, cancelable: true, view: window"
+                    "  }));"
+                    "  return 'dispatched';"
+                    "}"
+                    "return 'not-found';"
+                )
+            except Exception:
+                pass
+
+            # Step 6: Wait for the renewal to take effect. The renewal may be
+            # an async XHR. Poll for up to 30s checking if 'Deletes on' advances.
+            print("  Waiting for renewal to take effect (polling for up to 30s)...")
+            pre_date_str_for_poll = pre_date_str
+            advanced = False
+            for wait_round in range(6):  # 6 rounds * 5s = 30s
+                time.sleep(5)
+                # Reload to get fresh page state (date may have updated server-side)
+                try:
+                    page.driver.get(renew_url)
+                    time.sleep(2)
+                except Exception:
+                    pass
+                # Check current 'Deletes on'
+                cur_date_str, cur_dt = parse_deletes_on_date(page)
+                if cur_dt and pre_dt and cur_dt > pre_dt:
+                    print(f"  ✓ Date advanced at round {wait_round+1}: {cur_date_str}")
+                    post_date_str = cur_date_str
+                    post_dt = cur_dt
+                    advanced = True
+                    break
+                # Also check for a success toast/alert
+                try:
+                    success_js = (
+                        "const txt = document.body.innerText || '';"
+                        "const patterns = ['renewed successfully', 'successfully renewed', "
+                        "'续期成功', '已续期', 'renewal complete', 'server renewed'];"
+                        "for (const p of patterns) {"
+                        "  if (txt.toLowerCase().includes(p)) return p;"
+                        "}"
+                        "return null;"
+                    )
+                    success_match = page.execute_script(success_js)
+                    if success_match:
+                        print(f"  ✓ Success toast detected: '{success_match}'")
+                        # Even if we can't read the new date, the toast confirms renewal
+                        if not cur_dt:
+                            post_date_str = cur_date_str or "renewed (toast confirmed)"
+                            post_dt = pre_dt  # treat as advanced for verify logic
+                            advanced = True
+                            break
+                except Exception:
+                    pass
+
+            if not advanced:
+                # Fall back to one final read
+                post_date_str, post_dt = parse_deletes_on_date(page)
             if post_date_str:
                 print(f"  Post-renewal 'Deletes on': {post_date_str}")
                 result["new_time"] = post_date_str
