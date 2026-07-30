@@ -152,25 +152,70 @@ def inject_cookies(page: "SB", cookie_str: str) -> bool:
     SeleniumBase 4.51+ add_cookie(cookie_dict, expiry=False) takes a single dict,
     NOT the legacy (name, value) pair. See:
       https://www.seleniumbase.io/help_methods/se_methods/#add_cookie
+
+    Supports two input formats:
+      1. Cookie string (default): 'name=value; name2=value2' — semicolon-separated
+      2. Netscape HTTP Cookie File: starts with '# Netscape' header, tab-separated
+         7 columns per row: domain  include_subdomains  path  secure  expiry  name  value
+         Exported by browser extensions like Cookie-Manager-Pro / Cookie-Editor.
+         See: https://curl.se/docs/http-cookies.html
     """
     if not cookie_str:
         print("⚠️ No cookie string provided")
         return False
-    print("Injecting Cookie...")
+
+    cookies_to_inject = []
+
+    if cookie_str.lstrip().startswith("# Netscape"):
+        print("Parsing Netscape format cookie file...")
+        for line in cookie_str.splitlines():
+            if not line or line.startswith("#"):
+                continue
+            parts = line.split("\t")
+            if len(parts) >= 7:
+                cookies_to_inject.append({
+                    "name": parts[5].strip(),
+                    "value": parts[6].strip(),
+                })
+    else:
+        print("Parsing cookie string format...")
+        for item in cookie_str.split(";"):
+            item = item.strip()
+            if "=" in item:
+                k, v = item.split("=", 1)
+                cookies_to_inject.append({
+                    "name": k.strip(),
+                    "value": v.strip(),
+                })
+
+    if not cookies_to_inject:
+        print("⚠️ No cookies parsed from input")
+        return False
+
+    # Sanity check: warn if none of the critical login cookies are present.
+    # This catches "I pasted a Netscape file but the export only had ad cookies
+    # because I wasn't actually logged in" early, instead of failing later with
+    # a generic 'redirected to /login' error.
+    names = {c["name"] for c in cookies_to_inject}
+    critical = ["connect.sid", "session", "XSRF-TOKEN", "_csrf"]
+    found_critical = [n for n in critical if n in names]
+    if not any(n in names for n in ("connect.sid", "session")):
+        print(f"⚠️ WARNING: Neither 'connect.sid' nor 'session' found in cookies!")
+        print(f"  Available cookie names: {sorted(names)}")
+        print("  Renewal will likely fail with 'redirected to /login'.")
+
+    print(f"Injecting {len(cookies_to_inject)} cookies (login cookies found: {found_critical or 'NONE'})...")
     ok = 0
     fail = 0
-    for item in cookie_str.split(";"):
-        item = item.strip()
-        if "=" in item:
-            k, v = item.split("=", 1)
-            try:
-                page.add_cookie({"name": k.strip(), "value": v.strip()})
-                ok += 1
-            except Exception as e:
-                fail += 1
-                # Don't print the full 16-line ChromeDriver stacktrace, just the message.
-                msg = str(e).splitlines()[0]
-                print(f"  Cookie injection failed [{k}]: {msg}")
+    for c in cookies_to_inject:
+        try:
+            page.add_cookie(c)
+            ok += 1
+        except Exception as e:
+            fail += 1
+            # Don't print the full 16-line ChromeDriver stacktrace, just the message.
+            msg = str(e).splitlines()[0]
+            print(f"  Cookie injection failed [{c['name']}]: {msg}")
     print(f"  Cookies: {ok} OK, {fail} failed")
     return fail == 0 and ok > 0
 
@@ -312,34 +357,68 @@ def renew_server(server_name: str, cookie_str: str, renew_url: str = None) -> di
 
 def parse_accounts_config(accounts_str: str) -> list:
     """Parse H2P_ACCOUNTS config into list of server dicts.
-    
-    Format per line: Name|||URL|||COOKIE
-    Can omit Name (auto-numbered).
+
+    Format per server: Name|||URL|||Cookie
+      - Separator: '|||' (three pipe chars)
+      - The Cookie field may span MULTIPLE lines, e.g. when using the
+        Netscape HTTP Cookie File format exported by browser extensions.
+        Continuation lines are any line that does NOT match the server-start
+        pattern (Name|||URL|||<anything>). This lets you paste a multi-line
+        Netscape cookie block directly after the third '|||'.
+      - Can omit Name (auto-numbered as Server-1, Server-2, ...).
+      - Comment lines (starting with '#') BEFORE the first server are skipped.
+
+    Examples:
+
+      # Single-line cookie string (most common):
+      我的服务器1|||https://host2play.gratis/server/renew?i=abc|||session=foo; connect.sid=bar
+
+      # Netscape format (multi-line):
+      我的服务器1|||https://host2play.gratis/server/renew?i=abc|||# Netscape HTTP Cookie File
+      # https://curl.se/docs/http-cookies.html
+      .host2play.gratis<TAB>FALSE<TAB>/<TAB>FALSE<TAB>0<TAB>_gcl_au<TAB>value1
+      host2play.gratis<TAB>FALSE<TAB>/<TAB>TRUE<TAB>0<TAB>connect.sid<TAB>value2
+
+    Limitation: cookie values should not contain '|||' (extremely rare).
     """
+    import re
+    # A server-start line: <optional name>|||<url>|||<rest-of-line-becomes-cookie>
+    # name may be empty (auto-numbered); url must be non-empty.
+    # We require the line to START with this pattern — continuation cookie
+    # lines (e.g. Netscape rows) typically start with a domain or '#' and
+    # do not contain '|||', so they won't match.
+    server_start_re = re.compile(r"^([^|\n]*)\|\|\|([^|\n]+)\|\|\|")
+
     servers = []
-    line_num = 0
-    
-    for raw_line in accounts_str.strip().split("\n"):
-        line_num += 1
-        line = raw_line.strip()
-        if not line or line.startswith("#"):
-            continue
-        
-        parts = line.split("|||")
-        if len(parts) < 3:
-            print(f"⚠️ Line {line_num}: Invalid format (need Name|||URL|||Cookie)")
-            continue
-        
-        name = parts[0].strip() or f"Server-{len(servers)+1}"
-        url = parts[1].strip()
-        cookie = parts[2].strip()
-        
-        servers.append({
-            "name": name,
-            "url": url,
-            "cookie": cookie
-        })
-    
+    current = None
+
+    for raw_line in accounts_str.splitlines():
+        m = server_start_re.match(raw_line)
+        if m:
+            # New server starts on this line
+            if current is not None:
+                current["cookie"] = current["cookie"].rstrip()
+                servers.append(current)
+            name = (m.group(1) or "").strip() or f"Server-{len(servers)+1}"
+            url = m.group(2).strip()
+            # Cookie starts after the second '|||' on this line
+            cookie_start = raw_line[m.end():]
+            current = {
+                "name": name,
+                "url": url,
+                "cookie": cookie_start,
+            }
+        else:
+            # Continuation line (part of current server's cookie block)
+            if current is None:
+                # Stray line before any server — skip silently
+                continue
+            current["cookie"] += "\n" + raw_line
+
+    if current is not None:
+        current["cookie"] = current["cookie"].rstrip()
+        servers.append(current)
+
     return servers
 
 
