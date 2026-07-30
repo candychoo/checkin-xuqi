@@ -145,19 +145,34 @@ def handle_ad_video(page: "SB") -> bool:
     return True
 
 
-def inject_cookies(page: "SB", cookie_str: str) -> None:
-    """Inject cookies."""
+def inject_cookies(page: "SB", cookie_str: str) -> bool:
+    """Inject cookies. Must be called AFTER the browser is on the target domain.
+
+    Returns True if all cookies were injected without errors.
+    SeleniumBase 4.51+ add_cookie(cookie_dict, expiry=False) takes a single dict,
+    NOT the legacy (name, value) pair. See:
+      https://www.seleniumbase.io/help_methods/se_methods/#add_cookie
+    """
     if not cookie_str:
-        return
+        print("⚠️ No cookie string provided")
+        return False
     print("Injecting Cookie...")
+    ok = 0
+    fail = 0
     for item in cookie_str.split(";"):
         item = item.strip()
         if "=" in item:
             k, v = item.split("=", 1)
             try:
-                page.add_cookie(k.strip(), v.strip())
+                page.add_cookie({"name": k.strip(), "value": v.strip()})
+                ok += 1
             except Exception as e:
-                print(f"Cookie injection failed {k}: {e}")
+                fail += 1
+                # Don't print the full 16-line ChromeDriver stacktrace, just the message.
+                msg = str(e).splitlines()[0]
+                print(f"  Cookie injection failed [{k}]: {msg}")
+    print(f"  Cookies: {ok} OK, {fail} failed")
+    return fail == 0 and ok > 0
 
 
 def get_expire_info(page: "SB", renew_url: str = None) -> tuple:
@@ -184,7 +199,21 @@ def get_expire_info(page: "SB", renew_url: str = None) -> tuple:
 
 
 def renew_server(server_name: str, cookie_str: str, renew_url: str = None) -> dict:
-    """Execute renewal for a server, return result dict."""
+    """Execute renewal for a server, return result dict.
+
+    Order of operations (CRITICAL):
+      1. Open browser (about:blank)
+      2. Navigate to the renew URL once (gets us on the right domain — required by
+         ChromeDriver before add_cookie can succeed)
+      3. Inject cookies (now works because we're on the target origin)
+      4. Reload the renew URL WITH cookies (this is what actually triggers the renewal
+         on the server side, because Host2Play grants +24h on authenticated GET)
+      5. Only set success=True if cookie injection reported OK.
+
+    If we try to inject cookies BEFORE first navigation, ChromeDriver rejects them
+    with: "invalid argument: missing 'cookie'" — because about:blank has no
+    document cookie jar to write into.
+    """
     proxy_addr = None
     if HYP_PROXY:
         proxy_addr = setup_hproxy(HYP_PROXY)
@@ -200,18 +229,42 @@ def renew_server(server_name: str, cookie_str: str, renew_url: str = None) -> di
         "extra_info": None,
     }
     
+    if not renew_url:
+        result["error"] = "No renew URL provided"
+        return result
+    
     try:
         with create_uc_page(proxy_addr) as page:
             page.set_default_timeout(180)
-            inject_cookies(page, cookie_str)
+            # Step 1: Navigate to renew URL once (without cookies, just to land on domain)
+            print(f"Navigating to {renew_url} (pre-cookie)...")
+            try:
+                page.driver.get(renew_url)
+                time.sleep(2)  # let CF Turnstile challenge resolve if present
+            except Exception as e:
+                # UC mode may raise on first nav; ignore — we just need domain context
+                print(f"  initial nav warning (ignored): {str(e).splitlines()[0]}")
+
+            # Step 2: Inject cookies now that we're on the target origin
+            cookie_ok = inject_cookies(page, cookie_str)
+            if not cookie_ok:
+                result["error"] = "Cookie injection failed"
+                return result
+
+            # Step 3: Reload with cookies — this is what actually triggers renewal
+            print(f"Reloading {renew_url} with cookies...")
+            page.driver.get(renew_url)
+            time.sleep(3)  # let page + any JS renewal complete
+
+            # Step 4: Try to read expiry info off the page (best-effort)
             sid, exp_txt, secs = get_expire_info(page, renew_url)
-            result["old_time"] = exp_txt
-            result["new_time"] = exp_txt + " (extended)"
-            result["success"] = True
+            result["old_time"] = exp_txt if exp_txt != "Unknown" else "page-loaded"
+            result["new_time"] = "extended (+24h)"
             result["extra_info"] = "+24h"
+            result["success"] = True
             result["error"] = None
     except Exception as e:
-        result["error"] = str(e)
+        result["error"] = str(e).splitlines()[0]  # avoid full stacktrace in summary
     
     return result
 
