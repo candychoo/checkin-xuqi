@@ -12,7 +12,7 @@
 | --- | --- | --- | --- |
 | [ACLClouds](https://dash.aclclouds.com/projects) | [`ACLClouds-server/`](ACLClouds-server/) | Cookie 注入 | 纯 API, 无浏览器 |
 | [Gaming4Free](https://control.gaming4free.net/) | [`gaming4free-renew/`](gaming4free-renew/) | Cookie 注入 | SeleniumBase UC + Turnstile |
-| [Host2Play](https://panel.host2play.net/) | [`host2play-renew/`](host2play-renew/) | Cookie 注入 | SeleniumBase UC + Hysteria2 |
+| [Host2Play](https://panel.host2play.net/) | [独立仓库 weikkadd/Host2Play](https://github.com/weikkadd/Host2Play) | Cookie 注入 | reCAPTCHA 音频识别 |
 
 ---
 
@@ -49,16 +49,6 @@
 | `TG_BOT_TOKEN` | ❌ | Telegram Bot Token |
 | `TG_CHAT_ID` | ❌ | Telegram Chat ID |
 
-### Host2Play (`host2play.yml`)
-
-| Secret 名 | 必填 | 说明 |
-| --- | --- | --- |
-| `H2P_RENEW_URL` | ✅ | 续期页面 URL（单账号） |
-| `H2P_COOKIE` | ✅ | Cookie 字符串（单账号） |
-| `H2P_ACCOUNTS` | 多账号 | 每行 `名称\|\|\|URL\|\|\|Cookie` |
-| `TG_BOT_TOKEN` | ❌ | Telegram Bot Token |
-| `TG_CHAT_ID` | ❌ | Telegram Chat ID |
-
 ---
 
 ## 📁 目录结构
@@ -67,12 +57,13 @@
 .
 ├── .github/workflows/
 │   ├── aclclouds-kaka.yml    # ACLClouds 续期 (每天 UTC 03:00 / 15:00)
-│   ├── gaming4free.yml       # Gaming4Free 续期 (每天 UTC 01:00)
-│   └── host2play.yml         # Host2Play 续期 (每天 5 次)
+│   └── gaming4free.yml       # Gaming4Free 续期 (每天 UTC 01:00)
 ├── ACLClouds-server/         # ACLClouds 续期脚本 (纯 API)
 ├── gaming4free-renew/        # Gaming4Free 续期脚本 (SeleniumBase UC)
-└── host2play-renew/          # Host2Play 续期脚本 (SeleniumBase UC + Hysteria2)
+└── scripts/                  # 多协议代理解析等公共脚本
 ```
+
+> **Host2Play 续期**已迁移到独立仓库：[weikkadd/Host2Play](https://github.com/weikkadd/Host2Play)（使用 reCAPTCHA 音频识别方案）
 
 ---
 
