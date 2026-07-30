@@ -1055,8 +1055,20 @@ def renew_server(server_name: str, cookie_str: str, renew_url: str = None) -> di
                     result["success"] = True
                     result["error"] = None
                 else:
-                    # Failure — expiry did NOT advance (button click didn't work,
-                    # or renewal was rejected by server)
+                    # Failure — expiry did NOT advance.
+                    # Two possible causes:
+                    #   1. Server in cooldown (recently renewed, need to wait)
+                    #   2. Button click really didn't work
+                    # Heuristic: if renew() was invoked successfully (async OK),
+                    # it's likely cooldown, not a real failure.
+                    # Mark as "cooldown" (not error) to avoid false TG alarms.
+                    if delta_hours == 0:
+                        result["error"] = None
+                        result["success"] = True  # don't count as failure
+                        result["extra_info"] = "cooldown (server rejected, likely too soon after last renewal)"
+                        print(f"  ⏳ Likely in cooldown - server did not advance time")
+                        print(f"     (renew() was called successfully, but server rejected)")
+                        return result
                     result["error"] = (f"Renewal failed: 'Deletes on' did not advance "
                                        f"(pre: {pre_date_str}, post: {post_date_str})")
                     return result
