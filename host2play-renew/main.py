@@ -870,14 +870,26 @@ def renew_server(server_name: str, cookie_str: str, renew_url: str = None) -> di
                     #   funcName(123)              — numeric arg
                     #   funcName('a', 'b')         — multiple args (best-effort)
                     import re as _re2
-                    # Match: identifier followed by (...) with optional content
-                    fn_match = _re2.search(
+                    # CF Rocket Loader wraps onclick as:
+                    #   "if (!window.__cfRLUnblockHandlers) return false; renew()"
+                    # We need to skip JS keywords (if/for/while/return/switch/catch)
+                    # and find the REAL function call (renew).
+                    JS_KEYWORDS = {"if", "for", "while", "return", "switch",
+                                   "catch", "function", "do", "with", "try"}
+                    fn_name = None
+                    fn_args_raw = ""
+                    # Find ALL candidate function calls, then pick the first
+                    # one whose name is NOT a JS keyword.
+                    for m in _re2.finditer(
                         r"([a-zA-Z_$][\w$]*)\s*\(([^)]*)\)",
                         onclick_attr
-                    )
-                    if fn_match:
-                        fn_name = fn_match.group(1)
-                        fn_args_raw = fn_match.group(2).strip()
+                    ):
+                        candidate = m.group(1)
+                        if candidate not in JS_KEYWORDS:
+                            fn_name = candidate
+                            fn_args_raw = m.group(2).strip()
+                            break
+                    if fn_name:
                         print(f"  Found function call: {fn_name}({fn_args_raw})")
                         # Try direct invocation. Pass args verbatim (they're already
                         # valid JS syntax like 'abc-123' or 123 or empty).
@@ -896,16 +908,20 @@ def renew_server(server_name: str, cookie_str: str, renew_url: str = None) -> di
                             print(f"  Direct window.{fn_name}() result: {inv_res}")
                             # If not on window, try eval (function may be in closure scope)
                             if "not found on window" in str(inv_res):
-                                eval_js = (
-                                    f"try {{"
-                                    f"  const r = eval('{fn_name}({fn_args_raw})');"
-                                    f"  return 'eval invoked, returned: ' + String(r).substring(0, 100);"
-                                    f"}} catch(e) {{"
-                                    f"  return 'eval failed: ' + e.message;"
-                                    f"}}"
+                                # 用 CDP 直接调用按钮的 click() 方法 (最可靠)
+                                # 这会触发完整的 onclick 处理流程
+                                click_js = (
+                                    "try {{"
+                                    "  const btns = Array.from(document.querySelectorAll('button'));"
+                                    "  const btn = btns.find(b => (b.textContent||'').toLowerCase().includes('renew'));"
+                                    "  if (btn) {{ btn.click(); return 'button.click() invoked'; }}"
+                                    "  return 'button not found';"
+                                    "}} catch(e) {{"
+                                    "  return 'click failed: ' + e.message;"
+                                    "}}"
                                 )
-                                eval_res = page.execute_script(eval_js)
-                                print(f"  Eval fallback result: {eval_res}")
+                                click_res = page.execute_script(click_js)
+                                print(f"  Button.click() fallback result: {click_res}")
                         except Exception as e:
                             print(f"  Direct invocation failed: {str(e).splitlines()[0]}")
                     else:
