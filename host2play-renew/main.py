@@ -230,50 +230,87 @@ def parse_deletes_on_date(page: "SB") -> tuple:
         Deletes on: 2026/08/06 08:39:42
         [Renew server]   <- blue button
 
-    We look for any text matching "Deletes on" or "删除时间" or "到期时间"
-    followed by a YYYY/MM/DD HH:MM:SS pattern.
+    IMPORTANT: Selenium's element.text only returns VISIBLE text (CSS-visible).
+    If the modal is rendered but not yet fully visible (or in a display:none
+    parent until animation finishes), .text returns empty. So we use
+    page_source (full HTML) as the primary source — much more reliable.
+
+    Also tries iframes in case the modal lives in one (rare but possible).
     """
     import re
-    try:
-        body_text = page.find_element("css:body", timeout=2).text or ""
-    except Exception:
-        try:
-            body_text = page.driver.page_source or ""
-            body_text = re.sub(r"<[^>]+>", " ", body_text)
-            body_text = re.sub(r"\s+", " ", body_text)
-        except Exception:
-            return None, None
-
-    # Match "Deletes on" followed by date. Allow flexible whitespace.
-    # Date formats supported:
-    #   2026/08/06 08:39:42
-    #   2026-08-06 08:39:42
-    #   2026/8/6 8:39:42
+    # Date pattern: 2026/08/06 08:39:42 or 2026-08-06 08:39:42 or 2026/8/6 8:39
     date_pattern = r"(\d{4}[-/]\d{1,2}[-/]\d{1,2}\s+\d{1,2}:\d{2}(?::\d{2})?)"
+    # Keyword pattern (case-insensitive)
+    keyword_pattern = r"(?:Deletes\s+on|删除时间|到期时间|过期时间|expires\s+on|delete\s+at)"
     deletes_re = re.compile(
-        r"(?:Deletes\s+on|删除时间|到期时间|过期时间|expires\s+on|delete\s+at)"
-        r"\s*[:：]?\s*" + date_pattern,
+        keyword_pattern + r"\s*[:：]?\s*" + date_pattern,
         re.IGNORECASE
     )
-    m = deletes_re.search(body_text)
-    if not m:
-        return None, None
-    date_str = m.group(1).strip()
-    # Parse to datetime for comparison
+
+    sources = []
+
+    # Source 1: full page HTML (most reliable for our case)
     try:
-        # Normalize separators: 2026/08/06 -> 2026-08-06
-        normalized = date_str.replace("/", "-")
-        dt = datetime.strptime(normalized, "%Y-%m-%d %H:%M:%S")
-        if len(date_str.split(":")) == 2:  # only HH:MM, no seconds
-            dt = datetime.strptime(normalized, "%Y-%m-%d %H:%M")
+        html = page.driver.page_source or ""
+        if html:
+            text = re.sub(r"<script[^>]*>.*?</script>", "", html, flags=re.DOTALL | re.IGNORECASE)
+            text = re.sub(r"<style[^>]*>.*?</style>", "", text, flags=re.DOTALL | re.IGNORECASE)
+            text = re.sub(r"<[^>]+>", " ", text)
+            text = re.sub(r"&nbsp;", " ", text)
+            text = re.sub(r"&amp;", "&", text)
+            text = re.sub(r"\s+", " ", text).strip()
+            sources.append(("page_source", text))
+    except Exception as e:
+        print(f"  parse_deletes_on_date: page_source failed: {str(e).splitlines()[0]}")
+
+    # Source 2: visible body text (fallback)
+    try:
+        body_text = page.find_element("css:body", timeout=1).text or ""
+        if body_text:
+            sources.append(("body.text", body_text))
     except Exception:
-        # Try without seconds
-        try:
-            normalized = date_str.replace("/", "-")
-            dt = datetime.strptime(normalized, "%Y-%m-%d %H:%M")
-        except Exception:
-            return date_str, None
-    return date_str, dt
+        pass
+
+    # Source 3: check inside iframes
+    try:
+        iframes = page.find_elements("css:iframe", timeout=1) or []
+        for i, iframe in enumerate(iframes):
+            try:
+                page.driver.switch_to.frame(iframe)
+                try:
+                    iframe_html = page.driver.page_source or ""
+                    if iframe_html:
+                        text = re.sub(r"<[^>]+>", " ", iframe_html)
+                        text = re.sub(r"\s+", " ", text).strip()
+                        sources.append((f"iframe[{i}]", text))
+                finally:
+                    page.driver.switch_to.default_content()
+            except Exception:
+                try:
+                    page.driver.switch_to.default_content()
+                except Exception:
+                    pass
+    except Exception:
+        pass
+
+    # Try each source
+    for src_name, text in sources:
+        m = deletes_re.search(text)
+        if m:
+            date_str = m.group(1).strip()
+            print(f"  [deletes-on date found via {src_name}]: {date_str}")
+            try:
+                normalized = date_str.replace("/", "-")
+                try:
+                    dt = datetime.strptime(normalized, "%Y-%m-%d %H:%M:%S")
+                except ValueError:
+                    dt = datetime.strptime(normalized, "%Y-%m-%d %H:%M")
+                return date_str, dt
+            except Exception as e:
+                print(f"  date parse failed: {e}")
+                return date_str, None
+
+    return None, None
 
 
 def get_expire_info(page: "SB", renew_url: str = None) -> tuple:
@@ -617,15 +654,30 @@ def renew_server(server_name: str, cookie_str: str, renew_url: str = None) -> di
             # Step 4: Read "Deletes on" date BEFORE clicking — this is the
             # pre-renewal expiry, which we can compare against the post-click
             # value to verify the renewal actually worked.
+            # Wait a bit longer first — the modal may take time to animate in.
+            time.sleep(2)
             pre_date_str, pre_dt = parse_deletes_on_date(page)
             if pre_date_str:
                 print(f"  Pre-renewal 'Deletes on': {pre_date_str}")
                 result["old_time"] = pre_date_str
             else:
-                print("  ⚠️ Pre-renewal 'Deletes on' date NOT found on page")
-                print("  (This usually means the renew modal didn't open — either")
-                print("   cookie is invalid or the page redirected to /login.)")
-                # Save a screenshot so we can see what the page actually shows
+                print("  ⚠️ Pre-renewal 'Deletes on' date NOT found in page source")
+                print("  Dumping first 1500 chars of cleaned page HTML for diagnosis:")
+                try:
+                    import re
+                    html = page.driver.page_source or ""
+                    clean = re.sub(r"<script[^>]*>.*?</script>", "", html, flags=re.DOTALL | re.IGNORECASE)
+                    clean = re.sub(r"<style[^>]*>.*?</style>", "", clean, flags=re.DOTALL | re.IGNORECASE)
+                    clean = re.sub(r"<select[^>]*>.*?</select>", "", clean, flags=re.DOTALL | re.IGNORECASE)
+                    clean = re.sub(r"<[^>]+>", " ", clean)
+                    clean = re.sub(r"&nbsp;", " ", clean)
+                    clean = re.sub(r"&amp;", "&", clean)
+                    clean = re.sub(r"\s+", " ", clean).strip()
+                    for i in range(0, min(len(clean), 1500), 100):
+                        print(f"    {clean[i:i+100]}")
+                except Exception as e:
+                    print(f"    dump failed: {e}")
+                # Save a screenshot for visual diagnosis
                 try:
                     screenshot_dir = OUTPUT_DIR
                     screenshot_dir.mkdir(parents=True, exist_ok=True)
@@ -639,14 +691,8 @@ def renew_server(server_name: str, cookie_str: str, renew_url: str = None) -> di
                     print(f"  📸 Pre-click screenshot saved: {path}")
                 except Exception as e:
                     print(f"  screenshot save failed: {e}")
-                # Try get_expire_info anyway — it might detect /login redirect
-                sid, exp_txt, secs = get_expire_info(page, renew_url)
-                if exp_txt == "expired/redirected":
-                    result["error"] = "Cookie rejected by server (redirected to /login)"
-                    return result
-                result["error"] = ("Renew modal did not open. Cookie may be invalid "
-                                   "or page redirected. See screenshot artifact.")
-                return result
+                # Continue anyway — try clicking the button and see what happens.
+                # We'll use Unknown for pre_dt and verify post-click only.
 
             # Step 5: Click the "Renew server" button to actually trigger renewal.
             # Host2Play uses a blue button with text "Renew server". Try several
@@ -749,12 +795,31 @@ def renew_server(server_name: str, cookie_str: str, renew_url: str = None) -> di
                     result["error"] = (f"Renewal failed: 'Deletes on' did not advance "
                                        f"(pre: {pre_date_str}, post: {post_date_str})")
                     return result
-            else:
-                # We couldn't parse one of the dates — can't verify renewal
-                # but button was clicked. Mark as success with caveat.
-                result["extra_info"] = "clicked-but-not-verified"
+            elif post_dt and not pre_dt:
+                # Pre-date not captured (modal detection failed) but post-date exists.
+                # Button was clicked, post-date is present. Mark success with caveat.
+                result["extra_info"] = f"clicked (pre-date unknown, post: {post_date_str})"
                 result["success"] = True
                 result["error"] = None
+                print(f"  ✓ Button clicked; post-renewal date verified (pre-date was unknown)")
+            else:
+                # Post-date also missing — can't verify anything. Save screenshot.
+                result["error"] = ("Cannot verify renewal: 'Deletes on' not found "
+                                   "before OR after clicking button. See screenshots.")
+                try:
+                    screenshot_dir = OUTPUT_DIR
+                    screenshot_dir.mkdir(parents=True, exist_ok=True)
+                    ts = datetime.now(TZ_CN).strftime("%Y%m%d_%H%M%S")
+                    safe_id = (renew_url.split("?i=")[-1][:20]
+                               if "?i=" in renew_url else "server")[:30]
+                    import re as _re
+                    safe_id = _re.sub(r"[^\w\-.]", "_", safe_id)
+                    path = screenshot_dir / f"{ts}_{safe_id}_post_click.png"
+                    page.driver.save_screenshot(str(path))
+                    print(f"  📸 Post-click screenshot saved: {path}")
+                except Exception:
+                    pass
+                return result
     except Exception as e:
         result["error"] = str(e).splitlines()[0]  # avoid full stacktrace in summary
     
