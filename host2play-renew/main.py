@@ -1120,8 +1120,10 @@ def renew_server(server_name: str, cookie_str: str, renew_url: str = None) -> di
                 # reCAPTCHA v2 通常在 iframe 里, checkbox 位置约在 iframe 左上角
                 try:
                     # 找到 recaptcha iframe 的位置
+                    # 用 JS 变量传递 selector, 避免引号转义问题
                     iframe_rect = page.execute_script(
-                        'var f = document.querySelector("iframe[src*=\"recaptcha/api2/anchor\"]");'
+                        'var sel = "iframe[src*=" + String.fromCharCode(34) + "recaptcha/api2/anchor" + String.fromCharCode(34) + "]";'
+                        'var f = document.querySelector(sel);'
                         'if (!f) return null;'
                         'var r = f.getBoundingClientRect();'
                         'return {left: r.left, top: r.top, width: r.width, height: r.height};'
