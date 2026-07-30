@@ -1177,7 +1177,7 @@ def renew_server(server_name: str, cookie_str: str, renew_url: str = None) -> di
                                     break
                                 # 检查是否有错误提示或挑战
                                 challenge = page.execute_script(
-                                    "var iframe = document.querySelector('iframe[src*=recaptcha/api2/bframe]');"
+                                    'var sel2 = "iframe[src*=" + String.fromCharCode(34) + "recaptcha/api2/bframe" + String.fromCharCode(34) + "]"; var iframe = document.querySelector(sel2);'
                                     "if (!iframe) return '';"
                                     "try {"
                                     "  var doc = iframe.contentDocument || iframe.contentWindow.document;"
