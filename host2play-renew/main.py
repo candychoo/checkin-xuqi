@@ -95,14 +95,14 @@ def create_uc_page(proxy_addr: Optional[str] = None) -> "SB":
     # Build SB kwargs (new API: pass params directly to SB())
     sb_kwargs = dict(
         uc=True,
-        no_sandbox=True,
-        disable_dev_shm_usage=True,
-        disable_gpu=True,
-        disable_features="AutomationControlled",
         agent=(
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
             "(KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36"
         ),
+        # SB 4.51+: no_sandbox / disable_dev_shm_usage / disable_gpu are NOT kwargs.
+        # Pass them as Chrome flags via `chromium_arg` (comma-separated, no spaces).
+        chromium_arg="--no-sandbox,--disable-dev-shm-usage,--disable-gpu",
+        disable_features="AutomationControlled",
     )
     if proxy_addr:
         sb_kwargs["proxy"] = proxy_addr
