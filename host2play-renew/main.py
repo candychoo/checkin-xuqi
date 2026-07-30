@@ -1188,12 +1188,15 @@ def renew_server(server_name: str, cookie_str: str, renew_url: str = None) -> di
                             status = api_result.get('status', 0)
                             csrf_found = api_result.get('csrfFound', False)
                             print(f"    -> status={status} csrf={'yes' if csrf_found else 'NO'} body={body[:150]}")
-                            # 200 但返回 HTML 页面 = 不是 API, 是路由
                             is_html = body.strip().startswith('<!DOCTYPE') or body.strip().startswith('<html')
-                            is_api_success = status == 200 and not is_html
-                            # 也接受 JSON 响应 (无论 status)
-                            if body.strip().startswith('{') or body.strip().startswith('['):
-                                is_api_success = True
+                            is_json = body.strip().startswith('{') or body.strip().startswith('[')
+                            # JSON 但 success:0 = 拒绝 (如 captcha 失败)
+                            if is_json and '"success":0' in body:
+                                print(f"    API rejected: {body[:200]}")
+                                if 'captcha' in body.lower():
+                                    print(f"    Need captcha - will try to solve")
+                                continue
+                            is_api_success = is_json and ('"success":1' in body or '"success":true' in body)
                             if is_api_success:
                                 print(f"    Renewal API call succeeded!")
                                 renew_api_found = True
