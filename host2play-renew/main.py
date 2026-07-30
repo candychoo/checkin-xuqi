@@ -222,35 +222,70 @@ def inject_cookies(page: "SB", cookie_str: str) -> bool:
 
 def parse_server_real_name(page: "SB") -> str:
     """Extract the real server name from the renew modal.
-    Page shows multiple possible formats:
-      - 'Renew server: bof5032'
-      - '<h2>Renew server: mcf7008</h2>'
-      - 'Renew server: <strong>bof5032</strong>'
-    Returns the name (e.g. 'bof5032') or empty string if not found.
+    Page shows: 'Renew server: bof5032'
+    Tries multiple sources: modal element text, page_source, body innerText.
     """
     import re
+    name_re_plain = re.compile(
+        r"Renew\s+server\s*[:：]\s*([A-Za-z0-9_\-]{3,30})",
+        re.IGNORECASE
+    )
+    name_re_html = re.compile(
+        r"Renew\s+server\s*[:：]?\s*<[^>]*>?\s*([A-Za-z0-9_\-]{3,30})",
+        re.IGNORECASE
+    )
+    FILTER_WORDS = {"server", "renew", "button", "modal"}
+
+    def _search(text):
+        if not text:
+            return ""
+        for regex in [name_re_html, name_re_plain]:
+            m = regex.search(text)
+            if m:
+                name = m.group(1)
+                if name.lower() not in FILTER_WORDS:
+                    return name
+        return ""
+
+    # 方法 1: JS 读 modal 元素文本
+    js_modal = (
+        "var modal = document.querySelector('.modal') ||"
+        "            document.querySelector('[class*=\"modal\"]') ||"
+        "            document.querySelector('[role=\"dialog\"]');"
+        "if (modal) return modal.innerText || modal.textContent || '';"
+        "var all = document.querySelectorAll('h1,h2,h3,h4,h5,p,div,span');"
+        "for (var el of all) {"
+        "  var t = el.innerText || el.textContent || '';"
+        "  if (t.indexOf('Renew server') >= 0) return t;"
+        "}"
+        "return '';"
+    )
+    try:
+        modal_text = page.execute_script(js_modal)
+        name = _search(modal_text)
+        if name:
+            return name
+    except Exception:
+        pass
+
+    # 方法 2: page_source
     try:
         html = page.page_source or ""
+        name = _search(html)
+        if name:
+            return name
     except Exception:
-        return ""
-    # Try multiple patterns, most specific first
-    patterns = [
-        # HTML tag wrapped: <h2>Renew server: <strong>bof5032</strong></h2>
-        r"Renew\s+server\s*[:：]\s*<[^>]+>\s*([A-Za-z0-9_\-]{3,30})",
-        # Plain text: Renew server: bof5032
-        r"Renew\s+server\s*[:：]\s*([A-Za-z0-9_\-]{3,30})",
-        # Renew server: followed by tag then text
-        r"Renew\s+server\s*[:：]?\s*<[^>]+>\s*([A-Za-z0-9_\-]{3,30})",
-        # Fallback: any "Renew server: XXX" where XXX is alphanumeric
-        r"Renew\s+server[^A-Za-z0-9]{1,5}([A-Za-z0-9_\-]{3,30})",
-    ]
-    for pat in patterns:
-        m = re.search(pat, html, re.IGNORECASE)
-        if m:
-            name = m.group(1)
-            # Filter out obvious false positives
-            if name.lower() not in ("server", "renew", "button", "modal"):
-                return name
+        pass
+
+    # 方法 3: body innerText
+    try:
+        body_text = page.execute_script("return document.body.innerText || '';")
+        name = _search(body_text)
+        if name:
+            return name
+    except Exception:
+        pass
+
     return ""
 
 
@@ -703,6 +738,23 @@ def renew_server(server_name: str, cookie_str: str, renew_url: str = None) -> di
                 if real_name:
                     print(f"  🏷️ Server real name: {real_name}")
                     result["real_name"] = real_name
+            except Exception:
+                pass
+
+            # 提取 Expires in (剩余时间, 如 "20:34:46")
+            try:
+                expires_in = page.execute_script(
+                    "var modal = document.querySelector('.modal') ||"
+                    "            document.querySelector('[class*=\"modal\"]') ||"
+                    "            document.querySelector('[role=\"dialog\"]');"
+                    "if (!modal) return '';"
+                    "var t = modal.innerText || modal.textContent || '';"
+                    "var m = t.match(/Expires\\s*in[:：]?\\s*(\\d{1,2}:\\d{2}:\\d{2})/i);"
+                    "return m ? m[1] : '';"
+                )
+                if expires_in:
+                    print(f"  ⏰ Expires in: {expires_in}")
+                    result["expires_in"] = expires_in
             except Exception:
                 pass
                 print("  Dumping first 1500 chars of cleaned page HTML for diagnosis:")
@@ -1251,47 +1303,65 @@ def main() -> None:
             summary_msg += f"📊 Total: {summary['total']} | ✓{summary['success']} | ✗{summary['failed']}\n\n"
             
             from datetime import datetime as _dt
-            now_utc = _dt.now(_dt.utcnow().astimezone().tzinfo) if False else _dt.now()
+            now_utc = _dt.now()
             for r in summary["results"]:
-                # 显示格式: "👤 备注名 (真实名): ✓ 到期时间 (剩余 Xh Ym)"
+                # 显示格式: "👤 备注名 (真实名): ✓ 到期时间 | 剩余 Xh Ym"
                 display_name = r['name']
                 real_name = r.get('real_name', '')
                 if real_name and real_name != display_name:
                     display_name = f"{r['name']} ({real_name})"
                 if r["success"]:
                     new_t = r.get("new_time") or "extended"
-                    # 计算剩余时间
+                    expires_in = r.get('expires_in', '')  # 如 "20:34:46"
+
+                    # 优先用 expires_in 显示剩余时间 (更准确)
                     remaining_str = ""
-                    try:
-                        # 解析 new_t (格式: 2026/08/06 05:49:08)
-                        from datetime import datetime as _dt2
-                        for fmt in ("%Y/%m/%d %H:%M:%S", "%Y-%m-%d %H:%M:%S"):
-                            try:
-                                exp_dt = _dt2.strptime(new_t, fmt)
-                                break
-                            except ValueError:
-                                continue
-                        else:
-                            exp_dt = None
-                        if exp_dt:
-                            delta = exp_dt - now_utc
-                            total_sec = int(delta.total_seconds())
-                            if total_sec > 0:
-                                days = total_sec // 86400
-                                hours = (total_sec % 86400) // 3600
-                                mins = (total_sec % 3600) // 60
-                                if days > 0:
-                                    remaining_str = f" (剩 {days}d {hours}h)"
-                                elif hours > 0:
-                                    remaining_str = f" (剩 {hours}h {mins}m)"
-                                else:
-                                    remaining_str = f" (剩 {mins}m)"
+                    if expires_in:
+                        # 解析 HH:MM:SS
+                        parts = expires_in.split(":")
+                        if len(parts) == 3:
+                            h = int(parts[0])
+                            m = int(parts[1])
+                            days = h // 24
+                            h_left = h % 24
+                            if days > 0:
+                                remaining_str = f" | 剩 {days}d {h_left}h"
                             else:
-                                remaining_str = " (已过期)"
-                    except Exception:
-                        pass
+                                remaining_str = f" | 剩 {h}h {m}m"
+                    else:
+                        # fallback: 从到期时间计算
+                        try:
+                            from datetime import datetime as _dt2
+                            for fmt in ("%Y/%m/%d %H:%M:%S", "%Y-%m-%d %H:%M:%S"):
+                                try:
+                                    exp_dt = _dt2.strptime(new_t, fmt)
+                                    break
+                                except ValueError:
+                                    continue
+                            else:
+                                exp_dt = None
+                            if exp_dt:
+                                delta = exp_dt - now_utc
+                                total_sec = int(delta.total_seconds())
+                                if total_sec > 0:
+                                    days = total_sec // 86400
+                                    hours = (total_sec % 86400) // 3600
+                                    mins = (total_sec % 3600) // 60
+                                    if days > 0:
+                                        remaining_str = f" | 剩 {days}d {hours}h"
+                                    elif hours > 0:
+                                        remaining_str = f" | 剩 {hours}h {mins}m"
+                                    else:
+                                        remaining_str = f" | 剩 {mins}m"
+                        except Exception:
+                            pass
+
                     extra = r.get('extra_info', '')
-                    extra_str = f" [{extra}]" if extra and extra != "cooldown" else (" [冷却中]" if extra == "cooldown" else "")
+                    extra_str = ""
+                    if extra == "cooldown":
+                        extra_str = " [冷却中]"
+                    elif extra:
+                        extra_str = f" [{extra}]"
                     summary_msg += f"👤 {display_name}: ✓ {new_t}{remaining_str}{extra_str}\n"
                 else:
                     summary_msg += f"👤 {display_name}: ✗ {r.get('error') or 'Failed'}\n"
