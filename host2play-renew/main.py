@@ -695,40 +695,122 @@ def renew_server(server_name: str, cookie_str: str, renew_url: str = None) -> di
                 # We'll use Unknown for pre_dt and verify post-click only.
 
             # Step 5: Click the "Renew server" button to actually trigger renewal.
-            # Host2Play uses a blue button with text "Renew server". Try several
-            # selectors in order of specificity.
+            # Host2Play uses a blue button with text "Renew server". Use a robust
+            # multi-strategy approach:
+            #   (A) JavaScript: iterate all button-like elements, find one whose
+            #       textContent includes "renew server" (case-insensitive) or "续期".
+            #       This is the most reliable because it handles patterns like
+            #       <button><span>Renew</span> server</button> that XPath
+            #       contains(text(),...) misses (text() only matches direct text nodes).
+            #   (B) XPath contains(., ...) — . = full text content (better than text())
+            #   (C) CSS fallbacks: .modal .btn-primary, [role=dialog] button, etc.
             print("  Clicking 'Renew server' button...")
             renew_clicked = False
-            renew_btn_selectors = [
-                # Most specific: button whose text contains "Renew server"
-                "xpath://button[contains(translate(text(),\"RENEW\",\"renew\"),\"renew server\")]",
-                "xpath://button[contains(text(),\"Renew server\")]",
-                "xpath://button[contains(text(),\"renew server\")]",
-                "xpath://button[contains(text(),\"续期\")]",
-                "xpath://button[contains(text(),\"续费\")]",
-                "xpath://button[contains(text(),\"延长\")]",
-                "xpath://a[contains(text(),\"Renew server\")]",
-                "xpath://a[contains(text(),\"续期\")]",
-                # Fall back to any button inside a modal
-                "css:.modal button.btn-primary",
-                "css:.modal button[type=submit]",
-                "css:.modal-dialog button.btn-primary",
-                "css:[role=dialog] button.btn-primary",
-                "css:.swal2-confirm",
-            ]
-            clicked_selector = None
-            for sel in renew_btn_selectors:
-                try:
-                    btn = page.find_element(sel, timeout=2)
-                    if btn:
-                        btn.click()
-                        renew_clicked = True
-                        clicked_selector = sel
-                        break
-                except Exception:
-                    continue
+            clicked_via = None
+
+            # Strategy A: JavaScript iteration (most robust)
+            try:
+                js_code = (
+                    "const targets = Array.from(document.querySelectorAll("
+                    "'button, a, input[type=submit], input[type=button], [role=button]'));"
+                    "const keywords = ['renew server', 'renew now', 'confirm renew', "
+                    "'续期', '续费', '延长', 'renew'];"
+                    "for (const el of targets) {"
+                    "  const text = (el.textContent || el.value || '').toLowerCase().trim();"
+                    "  for (const kw of keywords) {"
+                    "    if (text.includes(kw)) {"
+                    "      const style = window.getComputedStyle(el);"
+                    "      if (style.display !== 'none' && style.visibility !== 'hidden'"
+                    "          && el.offsetWidth > 0 && el.offsetHeight > 0"
+                    "          && !el.disabled) {"
+                    "        el.scrollIntoView({block: 'center'});"
+                    "        el.click();"
+                    "        return el.outerHTML.substring(0, 200);"
+                    "      }"
+                    "    }"
+                    "  }"
+                    "}"
+                    "return null;"
+                )
+                result_js = page.execute_script(js_code)
+                if result_js:
+                    renew_clicked = True
+                    clicked_via = f"JS text-match (html: {str(result_js)[:80]})"
+            except Exception as e:
+                print(f"  Strategy A (JS) failed: {str(e).splitlines()[0]}")
+
+            # Strategy B: XPath contains(., ...) — . = full text content
             if not renew_clicked:
-                print("  ⚠️ Could not find 'Renew server' button")
+                xpath_selectors = [
+                    "xpath://button[contains(., \"Renew server\")]",
+                    "xpath://button[contains(translate(., \"RENEW\", \"renew\"), \"renew\")]",
+                    "xpath://button[contains(., \"续期\")]",
+                    "xpath://button[contains(., \"续费\")]",
+                    "xpath://a[contains(., \"Renew server\")]",
+                    "xpath://a[contains(., \"续期\")]",
+                    "xpath://*[@role='button'][contains(., \"Renew server\")]",
+                ]
+                for sel in xpath_selectors:
+                    try:
+                        btn = page.find_element(sel, timeout=2)
+                        if btn:
+                            btn.click()
+                            renew_clicked = True
+                            clicked_via = f"xpath: {sel[:80]}"
+                            break
+                    except Exception:
+                        continue
+
+            # Strategy C: CSS fallbacks
+            if not renew_clicked:
+                css_selectors = [
+                    "css:.modal button.btn-primary",
+                    "css:.modal-dialog button.btn-primary",
+                    "css:.modal-content button.btn-primary",
+                    "css:[role=dialog] button.btn-primary",
+                    "css:[role=dialog] button[type=submit]",
+                    "css:.modal button[type=submit]",
+                    "css:.swal2-confirm",
+                    "css:.bootbox-accept",
+                    "css:button.btn-primary",
+                ]
+                for sel in css_selectors:
+                    try:
+                        btn = page.find_element(sel, timeout=1)
+                        if btn:
+                            btn.click()
+                            renew_clicked = True
+                            clicked_via = f"css: {sel}"
+                            break
+                    except Exception:
+                        continue
+
+            if not renew_clicked:
+                print("  ⚠️ Could not find 'Renew server' button via any strategy")
+                # Dump all buttons on the page for diagnosis
+                try:
+                    js_dump = (
+                        "const btns = Array.from(document.querySelectorAll("
+                        "'button, a, input[type=submit], [role=button]'));"
+                        "return btns.slice(0, 20).map(b => ({"
+                        "  tag: b.tagName, type: b.type || '', class: b.className || '',"
+                        "  role: b.getAttribute('role') || '',"
+                        "  text: (b.textContent || b.value || '').trim().substring(0, 80),"
+                        "  disabled: b.disabled,"
+                        "  visible: window.getComputedStyle(b).display !== 'none'"
+                        "}));"
+                    )
+                    btns_info = page.execute_script(js_dump)
+                    if btns_info:
+                        print("  Buttons on page (up to 20):")
+                        for b in btns_info:
+                            vis = 'VIS' if b.get('visible') else 'HID'
+                            dis = ' [DISABLED]' if b.get('disabled') else ''
+                            print(f"    [{vis}] <{b.get('tag','?')} class=\"{b.get('class','')}\" "
+                                  f"type=\"{b.get('type','')}\" role=\"{b.get('role','')}\">"
+                                  f"{b.get('text','')!r}{dis}")
+                except Exception as e:
+                    print(f"  button dump failed: {e}")
                 try:
                     screenshot_dir = OUTPUT_DIR
                     screenshot_dir.mkdir(parents=True, exist_ok=True)
@@ -744,7 +826,7 @@ def renew_server(server_name: str, cookie_str: str, renew_url: str = None) -> di
                     pass
                 result["error"] = "Renew button not found. See screenshot artifact."
                 return result
-            print(f"  ✓ Clicked button via selector: {clicked_selector}")
+            print(f"  ✓ Clicked button via: {clicked_via}")
 
             # Step 6: Wait for the renewal to take effect. The modal may close,
             # show a success toast, or refresh the page. Give it a few seconds.
