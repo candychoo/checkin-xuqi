@@ -401,6 +401,32 @@ def _check_cf_passed(sb) -> bool:
 def get_servers_via_api(cookie_str: str):
     """用 API 获取服务器列表 (复用纯 API 方式, 比浏览器快)"""
     import requests as req
+
+    # 清理 cookie_str:
+    # - 去除多账号备注前缀 (如 "账号1-----")
+    # - 去除 BOM / 零宽空格等不可见字符
+    # - 去除任何非 latin-1 字符 (HTTP header 限制)
+    if "-----" in cookie_str:
+        # 多账号格式: "备注-----cookie值"
+        parts = cookie_str.split("-----", 1)
+        if len(parts) == 2:
+            cookie_str = parts[1]
+            log.info(f"📋 检测到备注前缀, 已剥离, 使用纯 Cookie")
+    # 移除 BOM 和零宽字符
+    cookie_str = cookie_str.replace("\ufeff", "").replace("\u200b", "")
+    cookie_str = cookie_str.replace("\u200c", "").replace("\u200d", "")
+    # 移除所有非 latin-1 字符 (HTTP header 只支持 0-255)
+    cleaned_chars = []
+    removed_count = 0
+    for ch in cookie_str:
+        if ord(ch) <= 255:
+            cleaned_chars.append(ch)
+        else:
+            removed_count += 1
+    if removed_count > 0:
+        log.warning(f"⚠️ Cookie 中含 {removed_count} 个非 latin-1 字符, 已移除")
+        cookie_str = "".join(cleaned_chars)
+
     s = req.Session()
     s.headers.update({
         "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
@@ -420,12 +446,23 @@ def get_servers_via_api(cookie_str: str):
     if "aclclouds_session" in parsed and "__Host-aclclouds_session" not in parsed:
         parsed["__Host-aclclouds_session"] = parsed.pop("aclclouds_session")
 
+    if not parsed:
+        log.warning("⚠️ Cookie 解析后为空, 跳过 API 调用")
+        return []
+
     # Cookie header + cookie jar
     cookie_header = "; ".join(f"{k}={v}" for k, v in parsed.items())
-    s.headers["Cookie"] = cookie_header
+    try:
+        s.headers["Cookie"] = cookie_header
+    except UnicodeEncodeError as e:
+        log.warning(f"⚠️ Cookie header 编码失败: {e}, 跳过 API 调用")
+        return []
     for d in ["aclclouds.com", ".aclclouds.com"]:
         for k, v in parsed.items():
-            s.cookies.set(k, v, domain=d, path="/")
+            try:
+                s.cookies.set(k, v, domain=d, path="/")
+            except Exception:
+                pass
 
     import urllib.parse
     token = None
@@ -439,11 +476,19 @@ def get_servers_via_api(cookie_str: str):
         if token:
             token = urllib.parse.unquote(token)
 
-    r = s.get(f"{BASE_URL}/api/client", timeout=30)
+    try:
+        r = s.get(f"{BASE_URL}/api/client", timeout=30)
+    except Exception as e:
+        log.warning(f"API 请求异常: {e}")
+        return []
     if r.status_code != 200:
         log.warning(f"API 获取服务器列表失败: HTTP {r.status_code}")
         return []
-    j = r.json()
+    try:
+        j = r.json()
+    except Exception:
+        log.warning("API 返回非 JSON, 跳过")
+        return []
     return j.get("data", []) if isinstance(j, dict) else (j if isinstance(j, list) else [])
 
 
