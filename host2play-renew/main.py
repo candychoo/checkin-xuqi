@@ -1135,33 +1135,59 @@ def renew_server(server_name: str, cookie_str: str, renew_url: str = None) -> di
                     for method, api_path in api_attempts:
                         try:
                             print(f"  Trying: {method} https://host2play.gratis{api_path}")
-                            # 用 XMLHttpRequest 同步调用
-                            # POST 请求需要带 CSRF token (从 cookie 读取)
+                            # POST 请求需要正确的 CSRF token
+                            # 1. 从 meta 标签获取 (<meta name="csrf-token">)
+                            # 2. 从 cookie 获取 (_csrf)
+                            # 3. 通过 header 和 body 双重发送
                             api_result = page.execute_script(
                                 "var method = arguments[0];"
                                 "var url = arguments[1];"
+                                "var serverUuid = arguments[2];"
                                 "var xhr = new XMLHttpRequest();"
                                 "xhr.open(method, url, false);"
                                 "xhr.withCredentials = true;"
-                                "if (method === 'POST') {"
-                                "  xhr.setRequestHeader('Content-Type', 'application/x-www-form-urlencoded');"
-                                "  var csrf = '';"
+                                # 获取 CSRF token: 优先 meta 标签, 然后 cookie
+                                "var csrfToken = '';"
+                                "var meta = document.querySelector('meta[name=csrf-token]') || document.querySelector('meta[name=_csrf]') || document.querySelector('meta[name=CSRFToken]');"
+                                "if (meta) csrfToken = meta.getAttribute('content') || '';"
+                                "if (!csrfToken) {"
+                                "  var input = document.querySelector('input[name=_csrf]');"
+                                "  if (input) csrfToken = input.value || '';"
+                                "}"
+                                "if (!csrfToken) {"
                                 "  var cookies = document.cookie.split(';');"
                                 "  for (var i=0; i<cookies.length; i++) {"
                                 "    var c = cookies[i].trim();"
-                                "    if (c.indexOf('_csrf=') === 0) csrf = c.substring(6);"
+                                "    if (c.indexOf('_csrf=') === 0) csrfToken = decodeURIComponent(c.substring(6));"
+                                "    if (c.indexOf('csrf=') === 0) csrfToken = decodeURIComponent(c.substring(5));"
                                 "  }"
-                                "  xhr.send('i=' + url.split('i=')[1] + '&_csrf=' + csrf);"
+                                "}"
+                                "if (method === 'POST') {"
+                                "  xhr.setRequestHeader('Content-Type', 'application/x-www-form-urlencoded');"
+                                "  if (csrfToken) {"
+                                "    xhr.setRequestHeader('X-CSRF-Token', csrfToken);"
+                                "    xhr.setRequestHeader('X-CSRF-TOKEN', csrfToken);"
+                                "    xhr.setRequestHeader('X-XSRF-TOKEN', csrfToken);"
+                                "  }"
+                                "  var body = 'i=' + encodeURIComponent(serverUuid);"
+                                "  if (csrfToken) body += '&_csrf=' + encodeURIComponent(csrfToken);"
+                                "  xhr.send(body);"
                                 "} else {"
+                                "  if (csrfToken) {"
+                                "    xhr.setRequestHeader('X-CSRF-Token', csrfToken);"
+                                "    xhr.setRequestHeader('X-XSRF-TOKEN', csrfToken);"
+                                "  }"
                                 "  xhr.send();"
                                 "}"
-                                "return {status: xhr.status, body: (xhr.responseText||'').substring(0, 300)};",
+                                "return {status: xhr.status, body: (xhr.responseText||'').substring(0, 300), csrfFound: !!csrfToken};",
                                 method,
-                                f"https://host2play.gratis{api_path}" + (f"?i={server_uuid}" if method == "POST" else "")
+                                f"https://host2play.gratis{api_path}" + (f"?i={server_uuid}" if method == "POST" else ""),
+                                server_uuid
                             )
                             body = api_result.get('body', '')
                             status = api_result.get('status', 0)
-                            print(f"    -> status={status} body={body[:150]}")
+                            csrf_found = api_result.get('csrfFound', False)
+                            print(f"    -> status={status} csrf={'yes' if csrf_found else 'NO'} body={body[:150]}")
                             # 200 但返回 HTML 页面 = 不是 API, 是路由
                             is_html = body.strip().startswith('<!DOCTYPE') or body.strip().startswith('<html')
                             is_api_success = status == 200 and not is_html
