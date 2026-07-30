@@ -1121,10 +1121,10 @@ def renew_server(server_name: str, cookie_str: str, renew_url: str = None) -> di
                 try:
                     # 找到 recaptcha iframe 的位置
                     iframe_rect = page.execute_script(
-                        "var f = document.querySelector('iframe[src*=recaptcha/api2/anchor]');"
-                        "if (!f) return null;"
-                        "var r = f.getBoundingClientRect();"
-                        "return {left: r.left, top: r.top, width: r.width, height: r.height};"
+                        'var f = document.querySelector("iframe[src*=\"recaptcha/api2/anchor\"]");'
+                        'if (!f) return null;'
+                        'var r = f.getBoundingClientRect();'
+                        'return {left: r.left, top: r.top, width: r.width, height: r.height};'
                     )
                     if iframe_rect:
                         # checkbox 在 iframe 内左上角约 (25, 25) 位置
