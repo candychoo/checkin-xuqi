@@ -176,26 +176,63 @@ def inject_cookies(page: "SB", cookie_str: str) -> bool:
 
 
 def get_expire_info(page: "SB", renew_url: str = None) -> tuple:
-    """Return (server_id, expires_text, seconds_remaining)."""
+    """Return (server_id, expires_text, seconds_remaining).
+
+    Best-effort: reads the current page to verify auth (not redirected to login)
+    and to grab an expiry date string if present. Returns ("Unknown", "Unknown", -1)
+    on any failure.
+    """
     url = renew_url if renew_url else RENEW_URL
-    
+
     sid = "Unknown"
     exp_txt = "Unknown"
     secs = -1
-    
+
     if not url:
         print("⚠️ No renewal URL configured")
         return sid, exp_txt, secs
-    
-    for _ in range(5):
-        try:
-            page.driver.get(url)
-            return sid, exp_txt, secs
-        except Exception as e:
-            print(f"Failed to fetch page info: {e}")
-            time.sleep(2)
-    
-    return "Unknown", "Unknown", -1
+
+    try:
+        final_url = page.driver.current_url
+        # Host2Play redirects unauthenticated users to /login. If we ended up there,
+        # the cookie is invalid/expired — surface this clearly.
+        if "/login" in final_url or "/signin" in final_url:
+            print(f"⚠️ Redirected to login page ({final_url}) — cookie is invalid or expired")
+            return sid, "expired/redirected", secs
+
+        # Best-effort: look for an expiry string anywhere on the page.
+        # Host2Play panel uses various formats; try a few common selectors.
+        expiry_selectors = [
+            "css:.expires", "css:.expiry", "css:[data-expires]",
+            "css:span:contains(\"expire\")", "css:div:contains(\"expire\")",
+            "xpath://*[@id=\"expiry\"]",
+            "xpath://*[@class=\"expiry\"]",
+        ]
+        for sel in expiry_selectors:
+            try:
+                el = page.find_element(sel, timeout=1)
+                if el:
+                    txt = el.text.strip()
+                    if txt and len(txt) < 100:
+                        exp_txt = txt
+                        break
+            except Exception:
+                continue
+
+        if exp_txt == "Unknown":
+            # Fall back to full body text search for the word "expire"
+            try:
+                body = page.find_element("css:body", timeout=1).text
+                for line in body.splitlines():
+                    if "expire" in line.lower() and len(line) < 200:
+                        exp_txt = line.strip()
+                        break
+            except Exception:
+                pass
+    except Exception as e:
+        print(f"  get_expire_info warning: {str(e).splitlines()[0]}")
+
+    return sid, exp_txt, secs
 
 
 def renew_server(server_name: str, cookie_str: str, renew_url: str = None) -> dict:
@@ -256,9 +293,13 @@ def renew_server(server_name: str, cookie_str: str, renew_url: str = None) -> di
             page.driver.get(renew_url)
             time.sleep(3)  # let page + any JS renewal complete
 
-            # Step 4: Try to read expiry info off the page (best-effort)
+            # Step 4: Read expiry info; if get_expire_info detected a /login
+            # redirect, that means the cookie was rejected — fail loudly.
             sid, exp_txt, secs = get_expire_info(page, renew_url)
-            result["old_time"] = exp_txt if exp_txt != "Unknown" else "page-loaded"
+            if exp_txt == "expired/redirected":
+                result["error"] = "Cookie rejected by server (redirected to /login)"
+                return result
+            result["old_time"] = exp_txt if exp_txt != "Unknown" else "page-loaded (no expiry text found)"
             result["new_time"] = "extended (+24h)"
             result["extra_info"] = "+24h"
             result["success"] = True
