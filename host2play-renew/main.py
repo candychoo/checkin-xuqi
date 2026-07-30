@@ -254,6 +254,38 @@ def get_expire_info(page: "SB", renew_url: str = None) -> tuple:
             print(f"⚠️ Redirected to login page ({final_url}) — cookie is invalid or expired")
             return sid, "expired/redirected", secs
 
+        # ---- Strategy 1.5: look for the renewal success alert/toast specifically ----
+        # After clicking the renew action, most Laravel/Bootstrap sites show
+        # an alert div like: <div class="alert alert-success">Server renewed
+        # until 2026-07-31 10:47</div>
+        alert_selectors = [
+            "css:.alert-success",
+            "css:.alert-info",
+            "css:.toast-success",
+            "css:.toast-message",
+            "css:.swal2-success",
+            "css:.swal2-html-container",
+            "css:[role=\"alert\"]",
+            "css:.notification",
+            "css:.notice",
+            "css:.flash",
+            "css:.flash-success",
+            "css:#notice",
+            "css:#alert",
+            "css:#flash",
+        ]
+        for sel in alert_selectors:
+            try:
+                el = page.find_element(sel, timeout=1)
+                if el:
+                    txt = (el.text or "").strip()
+                    if txt and 0 < len(txt) < 500:
+                        exp_txt = txt
+                        print(f"  [alert hit: {sel}] -> {txt[:120]}")
+                        break
+            except Exception:
+                continue
+
         # ---- Strategy 2: wide selector sweep ----
         # Covers common Tailwind / Bootstrap / custom class conventions plus
         # localized (zh-CN) panel structures.
@@ -309,67 +341,98 @@ def get_expire_info(page: "SB", renew_url: str = None) -> tuple:
                 continue
 
         # ---- Strategy 3: regex scan page body ----
+        # Strip noise elements FIRST (select, nav, header, footer, script, style)
+        # — Host2Play's language <select> alone is ~1500 chars of language names
+        # and was completely drowning the actual renewal result text.
         if exp_txt == "Unknown":
+            import re
             try:
-                body = page.find_element("css:body", timeout=1).text or ""
+                body_html = page.driver.page_source or ""
+                # Remove noisy elements entirely
+                clean = re.sub(r"<script[^>]*>.*?</script>", "", body_html, flags=re.DOTALL | re.IGNORECASE)
+                clean = re.sub(r"<style[^>]*>.*?</style>", "", clean, flags=re.DOTALL | re.IGNORECASE)
+                clean = re.sub(r"<!--.*?-->", "", clean, flags=re.DOTALL)
+                clean = re.sub(r"<select[^>]*>.*?</select>", "", clean, flags=re.DOTALL | re.IGNORECASE)
+                clean = re.sub(r"<nav[^>]*>.*?</nav>", "", clean, flags=re.DOTALL | re.IGNORECASE)
+                clean = re.sub(r"<header[^>]*>.*?</header>", "", clean, flags=re.DOTALL | re.IGNORECASE)
+                clean = re.sub(r"<footer[^>]*>.*?</footer>", "", clean, flags=re.DOTALL | re.IGNORECASE)
+                clean = re.sub(r"<noscript[^>]*>.*?</noscript>", "", clean, flags=re.DOTALL | re.IGNORECASE)
+                # Collapse tags to spaces
+                clean = re.sub(r"<[^>]+>", " ", clean)
+                clean = re.sub(r"&nbsp;", " ", clean)
+                clean = re.sub(r"\s+", " ", clean).strip()
+
                 # Date regex — matches 2026-07-30, 2026/07/30, 30/07/2026,
-                # 2026-07-30 10:47:36, etc.
-                import re
+                # 2026-07-30 10:47:36, July 30 2026, etc.
                 date_re = re.compile(
                     r"(\d{4}[-/]\d{1,2}[-/]\d{1,2}"
                     r"(?:\s+\d{1,2}:\d{2}(?::\d{2})?)?"
-                    r"|\d{1,2}[-/]\d{1,2}[-/]\d{2,4})"
+                    r"|\d{1,2}[-/]\d{1,2}[-/]\d{2,4}"
+                    r"(?:\s+\d{1,2}:\d{2}(?::\d{2})?)?"
+                    r"|(?:January|February|March|April|May|June|July|August|September|October|November|December)\s+\d{1,2},?\s+\d{4})"
                 )
                 # Keywords (case-insensitive)
                 keyword_re = re.compile(
-                    r"(expire|expiry|expires|until|valid|"
-                    r"到期|过期|剩余|续期|有效|时长)",
+                    r"(expire|expiry|expires|until|valid|renewed|extended|"
+                    r"到期|过期|剩余|续期|有效|时长|已续|延长时间)",
                     re.IGNORECASE
                 )
-                # Look line by line first (typical case)
-                for line in body.splitlines():
-                    line_s = line.strip()
-                    if not line_s or len(line_s) > 200:
-                        continue
-                    if keyword_re.search(line_s):
-                        m = date_re.search(line_s)
-                        if m:
-                            exp_txt = line_s
-                            print(f"  [regex hit: line has keyword + date] -> {line_s[:80]}")
-                            break
-                # If still not found, try the whole body as one string
-                if exp_txt == "Unknown":
-                    for m in date_re.finditer(body):
-                        start = max(0, m.start() - 40)
-                        end = min(len(body), m.end() + 40)
-                        window = body[start:end].replace("\n", " ").strip()
-                        if keyword_re.search(window):
-                            exp_txt = window
-                            print(f"  [regex hit: window] -> {window[:80]}")
-                            break
+                # Also try to find a window around any date that mentions
+                # keywords (within 80 chars before OR after).
+                for m in date_re.finditer(clean):
+                    start = max(0, m.start() - 80)
+                    end = min(len(clean), m.end() + 80)
+                    window = clean[start:end].strip()
+                    if keyword_re.search(window):
+                        exp_txt = window
+                        print(f"  [regex hit: window around date] -> {window[:120]}")
+                        break
             except Exception as e:
                 print(f"  body scan warning: {str(e).splitlines()[0]}")
 
-        # ---- Strategy 4: dump a snippet for debugging ----
+        # ---- Strategy 4: dump a larger snippet + save screenshot for debugging ----
         if exp_txt == "Unknown":
             print("  ⚠️ Could not find expiry info on the page.")
             print("  Page title:", page.driver.title or "(empty)")
             try:
                 body_html = page.driver.page_source or ""
-                # Strip script/style noise, take just the visible text skeleton
                 import re
-                clean = re.sub(r"<script[^>]*>.*?</script>", "", body_html, flags=re.DOTALL)
-                clean = re.sub(r"<style[^>]*>.*?</style>", "", clean, flags=re.DOTALL)
+                # Strip noise (same as above)
+                clean = re.sub(r"<script[^>]*>.*?</script>", "", body_html, flags=re.DOTALL | re.IGNORECASE)
+                clean = re.sub(r"<style[^>]*>.*?</style>", "", clean, flags=re.DOTALL | re.IGNORECASE)
                 clean = re.sub(r"<!--.*?-->", "", clean, flags=re.DOTALL)
-                # Collapse tags
+                clean = re.sub(r"<select[^>]*>.*?</select>", "", clean, flags=re.DOTALL | re.IGNORECASE)
+                clean = re.sub(r"<nav[^>]*>.*?</nav>", "", clean, flags=re.DOTALL | re.IGNORECASE)
+                clean = re.sub(r"<header[^>]*>.*?</header>", "", clean, flags=re.DOTALL | re.IGNORECASE)
+                clean = re.sub(r"<footer[^>]*>.*?</footer>", "", clean, flags=re.DOTALL | re.IGNORECASE)
                 clean = re.sub(r"<[^>]+>", " ", clean)
+                clean = re.sub(r"&nbsp;", " ", clean)
                 clean = re.sub(r"\s+", " ", clean).strip()
-                snippet = clean[:500] + ("..." if len(clean) > 500 else "")
-                print("  Page text snippet (first 500 chars):")
-                for line in [snippet[i:i+80] for i in range(0, min(len(snippet), 480), 80)]:
-                    print(f"    {line}")
+                # Increase snippet to 2000 chars (was 500) — Host2Play's
+                # language <select> alone was 1500 chars, drowning the actual
+                # renewal result. After stripping it, we get right to the meat.
+                snippet_size = 2000
+                snippet = clean[:snippet_size] + ("..." if len(clean) > snippet_size else "")
+                print(f"  Page text snippet (first {snippet_size} chars after noise strip):")
+                # Print in 100-char lines for readability
+                for i in range(0, min(len(snippet), snippet_size), 100):
+                    print(f"    {snippet[i:i+100]}")
             except Exception as e:
                 print(f"  page_source dump failed: {e}")
+
+            # Save a screenshot so the user can see exactly what the page looks like
+            try:
+                import os
+                screenshot_dir = OUTPUT_DIR
+                screenshot_dir.mkdir(parents=True, exist_ok=True)
+                ts = datetime.now(TZ_CN).strftime("%Y%m%d_%H%M%S")
+                # Sanitize server name for filename
+                safe_name = re.sub(r"[^\w\-.]", "_", url.split("?i=")[-1][:20] if "?i=" in url else "server")[:30]
+                screenshot_path = screenshot_dir / f"{ts}_{safe_name}.png"
+                page.driver.save_screenshot(str(screenshot_path))
+                print(f"  📸 Screenshot saved: {screenshot_path}")
+            except Exception as e:
+                print(f"  screenshot save failed: {e}")
     except Exception as e:
         print(f"  get_expire_info warning: {str(e).splitlines()[0]}")
 
